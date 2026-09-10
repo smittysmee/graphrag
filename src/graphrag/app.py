@@ -17,12 +17,21 @@ from graphrag.retrieve.search import Retriever
 class AppContext:
     settings: Settings
     store: GraphStore
-    embedder: Embedder
     registry: PersonaRegistry
+    # Built on first use, not at construction: creating the schema or loading a snapshot needs
+    # only the configured model name and dimension, so a machine with no model cached can still
+    # run `setup` and then import a bundle that supplies one.
+    embedder: Embedder | None = None
+
+    def require_embedder(self) -> Embedder:
+        """The embedder, constructed on demand. Only call this when actually embedding."""
+        if self.embedder is None:
+            self.embedder = build_embedder(self.settings.embedding)
+        return self.embedder
 
     @property
     def retriever(self) -> Retriever:
-        return Retriever(self.store, self.embedder)
+        return Retriever(self.store, self.require_embedder())
 
     @property
     def snapshots_dir(self) -> Path:
@@ -44,7 +53,7 @@ class AppContext:
         return cls(
             settings=cfg,
             store=store,
-            embedder=embedder or build_embedder(cfg.embedding),
+            embedder=embedder,
             registry=PersonaRegistry(cfg.personas_dir),
         )
 

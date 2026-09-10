@@ -119,8 +119,10 @@ def setup(
     """Create the schema, load every committed snapshot, and export persona skills."""
     ctx = State.context()
     try:
-        ctx.store.ensure_schema(ctx.embedder.dim)
-        console.print(f"schema ready (dim={ctx.embedder.dim}, model={ctx.embedder.model_name})")
+        ctx.store.ensure_schema(ctx.settings.embedding.dim)
+        console.print(
+            f"schema ready (dim={ctx.settings.embedding.dim}, model={ctx.settings.embedding.model})"
+        )
         loaded = 0
         if not skip_snapshots:
             for manifest in snap.list_snapshots(ctx.snapshots_dir):
@@ -137,8 +139,8 @@ def setup(
                     ctx.store,
                     persona,
                     ctx.snapshots_dir,
-                    embedding_model=ctx.embedder.model_name,
-                    embedding_dim=ctx.embedder.dim,
+                    embedding_model=ctx.settings.embedding.model,
+                    embedding_dim=ctx.settings.embedding.dim,
                     on_progress=_progress,
                 )
                 loaded += 1
@@ -180,7 +182,7 @@ def doctor() -> None:
         console.print(f"embedder: backend={emb.backend} model={emb.model} dim={emb.dim} at {where}")
         try:
             start = time.perf_counter()
-            vec = ctx.embedder.embed_query("doctor probe")
+            vec = ctx.require_embedder().embed_query("doctor probe")
             ms = (time.perf_counter() - start) * 1000
             status = "[green]ok[/green]" if vec.shape[0] == emb.dim else "[red]dim mismatch[/red]"
             console.print(f"  {status} ({vec.shape[0]} dims, {ms:.0f} ms round trip)")
@@ -256,7 +258,7 @@ def ingest(
             src = matches[0]
         if replace:
             ctx.store.delete_persona(spec.id)
-        pipeline = IngestPipeline(ctx.store, ctx.embedder, progress=_progress)
+        pipeline = IngestPipeline(ctx.store, ctx.require_embedder(), progress=_progress)
         report = pipeline.ingest(path, spec, src)
         console.print(
             f"[green]ingested[/green] {report.documents} documents / {report.chunks} chunks "
@@ -269,8 +271,8 @@ def ingest(
                 ctx.store,
                 spec,
                 ctx.snapshots_dir,
-                embedding_model=ctx.embedder.model_name,
-                embedding_dim=ctx.embedder.dim,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
                 source_commit=_git_commit(path),
             )
             console.print(f"snapshot exported to {snap.snapshot_dir(ctx.snapshots_dir, spec.id)}")
@@ -319,8 +321,8 @@ def enrich(
                 ctx.store,
                 spec,
                 ctx.snapshots_dir,
-                embedding_model=ctx.embedder.model_name,
-                embedding_dim=ctx.embedder.dim,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
             )
             console.print("snapshot re-exported")
     finally:
@@ -400,8 +402,8 @@ def enrich_import(
                 ctx.store,
                 spec,
                 ctx.snapshots_dir,
-                embedding_model=ctx.embedder.model_name,
-                embedding_dim=ctx.embedder.dim,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
             )
             console.print("snapshot re-exported")
     finally:
@@ -444,8 +446,8 @@ def snapshot_export(persona: Annotated[str, typer.Argument(help="Persona id.")])
             ctx.store,
             spec,
             ctx.snapshots_dir,
-            embedding_model=ctx.embedder.model_name,
-            embedding_dim=ctx.embedder.dim,
+            embedding_model=ctx.settings.embedding.model,
+            embedding_dim=ctx.settings.embedding.dim,
         )
         console.print(json.dumps(snap.manifest_summary(manifest), indent=2))
     finally:
@@ -474,8 +476,8 @@ def snapshot_load(
                 ctx.store,
                 spec,
                 ctx.snapshots_dir,
-                embedding_model=ctx.embedder.model_name,
-                embedding_dim=ctx.embedder.dim,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
                 on_progress=_progress,
             )
             console.print(
@@ -703,8 +705,8 @@ def persona_import(
                 personas_dir=ctx.settings.personas_dir,
                 snapshots_dir=ctx.snapshots_dir,
                 enrichment_dir=ctx.settings.enrichment_dir,
-                model_name=ctx.embedder.model_name,
-                dim=ctx.embedder.dim,
+                model_name=ctx.settings.embedding.model,
+                dim=ctx.settings.embedding.dim,
                 model_cache_dir=ctx.settings.model_cache_dir,
                 include_graph=include_graph,
                 overwrite=overwrite,
@@ -733,8 +735,8 @@ def persona_import(
                 ctx.store,
                 spec,
                 ctx.snapshots_dir,
-                embedding_model=ctx.embedder.model_name,
-                embedding_dim=ctx.embedder.dim,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
                 on_progress=_progress,
             )
             report.loaded = True

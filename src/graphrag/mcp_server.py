@@ -205,8 +205,8 @@ def create_server(state: ServerState | None = None) -> FastMCP:
             ],
             "embedding": {
                 "backend": st.ctx.settings.embedding.backend,
-                "model": st.ctx.embedder.model_name,
-                "dim": st.ctx.embedder.dim,
+                "model": st.ctx.settings.embedding.model,
+                "dim": st.ctx.settings.embedding.dim,
             },
         }
 
