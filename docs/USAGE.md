@@ -16,21 +16,21 @@ before redistributing anything you build.
 You need Docker Desktop. Nothing else is installed on your machine.
 
 ```bash
-git clone https://github.com/smittysmee/graphrag && cd graphrag
-make setup
+git clone https://github.com/smittysmee/graphrag
+cd graphrag
+make init
 ```
 
-`make setup` builds the images, verifies the pinned embedding model, starts Neo4j and starts the
-server. Then pick one:
+`make init` asks at most three things — what you want to do first, where embeddings should run,
+and how the model should get here — then writes `.env` and runs the rest. It skips any question it
+can answer itself: no download question when the cache is already warm or you chose a remote
+embedder. `./scripts/init.sh --yes` takes every default silently, for scripted installs.
 
-```bash
-# A. someone sent you a bundle — nothing else to download
-make persona-import FILE=their-persona.tar.gz
+The `.env` it writes is rendered from the pydantic settings models, so its keys cannot drift from
+what the app actually reads. `graphrag config show` prints the effective configuration with
+secrets redacted; `graphrag config init` writes one directly.
 
-# B. build the example persona from source (~26 MB archive, then hours of CPU embedding)
-make sources
-make ingest PERSONA=product-leader SRC=data/raw/product-leader
-```
+To drive it manually instead, copy `.env.example` to `.env` and run `make setup`.
 
 `make ingest` is the slow part: chunking and embedding the archive takes a few hours on CPU, or
 minutes against a GPU box (see section 6). You only do it once. It writes a snapshot to

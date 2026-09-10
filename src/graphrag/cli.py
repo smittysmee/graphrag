@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from pydantic import SecretStr
 from rich.console import Console
 from rich.table import Table
 
@@ -55,6 +56,12 @@ def _settings() -> Settings:
 
 def _progress(msg: str) -> None:
     err.print(f"[dim]{msg}[/dim]")
+
+
+def _utc_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _warn_if_ephemeral(target: Path) -> None:
@@ -755,6 +762,58 @@ def persona_recommend(stage: Annotated[str, typer.Argument(help="SDLC stage.")])
 
 
 # ----------------------------------------------------------------------------- servers
+
+
+config_app = typer.Typer(help="Inspect and write configuration.", no_args_is_help=True)
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("init")
+def config_init(
+    output: Annotated[
+        Path, typer.Option("--output", "-o", help="Where to write; - for stdout.")
+    ] = Path(".env"),
+    backend: Annotated[str, typer.Option(help="fastembed | http | hash")] = "fastembed",
+    base_url: Annotated[str | None, typer.Option(help="Endpoint for the http backend.")] = None,
+    neo4j_password: Annotated[str | None, typer.Option(help="Neo4j password.")] = None,
+    allow_download: Annotated[bool, typer.Option(help="Permit fetching model weights.")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+) -> None:
+    """Write a .env. Keys come from the settings models, so they cannot drift from the code."""
+    from graphrag.config import EmbeddingSettings, Neo4jSettings, Settings, render_dotenv
+
+    to_stdout = str(output) == "-"
+    if not to_stdout and output.exists() and not force:
+        err.print(f"[red]{output} exists; pass --force to overwrite[/red]")
+        raise typer.Exit(2)
+
+    neo4j = Neo4jSettings()
+    if neo4j_password:
+        neo4j = neo4j.model_copy(update={"password": SecretStr(neo4j_password)})
+    embedding = EmbeddingSettings().model_copy(
+        update={"backend": backend, "base_url": base_url, "allow_download": allow_download}
+    )
+    settings = Settings().model_copy(update={"neo4j": neo4j, "embedding": embedding})
+
+    rendered = render_dotenv(settings, header=f"Written by `graphrag config init` on {_utc_now()}.")
+    if to_stdout:
+        # Bare print: the caller is redirecting this into a file, so no markup or wrapping.
+        print(rendered, end="")
+        return
+    output.write_text(rendered, encoding="utf-8")
+    console.print(f"[green]wrote[/green] {output} (backend={backend}, downloads={allow_download})")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Print the effective configuration, secrets redacted."""
+    cfg = _settings()
+    redacted = "***"
+    data = json.loads(cfg.model_dump_json())
+    data["neo4j"]["password"] = redacted
+    if data["embedding"].get("api_key"):
+        data["embedding"]["api_key"] = redacted
+    console.print_json(json.dumps(data))
 
 
 @app.command()

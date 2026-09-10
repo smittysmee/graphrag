@@ -96,3 +96,57 @@ class Settings(BaseSettings):
 def load_settings() -> Settings:
     """Build settings from the environment. Kept as a function so tests can construct their own."""
     return Settings()
+
+
+def env_name(model_cls: type[BaseSettings], field: str) -> str:
+    """The environment variable pydantic-settings reads for one field.
+
+    Derived from the model rather than written out by hand, so anything that generates a .env
+    stays correct when a field is renamed.
+    """
+    prefix = str(model_cls.model_config.get("env_prefix", ""))
+    return f"{prefix}{field}".upper()
+
+
+def render_dotenv(settings: Settings, *, header: str = "") -> str:
+    """Render a .env covering the settings worth pinning at install time.
+
+    The keys come from the models, so this cannot drift from what the app actually reads.
+    """
+    emb = settings.embedding
+    sections: list[tuple[str, list[tuple[str, object]]]] = [
+        (
+            "Neo4j",
+            [
+                (env_name(Neo4jSettings, "uri"), settings.neo4j.uri),
+                (env_name(Neo4jSettings, "user"), settings.neo4j.user),
+                (env_name(Neo4jSettings, "password"), settings.neo4j.password.get_secret_value()),
+            ],
+        ),
+        (
+            "Embeddings",
+            [
+                (env_name(EmbeddingSettings, "backend"), emb.backend),
+                (env_name(EmbeddingSettings, "model"), emb.model),
+                (env_name(EmbeddingSettings, "dim"), emb.dim),
+                (env_name(EmbeddingSettings, "allow_download"), str(emb.allow_download).lower()),
+            ]
+            + ([(env_name(EmbeddingSettings, "base_url"), emb.base_url)] if emb.base_url else []),
+        ),
+        (
+            "MCP server",
+            [
+                (env_name(Settings, "mcp_host"), settings.mcp_host),
+                (env_name(Settings, "mcp_port"), settings.mcp_port),
+            ],
+        ),
+    ]
+    lines: list[str] = []
+    if header:
+        lines += [f"# {line}" for line in header.splitlines()]
+        lines.append("")
+    lines.append("# See .env.example for every setting and what it does.")
+    for title, pairs in sections:
+        lines += ["", f"# --- {title}"]
+        lines += [f"{key}={value}" for key, value in pairs]
+    return "\n".join(lines) + "\n"

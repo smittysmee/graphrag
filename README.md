@@ -39,10 +39,8 @@ make context Q="how do I know we have product-market fit" PERSONA=product-leader
 Requirements: Docker Desktop. Nothing else is installed on the host.
 
 ```bash
-cp .env.example .env          # optional; defaults work
-make setup                    # sources, images, model, Neo4j, MCP server
-make doctor                   # sanity check
-make ingest PERSONA=product-leader SRC=data/raw/product-leader
+make init      # asks a few questions, writes .env, runs setup
+make doctor    # sanity check
 ```
 
 Ingesting the example archive takes a few hours on CPU, or minutes if you point the embedder at a
@@ -132,3 +130,4 @@ Two ways to produce it:
   which anchors mentions to passages by name match, writes the graph, and re-exports the snapshot.
 - **Unattended (API key).** `make enrich PERSONA=product-leader LIMIT=10` calls `claude-opus-5`
   with structured outputs; needs `ANTHROPIC_API_KEY` in `.env`.
+

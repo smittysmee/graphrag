@@ -133,25 +133,19 @@ if [ "$KEEP_ENV" = 0 ]; then
       "at least 8 characters, and no spaces, slashes or \$"
   NEO4J_PASSWORD="$REPLY_TEXT"
 
+  printf '\n'; bold "Building images"
+  dim   "  needed before we can write .env from the settings model; a few minutes on a first run"
+  make build
+
   printf '\n'; bold "Writing .env"
   [ -f .env ] && cp .env ".env.backup.$(date +%s)" && dim "  previous .env backed up"
-  {
-    echo "# Written by scripts/init.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    echo "# See .env.example for every setting and what it does."
-    echo
-    echo "NEO4J_URI=bolt://neo4j:7687"
-    echo "NEO4J_USER=neo4j"
-    echo "NEO4J_PASSWORD=${NEO4J_PASSWORD}"
-    echo
-    echo "GRAPHRAG_EMBEDDING_BACKEND=${BACKEND}"
-    echo "GRAPHRAG_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5"
-    echo "GRAPHRAG_EMBEDDING_DIM=384"
-    echo "GRAPHRAG_EMBEDDING_ALLOW_DOWNLOAD=${ALLOW_DOWNLOAD}"
-    [ -n "$BASE_URL" ] && echo "GRAPHRAG_EMBEDDING_BASE_URL=${BASE_URL}"
-    echo
-    echo "GRAPHRAG_MCP_HOST=0.0.0.0"
-    echo "GRAPHRAG_MCP_PORT=8765"
-  } > .env
+  # Rendered by `graphrag config init` so the keys come from the pydantic settings models
+  # rather than being duplicated here in shell, where they would silently drift.
+  docker compose run --rm -T graphrag graphrag config init --output - \
+    --backend "$BACKEND" \
+    --neo4j-password "$NEO4J_PASSWORD" \
+    $([ "$ALLOW_DOWNLOAD" = "true" ] && echo --allow-download) \
+    ${BASE_URL:+--base-url "$BASE_URL"} > .env
   ok "  .env written (backend=${BACKEND}, downloads=${ALLOW_DOWNLOAD})"
 fi
 
