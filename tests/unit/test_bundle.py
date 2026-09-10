@@ -123,19 +123,23 @@ def test_no_graph_import_ignores_the_embedder(exported: Path, tmp_path: Path) ->
     assert report.snapshot_path is None
 
 
-def test_import_will_not_clobber_without_overwrite(
+def test_overwrite_replaces_a_modified_persona(
     exported: Path, settings: Settings, hash_embedder: HashEmbedder
 ) -> None:
-    kwargs = {
-        "personas_dir": settings.personas_dir,
-        "snapshots_dir": settings.snapshots_dir,
-        "enrichment_dir": settings.enrichment_dir,
-        "model_name": hash_embedder.model_name,
-        "dim": hash_embedder.dim,
-    }
-    with pytest.raises(BundleError, match="already exists"):
-        import_bundle(exported, **kwargs)
-    assert import_bundle(exported, overwrite=True, **kwargs).persona_path.exists()
+    """--overwrite is the escape hatch when the local copy really has diverged."""
+    path = settings.personas_dir / "test-pm" / "persona.yaml"
+    path.write_text(path.read_text() + "\n# local change\n")
+    report = import_bundle(
+        exported,
+        personas_dir=settings.personas_dir,
+        snapshots_dir=settings.snapshots_dir,
+        enrichment_dir=settings.enrichment_dir,
+        model_name=hash_embedder.model_name,
+        dim=hash_embedder.dim,
+        overwrite=True,
+    )
+    assert report.persona_path.exists()
+    assert "# local change" not in path.read_text()
 
 
 def test_export_without_graph_or_enrichment(
@@ -336,3 +340,34 @@ def test_compact_halves_the_vectors_without_moving_results(
         store.vector_search(query, 1)[0].chunk_id
         == memory_store.vector_search(query, 1)[0].chunk_id
     )
+
+
+def test_import_allows_replacing_an_identical_persona(
+    exported: Path, settings: Settings, hash_embedder: HashEmbedder
+) -> None:
+    """A repo may ship a persona as an example; re-importing its own bundle is not a clobber."""
+    report = import_bundle(
+        exported,
+        personas_dir=settings.personas_dir,
+        snapshots_dir=settings.snapshots_dir,
+        enrichment_dir=settings.enrichment_dir,
+        model_name=hash_embedder.model_name,
+        dim=hash_embedder.dim,
+    )
+    assert report.persona_path.exists()
+
+
+def test_import_still_refuses_to_clobber_a_modified_persona(
+    exported: Path, settings: Settings, hash_embedder: HashEmbedder
+) -> None:
+    path = settings.personas_dir / "test-pm" / "persona.yaml"
+    path.write_text(path.read_text() + "\n# a local change worth keeping\n")
+    with pytest.raises(BundleError, match="differs from the one in the bundle"):
+        import_bundle(
+            exported,
+            personas_dir=settings.personas_dir,
+            snapshots_dir=settings.snapshots_dir,
+            enrichment_dir=settings.enrichment_dir,
+            model_name=hash_embedder.model_name,
+            dim=hash_embedder.dim,
+        )

@@ -215,9 +215,6 @@ def import_bundle(
         check_embedder(manifest, model_name, dim)
 
     registry = PersonaRegistry(personas_dir)
-    if registry.path_for(manifest.persona_id).exists() and not overwrite:
-        msg = f"persona {manifest.persona_id!r} already exists here; pass --overwrite to replace it"
-        raise BundleError(msg)
 
     with TemporaryDirectory() as tmp:
         staging = Path(tmp)
@@ -233,6 +230,21 @@ def import_bundle(
         src_persona = staging / "personas" / manifest.persona_id
         if not (src_persona / PERSONA_FILE).exists():
             msg = f"bundle is missing personas/{manifest.persona_id}/{PERSONA_FILE}"
+            raise BundleError(msg)
+
+        # Only refuse when replacing would actually lose something. A repo may ship a persona
+        # definition as an example, and importing its own bundle over an untouched copy is not
+        # a clobber worth blocking.
+        existing = registry.path_for(manifest.persona_id)
+        if (
+            existing.exists()
+            and not overwrite
+            and not _same_file(existing, src_persona / PERSONA_FILE)
+        ):
+            msg = (
+                f"persona {manifest.persona_id!r} already exists here and differs from the one "
+                f"in the bundle; pass --overwrite to replace it"
+            )
             raise BundleError(msg)
         _replace_tree(src_persona, personas_dir / manifest.persona_id)
 
@@ -264,6 +276,13 @@ def import_bundle(
                 report.enrichment_paths.append(target_file)
 
     return report
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
 
 
 def _stage_compact_snapshot(snapshot_dir: Path, staged: Path) -> None:

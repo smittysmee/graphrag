@@ -129,8 +129,8 @@ persona-export: ## Pack a persona into data/exports/ (PERSONA=id [COMPACT=1] [WI
 		$(if $(COMPACT),--compact,) $(if $(WITH_MODEL),--with-model,)
 	@echo "→ $(EXPORT_DIR)/$(or $(FILE),$(PERSONA)-persona.tar.gz)"
 
-persona-import: ## Install a bundle and load it (FILE=path, relative to the repo root)
-	$(COMPOSE) run --rm -T graphrag graphrag persona import /app/$(FILE) --load
+persona-import: ## Install a bundle and load it (FILE=path [OVERWRITE=1])
+	$(COMPOSE) run --rm -T graphrag graphrag persona import /app/$(FILE) --load $(if $(OVERWRITE),--overwrite,)
 
 enrich: ## Claude entity/claim enrichment for PERSONA (LIMIT=n documents)
 	$(COMPOSE) run --rm -T graphrag graphrag enrich $(PERSONA) --limit $(or $(LIMIT),10)
