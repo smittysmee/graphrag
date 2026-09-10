@@ -30,6 +30,9 @@ down: ## Stop everything (keeps volumes)
 logs: ## Tail app + neo4j logs
 	$(COMPOSE) logs -f graphrag neo4j
 
+init: ## Interactive first-run setup: asks a few questions, writes .env, runs setup
+	@./scripts/init.sh
+
 model: ## Fetch the pinned embedding model. Explicit opt-in: nothing else downloads it.
 	@ALLOW_DOWNLOAD=1 ./scripts/model.sh ensure
 
