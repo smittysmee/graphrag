@@ -1,0 +1,12 @@
+# Overlay for a CUDA host (GB10 / DGX Spark):
+#   EMBED_GPU=1 GRAPHRAG_EMBEDDING_CUDA=true \
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile embed up --build embed
+services:
+  embed:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

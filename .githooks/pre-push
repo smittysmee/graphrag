@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Runs the full check plus integration tests against a throwaway Neo4j before pushing.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+if ! docker info >/dev/null 2>&1; then
+  echo "pre-push: Docker is not running. Start Docker Desktop and retry." >&2
+  exit 1
+fi
+echo "pre-push: unit checks..."
+docker compose --profile dev run --rm -T dev make check-local
+echo "pre-push: integration tests..."
+make test-integration

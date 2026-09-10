@@ -1,0 +1,14 @@
+# Pinned embedding model. The snapshot's vectors come from exactly this build, so query
+# vectors must too. `make model` warms the cache and verifies these hashes.
+#
+# Changing any of this invalidates every committed snapshot: re-ingest before you ship it.
+model_name      = BAAI/bge-small-en-v1.5
+hf_repo         = qdrant/bge-small-en-v1.5-onnx-q
+hf_revision     = 52398278842ec682c6f32300af41344b1c0b0bb2
+onnx_file       = model_optimized.onnx
+onnx_sha256     = 51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431
+onnx_bytes      = 66465124
+dimensions      = 384
+license         = MIT (BAAI/bge-small-en-v1.5, the underlying model)
+# The qdrant/* ONNX conversion declares no license of its own on Hugging Face.
+# We do not redistribute either: the pin above is fetched by the user from HF.

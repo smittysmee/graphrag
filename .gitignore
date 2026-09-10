@@ -1,0 +1,32 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local data that is NOT the shared snapshot.
+# data/raw/product-leader is a git submodule (the upstream transcript archive), so it is tracked.
+data/raw/*
+!data/raw/product-leader
+data/cache/
+data/exports/
+models/
+.fastembed_cache/
+
+# editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
