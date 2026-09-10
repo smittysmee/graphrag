@@ -36,21 +36,25 @@ make ingest PERSONA=product-leader SRC=data/raw/product-leader
 minutes against a GPU box (see section 6). You only do it once. It writes a snapshot to
 `data/snapshots/`, and reloading that into an empty database later takes well under a minute.
 
-**Skipping the model download.** `make setup` fetches the pinned embedding model (~64 MB) because
-the default embedder runs it locally. Two ways not to:
+**Nothing downloads model weights unless you ask.** `make setup` only reports whether the pinned
+model is present. If it is missing, setup tells you how to supply it and carries on.
+
+At runtime the guarantee is enforced, not merely deferred: the fastembed backend marks the Hugging
+Face stack offline and refuses to construct a model that is not already cached, failing with
+instructions rather than fetching silently mid-query. `GRAPHRAG_EMBEDDING_ALLOW_DOWNLOAD` defaults
+to `false`.
+
+Three ways to get the model onto a machine, in order of least network:
 
 ```bash
-make setup SKIP_MODEL=1     # the model is arriving another way
+make persona-import FILE=bundle.tar.gz   # a bundle exported --with-model carries it
+make model-import FILE=model.tar.gz      # a cache tarball from `make model-export`
+make model                               # explicit opt-in: ~64 MB from Hugging Face
 ```
 
-It also skips itself automatically when `GRAPHRAG_EMBEDDING_BACKEND` is anything other than
-`fastembed`, since an `http` backend embeds on another machine and never touches a local model.
-The setting is read from your environment or `.env`, exactly as the app reads it.
-
-Use `SKIP_MODEL=1` when you are about to import a persona bundle exported `--with-model`, or when
-you will restore a cache with `make model-import`. Note that it *defers* rather than forbids: with
-the fastembed backend still selected, the model is fetched on first use if nothing else supplied
-it. On a machine with no network, supply it first and the deferred fetch never happens.
+`make model` is the only command that will ever fetch it, and only because you typed it. The check
+also skips itself entirely when `GRAPHRAG_EMBEDDING_BACKEND` is not `fastembed`, since an `http`
+backend embeds on another machine and never touches a local model.
 
 Check it:
 

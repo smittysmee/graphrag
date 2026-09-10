@@ -21,7 +21,8 @@ backend() {
 }
 SHA="$(pin onnx_sha256)"; REPO="$(pin hf_repo)"; REV="$(pin hf_revision)"; FILE="$(pin onnx_file)"
 CACHE="models--${REPO//\//--}"
-VOL=graph-rag_models
+# Compose prefixes volumes with the project name; override if yours differs.
+VOL="${GRAPHRAG_MODEL_VOLUME:-${COMPOSE_PROJECT_NAME:-graph-rag}_models}"
 
 verify() {
   docker run --rm -v "$VOL":/models alpine sh -c "
@@ -33,17 +34,21 @@ verify() {
 
 case "${1:-ensure}" in
   ensure)
-    if [ -n "${SKIP_MODEL:-}" ]; then
-      echo "model: skipped (SKIP_MODEL set). It will be fetched on first use, or supplied by a"
-      echo "       persona bundle exported with --with-model, or by \`make model-import\`."
-      exit 0
-    fi
     if [ "$(backend)" != "fastembed" ]; then
       echo "model: not needed (GRAPHRAG_EMBEDDING_BACKEND=$(backend) does not use a local model)"
       exit 0
     fi
-    if verify >/dev/null 2>&1; then echo "model already present and pinned ($REPO@${REV:0:7})"; exit 0; fi
-    echo "warming model cache ($REPO@${REV:0:7}); first run downloads ~64 MB..."
+    if verify >/dev/null 2>&1; then echo "model: present and pinned ($REPO@${REV:0:7})"; exit 0; fi
+    # Nothing downloads a model implicitly. `make model` sets ALLOW_DOWNLOAD; everything else
+    # reports and moves on, so an environment that forbids fetching weights is never surprised.
+    if [ -z "${ALLOW_DOWNLOAD:-}" ]; then
+      echo "model: NOT present, and nothing will download it."
+      echo "  supply it offline:  make model-import FILE=model.tar.gz"
+      echo "                      or import a persona bundle exported --with-model"
+      echo "  or fetch it:        make model    (~64 MB from Hugging Face)"
+      exit 0
+    fi
+    echo "warming model cache ($REPO@${REV:0:7}); downloading ~64 MB..."
     docker compose run --rm -T graphrag python -c \
       "from graphrag.config import load_settings; from graphrag.embed.base import build_embedder; \
        print('dims', build_embedder(load_settings().embedding).embed_query('warm').shape[0])"

@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -77,3 +79,26 @@ def test_http_embedder_rejects_wrong_dim(hash_embedder: HashEmbedder) -> None:
     remote = HttpEmbedder("http://x/v1", "m", dim=64, transport=httpx.MockTransport(handler))
     with pytest.raises(ValueError, match="expected"):
         remote.embed_documents(["a"])
+
+
+def test_download_is_off_by_default() -> None:
+    """Policy default: the fastembed backend must not fetch weights unless asked."""
+    assert EmbeddingSettings().allow_download is False
+
+
+def test_missing_model_fails_with_instructions_instead_of_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache miss must raise locally, and must have marked the HF stack offline first."""
+    from graphrag.embed.fastembed_embedder import EmbeddingModelUnavailableError, FastEmbedEmbedder
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    with pytest.raises(EmbeddingModelUnavailableError) as exc:
+        FastEmbedEmbedder(
+            model_name="definitely/not-a-real-model",
+            dim=384,
+            cache_dir=str(tmp_path / "empty"),
+        )
+    assert "downloading is disabled" in str(exc.value)
+    assert "make model-import" in str(exc.value)
+    assert os.environ["HF_HUB_OFFLINE"] == "1"

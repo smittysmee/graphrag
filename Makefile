@@ -30,8 +30,11 @@ down: ## Stop everything (keeps volumes)
 logs: ## Tail app + neo4j logs
 	$(COMPOSE) logs -f graphrag neo4j
 
-model: ## Ensure the pinned embedding model is cached (SKIP_MODEL=1 to skip the download)
-	@SKIP_MODEL="$(SKIP_MODEL)" ./scripts/model.sh ensure
+model: ## Fetch the pinned embedding model. Explicit opt-in: nothing else downloads it.
+	@ALLOW_DOWNLOAD=1 ./scripts/model.sh ensure
+
+model-check: ## Report whether the pinned model is present, without fetching anything
+	@./scripts/model.sh ensure
 
 model-export: ## Tar the model cache for an air-gapped machine (FILE=model.tar.gz)
 	./scripts/model.sh export $(or $(FILE),model.tar.gz)
@@ -42,7 +45,7 @@ model-import: ## Restore a model cache tarball (FILE=model.tar.gz)
 sources: ## Fetch the pinned source archives (only needed to ingest them yourself)
 	git submodule update --init --recursive
 
-setup: hooks build model ## One-shot: hooks, images, model, Neo4j, snapshots, MCP up
+setup: hooks build model-check ## One-shot: hooks, images, Neo4j, snapshots, MCP up (no download)
 	$(COMPOSE) up -d --wait neo4j
 	$(COMPOSE) run --rm -T graphrag graphrag setup
 	$(COMPOSE) up -d --wait graphrag

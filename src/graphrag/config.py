@@ -48,6 +48,9 @@ class EmbeddingSettings(BaseSettings):
     dim: int = 384
     batch_size: int = Field(default=64, ge=1, le=2048)
     cuda: bool = False
+    # Off by default: many environments forbid fetching model weights, and fastembed would
+    # otherwise download silently on first use. Supply the model via a bundle or model-import.
+    allow_download: bool = False
     base_url: str | None = None
     api_key: SecretStr | None = None
     timeout_seconds: float = Field(default=120.0, gt=0)
