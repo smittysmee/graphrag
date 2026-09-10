@@ -8,6 +8,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 pin() { grep -E "^$1[[:space:]]*=" vendor/model.lock | cut -d= -f2- | xargs; }
+
+# Which embedder is configured. Only "fastembed" needs a model on this machine; the http backend
+# calls out to another host. Checks the environment first, then .env, as the app itself does.
+backend() {
+  if [ -n "${GRAPHRAG_EMBEDDING_BACKEND:-}" ]; then echo "$GRAPHRAG_EMBEDDING_BACKEND"; return; fi
+  if [ -f .env ]; then
+    b=$(grep -E "^GRAPHRAG_EMBEDDING_BACKEND=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"' " )
+    if [ -n "$b" ]; then echo "$b"; return; fi
+  fi
+  echo fastembed
+}
 SHA="$(pin onnx_sha256)"; REPO="$(pin hf_repo)"; REV="$(pin hf_revision)"; FILE="$(pin onnx_file)"
 CACHE="models--${REPO//\//--}"
 VOL=graph-rag_models
@@ -22,6 +33,15 @@ verify() {
 
 case "${1:-ensure}" in
   ensure)
+    if [ -n "${SKIP_MODEL:-}" ]; then
+      echo "model: skipped (SKIP_MODEL set). It will be fetched on first use, or supplied by a"
+      echo "       persona bundle exported with --with-model, or by \`make model-import\`."
+      exit 0
+    fi
+    if [ "$(backend)" != "fastembed" ]; then
+      echo "model: not needed (GRAPHRAG_EMBEDDING_BACKEND=$(backend) does not use a local model)"
+      exit 0
+    fi
     if verify >/dev/null 2>&1; then echo "model already present and pinned ($REPO@${REV:0:7})"; exit 0; fi
     echo "warming model cache ($REPO@${REV:0:7}); first run downloads ~64 MB..."
     docker compose run --rm -T graphrag python -c \

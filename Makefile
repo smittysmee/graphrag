@@ -30,8 +30,8 @@ down: ## Stop everything (keeps volumes)
 logs: ## Tail app + neo4j logs
 	$(COMPOSE) logs -f graphrag neo4j
 
-model: ## Ensure the pinned embedding model is cached, and verify its checksum
-	./scripts/model.sh ensure
+model: ## Ensure the pinned embedding model is cached (SKIP_MODEL=1 to skip the download)
+	@SKIP_MODEL="$(SKIP_MODEL)" ./scripts/model.sh ensure
 
 model-export: ## Tar the model cache for an air-gapped machine (FILE=model.tar.gz)
 	./scripts/model.sh export $(or $(FILE),model.tar.gz)
