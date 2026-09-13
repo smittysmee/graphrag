@@ -224,6 +224,7 @@ def retriever(memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder) -> 
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         personas_dir=tmp_path / "personas",
+        raw_dir=tmp_path / "raw",
         snapshots_dir=tmp_path / "snapshots",
         enrichment_dir=tmp_path / "enrichment",
         skills_dir=tmp_path / "skills",

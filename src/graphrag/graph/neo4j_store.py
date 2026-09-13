@@ -405,6 +405,18 @@ class Neo4jGraphStore:
         )
         return [_doc_from_node(r["d"]) for r in rows]
 
+    def document_ids(self, persona_id: str, source_id: str | None = None) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE $source_id IS NULL OR d.source_id = $source_id
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
     def document_chunks(self, doc_id: str, start: int = 0, count: int = 5) -> list[Chunk]:
         rows = self._read(
             """
@@ -482,6 +494,19 @@ class Neo4jGraphStore:
             pid=persona_id,
         )
         return {r["doc_id"] for r in rows}
+
+    def enriched_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id
+              AND EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity) }
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
 
     # ------------------------------------------------------------- bulk
     def iter_documents(self, persona_id: str) -> Iterator[Document]:

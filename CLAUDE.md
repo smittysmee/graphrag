@@ -8,7 +8,8 @@ content (see NOTICE.md), otherwise each user ingests locally.
 - `make setup` — first-time: hooks, images, Neo4j, load snapshots, MCP on :8765
 - `make check` — ruff format check, ruff lint, mypy --strict, unit tests (this is the pre-commit hook)
 - `make test-integration` — against a throwaway Neo4j (pre-push hook)
-- `make ingest PERSONA=<id> SRC=<path>` / `make enrich` / `make search Q="..."` / `make context`
+- `make sync PERSONA=<id>` — ingest what is missing and re-import that source's enrichment JSON
+- `make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` / `make enrich` / `make search Q="..."` / `make context`
 - `make doctor` — Neo4j, embedder placement (local vs http), snapshot compatibility
 
 ## Layout
@@ -18,6 +19,7 @@ embed server), `graph/` (GraphStore Protocol: neo4j_store, memory_store, snapsho
 `extract/` (topic co-occurrence; optional Claude enrichment), `retrieve/` (hybrid RRF search,
 context packs), `personas/` (registry, brief, skill export), `pipeline.py`, `cli.py`,
 `mcp_server.py`, `app.py` (composition root).
+`hooks/` (host-side Claude Code hooks, stdlib only; shell wrappers in `.claude/hooks/`).
 
 ## Data facts worth knowing
 - `product-leader` is grounded in the ChatPRD Lenny's Podcast archive, pinned as a git submodule

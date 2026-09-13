@@ -5,7 +5,7 @@ import pytest
 
 from graphrag.embed.hashing import HashEmbedder
 from graphrag.graph.memory_store import InMemoryGraphStore
-from graphrag.models import PersonaSpec, SourceSpec
+from graphrag.models import Enrichment, Entity, Mention, PersonaSpec, SourceSpec
 from graphrag.pipeline import IngestPipeline, IngestReport
 
 
@@ -58,6 +58,41 @@ def test_topic_cooccurrence_and_filters(
     assert len(memory_store.list_documents("test-pm", topic="onboarding")) == 2
     assert memory_store.list_documents("test-pm")[0].published is not None
     assert memory_store.list_speakers("test-pm")[0].speaker == "Lenny Rachitsky"
+
+
+def test_document_ids_are_scoped_by_persona_and_source(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag sync` compares the raw files against."""
+    ids = memory_store.document_ids("test-pm")
+    assert len(ids) == 3
+    assert all(i.startswith("test-pm:test-podcast:") for i in ids)
+    assert memory_store.document_ids("test-pm", "test-podcast") == ids
+    assert memory_store.document_ids("test-pm", "nope") == set()
+    assert memory_store.document_ids("other-persona") == set()
+
+
+def test_enriched_document_ids_answer_only_after_an_extraction_lands(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag sync` compares those ids against to find documents with no entities.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    doc_id = sorted(memory_store.document_ids("test-pm", "test-podcast"))[0]
+    assert memory_store.enriched_document_ids("test-pm", "test-podcast") == set()
+
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="metric:retention", name="Retention", type="metric")],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="metric:retention")],
+        )
+    )
+
+    assert memory_store.enriched_document_ids("test-pm", "test-podcast") == {doc_id}
+    assert memory_store.enriched_document_ids("test-pm", "nope") == set()
+    assert memory_store.enriched_document_ids("other-persona", "test-podcast") == set()
 
 
 def test_delete_persona_removes_everything(

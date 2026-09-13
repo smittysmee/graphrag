@@ -12,6 +12,7 @@ import numpy as np
 from graphrag.embed.base import Embedder
 from graphrag.extract.topics import topic_cooccurrence
 from graphrag.graph.store import GraphStore
+from graphrag.ingest import hygiene
 from graphrag.ingest.chunker import ChunkerConfig, chunk_document
 from graphrag.ingest.loaders import load_source
 from graphrag.models import Chunk, Document, PersonaSpec, SourceSpec
@@ -28,6 +29,9 @@ class IngestReport:
     seconds: float = 0.0
     embedding_model: str = ""
     skipped: list[str] = field(default_factory=list)
+    flagged: list[tuple[str, str]] = field(default_factory=list)
+    """``(document path, one-line reason)`` for files whose raw text looks like an injection
+    attempt. Advisory only: the document was ingested anyway, and a human decides."""
 
 
 class IngestPipeline:
@@ -54,9 +58,11 @@ class IngestPipeline:
         self._store.ensure_schema(self._embedder.dim)
         self._store.upsert_persona(persona)
 
+        base = root / source.path if source.path else root
         pending_docs: list[Document] = []
         pending_chunks: list[Chunk] = []
         for loaded in load_source(root, source, persona.id):
+            self._flag(base, loaded.document, report)
             chunks = chunk_document(loaded, self._chunker)
             if not chunks:
                 report.skipped.append(loaded.document.path)
@@ -73,6 +79,16 @@ class IngestPipeline:
         self._store.upsert_topic_cooccurrence(topic_cooccurrence(all_docs))
         report.seconds = time.perf_counter() - started
         return report
+
+    def _flag(self, base: Path, document: Document, report: IngestReport) -> None:
+        """Record injection-shaped text found in the file as it sits on disk.
+
+        The scan runs on the raw body, before the loader cleaned it, so a stripped zero-width
+        run still reaches the report. Nothing here stops the ingest.
+        """
+        reason = hygiene.summarize(hygiene.scan_file(base / document.path))
+        if reason:
+            report.flagged.append((document.path, reason))
 
     def _flush(self, docs: list[Document], chunks: list[Chunk], report: IngestReport) -> None:
         matrix = self._embedder.embed_documents([c.text for c in chunks])
