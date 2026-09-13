@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Any
 
 from graphrag.ingest.frontmatter import split_frontmatter
-from graphrag.models import Document, LoadedDocument, Scalar, Turn, slugify
+from graphrag.models import Document, LoadedDocument, Scalar, Turn
+from graphrag.textutil import slugify
 
 TURN_HEADER = re.compile(r"^(?P<speaker>[^\n(]{1,80}?)\s\((?P<ts>\d{1,2}:\d{2}:\d{2})\):\s*$")
 MARKDOWN_HEADING = re.compile(r"^#{1,6}\s")

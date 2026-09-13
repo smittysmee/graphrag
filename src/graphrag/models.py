@@ -8,18 +8,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from graphrag.textutil import slugify
+
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 LoaderName = Literal["transcripts", "documents"]
 SearchMode = Literal["hybrid", "vector", "fulltext"]
 Scalar = str | int | float | bool | None
-
-
-def slugify(value: str) -> str:
-    """Lower-case, ASCII-ish slug safe for ids, folder names and Cypher parameters."""
-    value = value.strip().lower()
-    value = re.sub(r"[^a-z0-9]+", "-", value)
-    return value.strip("-") or "untitled"
 
 
 # ----------------------------------------------------------------------------- personas

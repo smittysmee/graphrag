@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from graphrag.ingest.frontmatter import split_frontmatter
-from graphrag.models import Document, LoadedDocument, Scalar, Turn, slugify
+from graphrag.models import Document, LoadedDocument, Scalar, Turn
+from graphrag.textutil import slugify
 
 PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 HEADING = re.compile(r"^#{1,6}\s+(.*)$")
