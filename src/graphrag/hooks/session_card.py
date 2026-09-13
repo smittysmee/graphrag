@@ -98,8 +98,10 @@ def _persona_line(
         counts = f"{_count(live, 'documents')} documents, {_count(live, 'chunks')} chunks"
     elif manifest is not None:
         counts = f"{manifest.document_count} documents, {manifest.chunk_count} chunks (snapshot)"
-    else:
+    elif live_stats is not None:
         counts = "not ingested"
+    else:
+        counts = "unknown (no snapshot; server not reachable)"
     snapshot = f", snapshot {manifest.created_date}" if manifest and manifest.created_date else ""
     return f"- {pid} ({name}): {counts}{snapshot}"
 

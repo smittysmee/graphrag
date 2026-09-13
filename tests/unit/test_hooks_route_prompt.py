@@ -29,10 +29,12 @@ class FakeClient:
         topics: dict[str, list[dict[str, Any]]] | None = None,
         search: dict[str, list[dict[str, Any]]] | None = None,
         url: str = "http://localhost:8765/mcp",
+        stats: dict[str, dict[str, int]] | None = None,
     ) -> None:
         self.url = url
         self._topics = topics or {}
         self._search = search or {}
+        self.stats = stats or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -41,6 +43,8 @@ class FakeClient:
             return self._topics.get(arguments.get("persona_id"), [])
         if name == "search":
             return self._search.get(arguments.get("persona_id"), [])
+        if name == "stats":
+            return {"graph": {"per_persona": self.stats}}
         raise AssertionError(f"unexpected tool call {name!r}")
 
 
@@ -301,7 +305,7 @@ def test_render_persona_stays_under_the_character_limit() -> None:
         identity_hit=True,
     )
     titles = [f"A Very Long Document Title About Something Number {i}" * 3 for i in range(3)]
-    text = route_prompt.render_persona(persona, manifest, match, titles)
+    text = route_prompt.render_persona(persona, manifest.document_count, match, titles)
     assert len(text) <= route_prompt.MAX_PARAGRAPH
 
 
@@ -312,7 +316,19 @@ def test_render_persona_omits_the_titles_sentence_when_there_are_none() -> None:
     )
     text = route_prompt.render_persona(persona, None, match, [])
     assert "Possibly relevant" not in text
-    assert "0 documents are indexed" in text
+    assert "documents are indexed" not in text
+    assert "graphrag MCP server." in text
+
+
+def test_route_prefers_the_live_document_count_over_the_snapshot(root: Path) -> None:
+    (project.cache_dir(root) / "topics-demo-persona.json").write_text(
+        json.dumps({"fetched_at": 1000.0, "topics": ["retention"]}), encoding="utf-8"
+    )
+    client = FakeClient(stats={"demo-persona": {"documents": 57, "chunks": 300}})
+    prompt = "How should we think about onboarding and retention for our customers this year?"
+    output = route_prompt.route(root, prompt, client, now=1000.0)  # type: ignore[arg-type]
+    assert "57 documents are indexed" in output
+    assert "42 documents" not in output
 
 
 # ----------------------------------------------------------------------------- main()

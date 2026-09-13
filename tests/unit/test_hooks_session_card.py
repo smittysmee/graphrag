@@ -86,7 +86,7 @@ def root(tmp_path: Path) -> Path:
 def test_render_card_lists_every_persona(root: Path) -> None:
     card = session_card.render_card(root, None, NOW)
     assert card.startswith("graphrag knowledge graph\n")
-    assert "- fresh (Fresh): not ingested" in card
+    assert "- fresh (Fresh): unknown (no snapshot; server not reachable)" in card
     assert "handbook" in card
 
 
@@ -100,6 +100,7 @@ def test_render_card_prefers_live_counts_when_the_server_answers(root: Path) -> 
     client = FakeClient(stats_payload({"handbook": {"documents": 5, "chunks": 40}}))
     card = session_card.render_card(root, client, NOW)  # type: ignore[arg-type]
     assert "- handbook (Handbook): 5 documents, 40 chunks, snapshot 2026-09-09" in card
+    assert "- fresh (Fresh): not ingested" in card
     assert "MCP server: up at http://localhost:8765/mcp" in card
     assert [name for name, _ in client.calls] == ["stats"]
 

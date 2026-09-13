@@ -369,22 +369,54 @@ def _shorten(text: str, limit: int) -> str:
 
 def render_persona(
     persona: project.PersonaInfo,
-    manifest: project.Manifest | None,
+    doc_count: int | None,
     match: PersonaMatch,
     titles: Sequence[str],
 ) -> str:
-    """One paragraph, under 700 characters, naming the persona, the matches, and doc titles."""
+    """One paragraph, under 700 characters, naming the persona, the matches, and doc titles.
+
+    ``doc_count`` is the live or snapshot document count; ``None`` when neither is known, in
+    which case the count clause is left out rather than printing a misleading zero.
+    """
     matched_display = ", ".join(match.matched[:MAX_MATCHED_SHOWN]) or "its focus"
-    doc_count = manifest.document_count if manifest is not None else 0
+    indexed = f"; {doc_count} documents are indexed" if doc_count is not None else ""
     text = (
         f"This prompt looks like a {persona.name} question (matched: {matched_display}). "
         f"Before answering, call context(query, persona_id='{persona.id}') on the graphrag "
-        f"MCP server; {doc_count} documents are indexed."
+        f"MCP server{indexed}."
     )
     if titles:
         shown = [_shorten(t, MAX_TITLE_LEN) for t in titles[:MAX_TITLES]]
         text += f" Possibly relevant: {'; '.join(shown)}."
     return _shorten(text, MAX_PARAGRAPH)
+
+
+def _live_doc_counts(client: McpClient | None) -> dict[str, int]:
+    """Per-persona document counts from the live server's ``stats``; empty when unavailable."""
+    if client is None:
+        return {}
+    try:
+        payload = client.call_tool("stats", {})
+    except McpUnavailable:
+        return {}
+    graph = payload.get("graph") if isinstance(payload, dict) else None
+    per_persona = graph.get("per_persona") if isinstance(graph, dict) else None
+    if not isinstance(per_persona, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for pid, entry in per_persona.items():
+        docs = entry.get("documents") if isinstance(entry, dict) else None
+        if isinstance(pid, str) and isinstance(docs, int):
+            counts[pid] = docs
+    return counts
+
+
+def _doc_count(
+    persona_id: str, live_counts: dict[str, int], manifest: project.Manifest | None
+) -> int | None:
+    if persona_id in live_counts:
+        return live_counts[persona_id]
+    return manifest.document_count if manifest is not None else None
 
 
 # ----------------------------------------------------------------------------- orchestration
@@ -414,9 +446,13 @@ def route(root: Path, prompt: str, client: McpClient | None, now: float) -> str:
     candidates.sort(key=lambda m: (-m.score, m.persona.id))
     chosen = candidates[:MAX_PERSONAS]
 
+    live_counts = _live_doc_counts(client)
     paragraphs = [
         render_persona(
-            m.persona, manifests.get(m.persona.id), m, _titles_for(m.persona.id, prompt, client)
+            m.persona,
+            _doc_count(m.persona.id, live_counts, manifests.get(m.persona.id)),
+            m,
+            _titles_for(m.persona.id, prompt, client),
         )
         for m in chosen
     ]
