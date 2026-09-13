@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 from graphrag.app import AppContext
 from graphrag.cli import app
 from graphrag.pipeline import IngestReport
-from tests.conftest import write_sample_corpus
+from tests.conftest import THREAD_POSTS, write_sample_corpus
 
 runner = CliRunner()
 
@@ -169,3 +169,41 @@ def test_ingest_reports_flagged_files_after_the_summary(
     assert "zed-quill/transcript.md" in result.output
     assert "[INST]" in result.output
     assert cli_context.store.stats().documents == 4
+
+
+def test_attribution_import_from_agent_json(
+    cli_context: AppContext, thread_document: str, tmp_path: Path
+) -> None:
+    """The thread arrives with no speakers; the CLI is what puts them on its passages."""
+    assert cli_context.store.stats().speakers == 0
+    payload = {
+        "doc_id": thread_document,
+        "posts": [
+            {"speaker": "quill-maker", "anchor": THREAD_POSTS[0][2][:60], "role": "op"},
+            {"speaker": "ledger-ann", "anchor": THREAD_POSTS[-1][2][:60], "date": "2025-02-06"},
+            {"speaker": "north-by", "anchor": "a line this thread does not contain"},
+        ],
+    }
+    file = tmp_path / "thread.json"
+    file.write_text(json.dumps(payload))
+
+    dry = runner.invoke(app, ["attribution-import", "test-docs", str(file), "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "2/3 posts attached" in dry.stdout
+    assert "1 loose anchors" in dry.stdout
+    assert "loose: north-by: a line this thread" in dry.output
+    assert cli_context.store.stats().speakers == 0  # a dry run wrote nothing
+
+    result = runner.invoke(app, ["attribution-import", "test-docs", str(file)])
+    assert result.exit_code == 0, result.output
+    assert "2 speakers" in result.stdout
+    assert cli_context.store.stats().speakers == 2
+    assert (cli_context.settings.snapshots_dir / "test-docs" / "manifest.json").exists()
+
+    again = runner.invoke(app, ["attribution-import", "test-docs", str(file), "--no-export"])
+    assert again.exit_code == 0, again.output
+    assert cli_context.store.stats().speakers == 2  # re-import is idempotent
+
+    missing = tmp_path / "missing.json"
+    missing.write_text(json.dumps({"doc_id": "nope", "posts": []}))
+    assert runner.invoke(app, ["attribution-import", "test-docs", str(missing)]).exit_code == 2

@@ -231,6 +231,81 @@ There is also an unattended path that calls the API directly, `make enrich PERSO
 which needs `ANTHROPIC_API_KEY` in `.env`. The agent path needs no key and was used for the
 existing corpus.
 
+### Add the speaker layer
+
+Transcripts arrive with speakers, because their loader parses `Name (00:00:00):` turns. Prose
+documents do not: a captured discussion thread reaches the graph as one body of text with no
+`Speaker` node at all, so every speaker-shaped question about it comes back empty.
+
+Attribution fills that in, the same way enrichment fills in entities. An agent reads one document
+and writes one file per document under `data/attribution/<persona>/`:
+
+```json
+{
+  "doc_id": "<persona>:<source>:<slug>",
+  "posts": [
+    {
+      "speaker": "handle or name",
+      "anchor": "the verbatim opening words of the post, 6 to 20 words",
+      "role": "op",
+      "date": "2025-02-03",
+      "score": 12
+    }
+  ]
+}
+```
+
+Then:
+
+```bash
+docker compose run --rm graphrag graphrag attribution-import <persona> /app/data/attribution/<persona>/*.json --dry-run
+docker compose run --rm graphrag graphrag attribution-import <persona> /app/data/attribution/<persona>/*.json
+```
+
+Each anchor is looked for in the document's passages, ignoring case and how the whitespace fell,
+and the speaker is attached to the first passage that contains it. `role`, `date` and `score` are
+kept in the file as provenance; only who spoke in which passage reaches the graph.
+
+A post whose anchor occurs in no passage is reported as loose and skipped, never guessed at, so a
+paraphrased opening line costs that one post rather than the file. The dry run lists them, which
+is what you fix before writing. Import is idempotent.
+
+`make sync` re-imports these files by itself, on the same two triggers as the extraction files: a
+source it had to re-ingest (re-ingesting deletes the passages the speakers hang off), and a
+document sitting in the graph with no speaker at all.
+
+### Analyse the networks
+
+Three networks sit inside the graph and nobody has to build them: who appears alongside whom
+(speakers sharing a document), what is discussed together (entities sharing a passage), and how
+the ingestion topics co-occur. `graphrag sna` measures them, groups them, and checks whether the
+grouping means anything.
+
+```bash
+# which network, which method, and what each one is for
+docker compose run --rm graphrag graphrag sna guide
+
+# communities of speakers, with a stability score and a null-model check
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --method louvain --seed 1 --out /app/data/exports/speakers.md
+
+# k groups of entities, k chosen by silhouette
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network entities --method kmeans --features spectral --k-range 2-10 --seed 1 \
+  --out /app/data/exports/entities.md
+
+# the raw network, for Gephi or Cytoscape
+docker compose run --rm graphrag graphrag sna export <persona> \
+  --network topics --out /app/data/exports/topics.graphml
+```
+
+Pass `--seed` so the run can be repeated, and write under `/app/data/` so the file survives the
+container. The report carries the method rationale, the stability score, the null-model z-score
+and the caveats, so it can go into a corpus as a research note unedited.
+
+[SNA.md](SNA.md) has the full reference: which method for which question, how to read a z-score,
+and what to do when silhouette and BIC disagree.
+
 ### Share a persona with someone
 
 A persona is the unit you hand over: the role prompt, its sources, the built graph and the entity

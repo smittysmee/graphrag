@@ -10,11 +10,13 @@ from typing import Any
 import numpy as np
 
 from graphrag.embed.base import Matrix, Vector
+from graphrag.graph.vectors import stack_means
 from graphrag.models import (
     Chunk,
     Document,
     Enrichment,
     Entity,
+    EntityChunk,
     GraphStats,
     Mention,
     PersonaSpec,
@@ -22,7 +24,9 @@ from graphrag.models import (
     Relation,
     ScoredChunk,
     SpeakerCount,
+    SpeakerDocument,
     TopicCount,
+    TopicEdge,
 )
 
 TOKEN = re.compile(r"[a-z0-9]+")
@@ -292,3 +296,116 @@ class InMemoryGraphStore:
     ) -> list[dict[str, Any]]:
         msg = "Cypher is only available on the Neo4j store"
         raise NotImplementedError(msg)
+
+    # ------------------------------------------------------------- attribution
+    def attach_speaker(self, doc_id: str, chunk_id: str, speaker: str) -> None:
+        """Record that ``speaker`` wrote the passage ``chunk_id`` of document ``doc_id``.
+
+        Stored on the ``speakers`` lists rather than in a side table, because that is what the
+        Neo4j store builds its ``Speaker`` nodes from on upsert -- so an attributed document
+        survives a snapshot export and load with its speakers intact. The singular ``speaker``
+        field is left alone: it means "the voice of this turn", and one passage of a thread can
+        hold posts by several people.
+        """
+        chunk = self.chunks.get(chunk_id)
+        document = self.documents.get(doc_id)
+        if chunk is None or document is None or chunk.doc_id != doc_id:
+            return
+        if speaker not in chunk.speakers:
+            self.chunks[chunk_id] = chunk.model_copy(
+                update={"speakers": [*chunk.speakers, speaker]}
+            )
+        if speaker not in document.speakers:
+            self.documents[doc_id] = document.model_copy(
+                update={"speakers": [*document.speakers, speaker]}
+            )
+
+    def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        wanted = self.document_ids(persona_id, source_id)
+        return {doc_id for doc_id in wanted if self.documents[doc_id].speakers}
+
+    # ------------------------------------------------------------- network analysis
+    def speaker_document_pairs(
+        self, persona_id: str, source_id: str | None = None
+    ) -> list[SpeakerDocument]:
+        wanted = self.document_ids(persona_id, source_id)
+        by_doc: dict[str, list[Chunk]] = defaultdict(list)
+        for chunk in self.chunks.values():
+            if chunk.doc_id in wanted:
+                by_doc[chunk.doc_id].append(chunk)
+        rows: list[SpeakerDocument] = []
+        for doc_id in sorted(wanted):
+            chunks = by_doc.get(doc_id, [])
+            doc = self.documents[doc_id]
+            # A speaker counts as present if the document credits them or if they hold a passage.
+            names = set(doc.speakers) | {s for c in chunks for s in c.speakers}
+            for name in sorted(names):
+                spoken = sum(1 for c in chunks if name in c.speakers)
+                rows.append(SpeakerDocument(speaker=name, doc_id=doc_id, chunks=spoken))
+        rows.sort(key=lambda r: (r.speaker, r.doc_id))
+        return rows
+
+    def entity_chunk_pairs(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityChunk]:
+        wanted = self.document_ids(persona_id, source_id)
+        kinds = set(types) if types else None
+        rows: list[EntityChunk] = []
+        for mention in self.mentions:
+            chunk = self.chunks.get(mention.chunk_id)
+            entity = self.entities.get(mention.entity_id)
+            if chunk is None or entity is None or chunk.doc_id not in wanted:
+                continue
+            if kinds is not None and entity.type not in kinds:
+                continue
+            rows.append(
+                EntityChunk(
+                    entity_id=entity.id,
+                    name=entity.name,
+                    type=entity.type,
+                    chunk_id=chunk.id,
+                    doc_id=chunk.doc_id,
+                )
+            )
+        rows.sort(key=lambda r: (r.entity_id, r.chunk_id))
+        return rows
+
+    def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]:
+        present = {
+            t for d in self.documents.values() if d.persona_id == persona_id for t in d.topics
+        }
+        rows = [
+            TopicEdge(source=a, target=b, weight=w)
+            for (a, b), w in self.cooccurrence.items()
+            if w >= min_weight and a in present and b in present
+        ]
+        rows.sort(key=lambda r: (r.source, r.target))
+        return rows
+
+    def mean_embeddings(self, persona_id: str, level: str = "document") -> tuple[list[str], Matrix]:
+        sums: dict[str, np.ndarray] = {}
+        counts: Counter[str] = Counter()
+
+        def add(key: str, chunk_id: str) -> None:
+            vec = self.embeddings.get(chunk_id)
+            if vec is None:
+                return
+            sums[key] = sums.get(key, np.zeros_like(vec)) + vec
+            counts[key] += 1
+
+        if level == "document":
+            for chunk in self.chunks.values():
+                if chunk.persona_id == persona_id:
+                    add(chunk.doc_id, chunk.id)
+        elif level == "entity":
+            for mention in self.mentions:
+                mentioned = self.chunks.get(mention.chunk_id)
+                if mentioned is not None and mentioned.persona_id == persona_id:
+                    add(mention.entity_id, mentioned.id)
+        else:
+            msg = f"level must be 'document' or 'entity', got {level!r}"
+            raise ValueError(msg)
+        return stack_means(sums, counts)

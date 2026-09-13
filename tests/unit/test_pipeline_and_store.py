@@ -156,3 +156,98 @@ def test_reingest_replaces_chunks_instead_of_merging(
     assert second.documents == first.documents == 3
     assert memory_store.stats().chunks == second.chunks <= first.chunks
     assert not any("Charge early" in c.text for c in memory_store.chunks.values())
+
+
+def test_attach_speaker_and_attributed_document_ids(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag attribution-import` writes, and what `graphrag sync` reads back.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    assert memory_store.attributed_document_ids("test-docs", "threads") == set()
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+
+    memory_store.attach_speaker(thread_document, chunks[0].id, "quill-maker")
+    memory_store.attach_speaker(thread_document, chunks[-1].id, "ledger-ann")
+    memory_store.attach_speaker(thread_document, chunks[0].id, "quill-maker")  # idempotent
+
+    assert memory_store.attributed_document_ids("test-docs", "threads") == {thread_document}
+    assert memory_store.attributed_document_ids("test-docs", "docs") == set()
+    assert memory_store.attributed_document_ids("other-persona", "threads") == set()
+    assert memory_store.documents[thread_document].speakers == ["quill-maker", "ledger-ann"]
+    assert memory_store.document_chunks(thread_document, 0, 1)[0].speakers == ["quill-maker"]
+    assert memory_store.list_documents("test-docs", speaker="ledger-ann") != []
+    assert memory_store.stats().speakers == 2
+
+
+def test_network_reads_return_the_edges_the_sna_package_projects_from(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """The store contract behind `graphrag sna`.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    pairs = memory_store.speaker_document_pairs("test-pm")
+    assert [(p.speaker, p.doc_id) for p in pairs] == sorted(
+        (p.speaker, p.doc_id) for p in pairs
+    )  # stable order, so a projection is reproducible
+    host = [p for p in pairs if p.speaker == "Lenny Rachitsky"]
+    assert len(host) == 3 and all(p.chunks >= 1 for p in host)
+    assert len({p.doc_id for p in pairs}) == 3
+    assert memory_store.speaker_document_pairs("test-pm", "test-podcast") == pairs
+    assert memory_store.speaker_document_pairs("test-pm", "absent") == []
+    assert memory_store.speaker_document_pairs("other-persona") == []
+
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="metric:retention", name="Retention", type="metric"),
+                Entity(id="concept:onboarding", name="Onboarding", type="concept"),
+            ],
+            mentions=[
+                Mention(chunk_id=chunk_id, entity_id="metric:retention"),
+                Mention(chunk_id=chunk_id, entity_id="concept:onboarding"),
+            ],
+        )
+    )
+    mentions = memory_store.entity_chunk_pairs("test-pm")
+    assert {m.entity_id for m in mentions} == {"metric:retention", "concept:onboarding"}
+    assert all(m.chunk_id == chunk_id and m.doc_id == doc_id for m in mentions)
+    assert [m.name for m in mentions if m.entity_id == "metric:retention"] == ["Retention"]
+    typed = memory_store.entity_chunk_pairs("test-pm", types=["metric"])
+    assert [m.entity_id for m in typed] == ["metric:retention"]
+    assert memory_store.entity_chunk_pairs("test-pm", "absent") == []
+    assert memory_store.entity_chunk_pairs("other-persona") == []
+
+    edges = memory_store.topic_edges("test-pm", min_weight=1)
+    assert edges and all(e.source < e.target and e.weight >= 1 for e in edges)
+    assert memory_store.topic_edges("test-pm", min_weight=99) == []
+    assert memory_store.topic_edges("other-persona") == []
+
+
+def test_mean_embeddings_are_one_unit_vector_per_document_or_entity(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """What K-means and Gaussian mixtures cluster when asked for content rather than structure."""
+    doc_ids, matrix = memory_store.mean_embeddings("test-pm")
+    assert doc_ids == sorted(memory_store.document_ids("test-pm"))
+    assert matrix.shape == (3, 64)
+    assert np.allclose(np.linalg.norm(matrix, axis=1), 1.0, atol=1e-5)
+
+    chunk_id = memory_store.document_chunks(doc_ids[0], 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="metric:retention", name="Retention", type="metric")],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="metric:retention")],
+        )
+    )
+    keys, entity_matrix = memory_store.mean_embeddings("test-pm", level="entity")
+    assert keys == ["metric:retention"]
+    assert np.allclose(entity_matrix[0], memory_store.embeddings[chunk_id], atol=1e-5)
+
+    assert memory_store.mean_embeddings("other-persona")[0] == []
+    with pytest.raises(ValueError, match="level must be"):
+        memory_store.mean_embeddings("test-pm", level="chunk")

@@ -15,6 +15,8 @@ dependencies = [
     "pydantic-settings>=2.15.0,<3",
     "pyyaml>=6.0.3,<7",
     "numpy>=2.5.3,<3",
+    "networkx>=3.4,<4",
+    "scikit-learn>=1.6,<2",
     "pypdf>=6.18.0,<7",
     "anthropic>=1.4.0,<2",
     "rich>=15.0.0,<16",
@@ -97,7 +99,10 @@ packages = ["graphrag"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["fastembed", "fastembed.*", "pypdf", "pypdf.*"]
+module = [
+    "fastembed", "fastembed.*", "pypdf", "pypdf.*",
+    "networkx", "networkx.*", "sklearn", "sklearn.*",
+]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------- pytest

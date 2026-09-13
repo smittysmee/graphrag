@@ -97,6 +97,74 @@ EPISODES = {
 }
 
 
+"""A captured discussion thread: four posts by three handles, in one prose document.
+
+The loader that reads it knows nothing about posts, so the graph holds it with no speakers at
+all -- which is exactly the gap `graphrag attribution-import` fills. The bodies are long enough
+that the chunker splits the thread across more than one passage, so an anchor has somewhere
+wrong to land.
+"""
+THREAD_POSTS = [
+    (
+        "quill-maker",
+        "2025-02-03",
+        "I ran onboarding for three years and the part nobody warns you about is that the first "
+        "week decides how the next year goes. We tried a long written handbook and nobody read "
+        "it. What actually moved the needle was a single page listing the five things a new "
+        "person has to be able to do by Friday, and then getting out of the way. If you cannot "
+        "write that page, you do not understand the job well enough to hire for it yet. Write "
+        "the page first, hire second, and revise the page after every single start date.",
+    ),
+    (
+        "north-by",
+        "2025-02-03",
+        "Respectfully I think the one page idea is a trap. We used it for a year and all it did "
+        "was make people optimise for looking finished by Friday. The pairing model worked far "
+        "better for us. Every new starter sits with someone who joined six months earlier, "
+        "because that person still remembers which parts were confusing and has not yet "
+        "forgotten what the jargon means. It costs the pair about four hours a week for a month "
+        "and it has halved our time to a first real contribution, which is the only number I "
+        "actually care about.",
+    ),
+    (
+        "quill-maker",
+        "2025-02-04",
+        "That is fair and I do not think the two are opposed. We kept the page and added the "
+        "pairing on top of it once the team was big enough to spare the hours. The page is what "
+        "stops the pairing from turning into folklore, where each new person learns a slightly "
+        "different version of how things are done. Write down the parts that must not drift, and "
+        "let the pair handle everything else. The failure mode I still see most often is a "
+        "manager who delegates the whole thing and then wonders why two hires on one team work "
+        "completely differently.",
+    ),
+    (
+        "ledger-ann",
+        "2025-02-06",
+        "Late to this thread but I want to add the boring part that nobody mentions. Most of what "
+        "goes wrong in a first month is access. Accounts that were never created, a repository "
+        "nobody thought to grant, a calendar invite to the wrong address. We now run a checklist "
+        "the day before someone starts and we treat a missing account as an incident rather than "
+        "an inconvenience. It is unglamorous and it removed more frustration than any of the "
+        "mentoring schemes we tried before it.",
+    ),
+]
+
+
+def write_thread(root: Path) -> Path:
+    """Write the sample thread under ``root/threads``. Its own folder, so the ``docs`` fixtures
+    keep the document count their tests assert on."""
+    folder = root / "threads"
+    folder.mkdir(parents=True, exist_ok=True)
+    body = "\n\n".join(f"**{who}** wrote on {when}:\n{text}" for who, when, text in THREAD_POSTS)
+    path = folder / "onboarding-thread.md"
+    path.write_text(
+        "---\ntitle: How do you handle onboarding for a new hire\n---\n\n"
+        "# How do you handle onboarding for a new hire\n\n" + body + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_sample_corpus(root: Path) -> Path:
     """Write three small synthetic transcripts in the Lenny's-archive layout under ``root``."""
     for slug, ep in EPISODES.items():
@@ -140,6 +208,7 @@ def write_sample_corpus(root: Path) -> Path:
         "Frequently asked questions.\n\nCan I keep my doctor? Check the plan network first.\n",
         encoding="utf-8",
     )
+    write_thread(root)
     return root
 
 
@@ -163,6 +232,12 @@ def transcript_source() -> SourceSpec:
 @pytest.fixture
 def documents_source() -> SourceSpec:
     return SourceSpec(id="docs", kind="local", path="docs", loader="documents", glob="**/*")
+
+
+@pytest.fixture
+def thread_source() -> SourceSpec:
+    """A documents source whose one file is a discussion thread, so it arrives with no speakers."""
+    return SourceSpec(id="threads", kind="local", path="threads", loader="documents", glob="**/*")
 
 
 @pytest.fixture
@@ -216,6 +291,19 @@ def ingested(
 
 
 @pytest.fixture
+def thread_document(
+    sample_corpus: Path,
+    docs_persona: PersonaSpec,
+    thread_source: SourceSpec,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+) -> str:
+    """The ingested thread's document id: one document, several passages, and no speakers yet."""
+    IngestPipeline(memory_store, hash_embedder).ingest(sample_corpus, docs_persona, thread_source)
+    return next(iter(memory_store.document_ids(docs_persona.id, thread_source.id)))
+
+
+@pytest.fixture
 def retriever(memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder) -> Retriever:
     return Retriever(memory_store, hash_embedder)
 
@@ -227,6 +315,7 @@ def settings(tmp_path: Path) -> Settings:
         raw_dir=tmp_path / "raw",
         snapshots_dir=tmp_path / "snapshots",
         enrichment_dir=tmp_path / "enrichment",
+        attribution_dir=tmp_path / "attribution",
         skills_dir=tmp_path / "skills",
         neo4j=Neo4jSettings(uri="bolt://unused:7687"),
         embedding=EmbeddingSettings(backend="hash", model="hash-test", dim=DIM),

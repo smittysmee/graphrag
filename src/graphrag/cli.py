@@ -328,6 +328,7 @@ def sync(
                 embedder=ctx.require_embedder,
                 raw_root=ctx.settings.raw_dir / spec.id,
                 enrichment_root=ctx.settings.enrichment_dir,
+                attribution_root=ctx.settings.attribution_dir,
                 source_id=source,
                 dry_run=dry_run,
                 progress=_progress,
@@ -338,7 +339,7 @@ def sync(
         for line in summary_lines(report):
             console.print(line)
         if report.errors:
-            err.print(f"[yellow]{len(report.errors)} extraction files failed to import[/yellow]")
+            err.print(f"[yellow]{len(report.errors)} files failed to import[/yellow]")
         if export and report.wrote:
             snap.export_snapshot(
                 ctx.store,
@@ -897,6 +898,238 @@ def embed_server() -> None:
     from graphrag.embed.server import main as embed_main
 
     embed_main(_settings())
+
+
+# ----------------------------------------------------------------------------- attribution
+
+
+@app.command("attribution-import")
+def attribution_import(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    files: Annotated[list[Path], typer.Argument(help="JSON files: {doc_id, posts}.")],
+    export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Validate and report only; write nothing.")
+    ] = False,
+) -> None:
+    """Attach speakers to the passages they wrote, from JSON an agent produced.
+
+    For documents whose loader parsed no speaker turns, such as a captured discussion thread:
+    each post names a speaker and quotes its opening words, and those words are looked for in
+    the document's passages. Reports posts whose anchor occurs in no passage (they are skipped,
+    never guessed at), so a reviewer can fix the quote before writing.
+    """
+    from graphrag.extract.attribution import import_attribution_file
+
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        total_posts = total_attached = total_loose = 0
+        voices: set[str] = set()
+        problems = 0
+        for file in files:
+            result = import_attribution_file(ctx.store, file, dry_run=dry_run)
+            if not result.ok:
+                err.print(f"[red]{file}: {result.error}[/red]")
+                problems += 1
+                continue
+            total_posts += result.posts
+            total_attached += result.attached
+            total_loose += len(result.loose)
+            voices.update(result.speakers)
+            console.print(
+                f"{result.doc_id}: {result.attached}/{result.posts} posts attached, "
+                f"{len(result.speakers)} speakers"
+                + (f"; [yellow]{len(result.loose)} loose anchors[/yellow]" if result.loose else "")
+            )
+            for post in result.loose:
+                err.print(f"  loose: {post}", markup=False, highlight=False)
+        verb = "validated" if dry_run else "imported"
+        console.print(
+            f"[green]{verb}[/green] {len(files) - problems} files: {total_attached}/{total_posts} "
+            f"posts attached, {len(voices)} speakers, {total_loose} loose anchors"
+        )
+        if problems:
+            raise typer.Exit(2)
+        if export and not dry_run:
+            snap.export_snapshot(
+                ctx.store,
+                spec,
+                ctx.snapshots_dir,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
+            )
+            console.print("snapshot re-exported")
+    finally:
+        ctx.close()
+
+
+# ----------------------------------------------------------------------------- network analysis
+
+
+sna_app = typer.Typer(
+    help="Build, measure and cluster the graph's networks (speakers, entities, topics).",
+    no_args_is_help=True,
+)
+app.add_typer(sna_app, name="sna")
+
+
+def _parse_k_range(text: str) -> list[int]:
+    """``2-10`` or ``3,5,8`` into a list of candidate k values."""
+    try:
+        if "-" in text:
+            low, high = (int(part) for part in text.split("-", 1))
+            return list(range(low, high + 1))
+        return [int(part) for part in text.split(",") if part.strip()]
+    except ValueError as exc:
+        msg = f"--k-range must look like 2-10 or 3,5,8, got {text!r}"
+        raise typer.BadParameter(msg) from exc
+
+
+def _network_or_exit(network: str) -> str:
+    from graphrag.sna.export import NETWORKS
+
+    if network not in NETWORKS:
+        err.print(f"[red]--network must be one of {', '.join(NETWORKS)}[/red]")
+        raise typer.Exit(2)
+    return network
+
+
+@sna_app.command("export")
+def sna_export(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Target .graphml or .json file.")],
+    network: Annotated[str, typer.Option(help="speakers | entities | topics")] = "speakers",
+    source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
+    min_weight: Annotated[
+        int | None, typer.Option("--min-weight", help="Drop edges below this weight.")
+    ] = None,
+    types: Annotated[
+        str | None, typer.Option(help="Entity types to keep, comma separated.")
+    ] = None,
+) -> None:
+    """Write one of the graph's networks to GraphML or node-link JSON."""
+    from graphrag.sna.export import build_network, write_graph
+
+    network = _network_or_exit(network)
+    ctx = State.context()
+    try:
+        ctx.registry.get(persona)  # fail fast on an unknown persona
+        graph = build_network(
+            ctx.store,
+            network,
+            persona,
+            source_id=source,
+            min_weight=min_weight,
+            types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+        )
+    finally:
+        ctx.close()
+    _warn_if_ephemeral(out)
+    write_graph(graph, out)
+    console.print(
+        f"[green]wrote[/green] {out}: {graph.number_of_nodes():,} nodes, "
+        f"{graph.number_of_edges():,} edges ({network})"
+    )
+
+
+@sna_app.command("analyze")
+def sna_analyze(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Markdown report to write.")],
+    network: Annotated[str, typer.Option(help="speakers | entities | topics")] = "speakers",
+    method: Annotated[str, typer.Option(help="louvain | kmeans | gmm")] = "louvain",
+    k: Annotated[int | None, typer.Option("-k", help="Force k; otherwise it is chosen.")] = None,
+    k_range: Annotated[str, typer.Option("--k-range", help="Candidates, e.g. 2-10.")] = "2-10",
+    resolution: Annotated[float, typer.Option(help="Louvain resolution.")] = 1.0,
+    runs: Annotated[int, typer.Option(help="Louvain seeds to compare for stability.")] = 10,
+    features: Annotated[str, typer.Option(help="spectral | embedding")] = "spectral",
+    dims: Annotated[int, typer.Option(help="Spectral embedding dimensions.")] = 8,
+    covariance: Annotated[str, typer.Option(help="GMM covariance: full|tied|diag|spherical.")] = (
+        "full"
+    ),
+    samples: Annotated[int, typer.Option(help="Null-model rewirings.")] = 50,
+    source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
+    min_weight: Annotated[int | None, typer.Option("--min-weight")] = None,
+    types: Annotated[str | None, typer.Option(help="Entity types, comma separated.")] = None,
+    seed: Annotated[int | None, typer.Option(help="Fix every random seed.")] = None,
+    as_json: Annotated[Path | None, typer.Option("--json", help="Also write JSON here.")] = None,
+) -> None:
+    """Measure a network, group it, check the grouping, and write a markdown report."""
+    from graphrag.sna.analysis import METHODS, render_markdown, run_analysis, to_payload
+    from graphrag.sna.export import build_network
+
+    network = _network_or_exit(network)
+    if method not in METHODS:
+        err.print(f"[red]--method must be one of {', '.join(METHODS)}[/red]")
+        raise typer.Exit(2)
+
+    ctx = State.context()
+    try:
+        ctx.registry.get(persona)
+        graph = build_network(
+            ctx.store,
+            network,
+            persona,
+            source_id=source,
+            min_weight=min_weight,
+            types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+        )
+        try:
+            analysis = run_analysis(
+                ctx.store,
+                graph,
+                persona_id=persona,
+                network=network,
+                method=method,
+                k=k,
+                k_range=_parse_k_range(k_range),
+                resolution=resolution,
+                runs=runs,
+                features=features,  # type: ignore[arg-type]
+                dims=dims,
+                covariance=covariance,
+                samples=samples,
+                seed=seed,
+            )
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
+    finally:
+        ctx.close()
+
+    _warn_if_ephemeral(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_markdown(analysis), encoding="utf-8")
+    console.print(
+        f"[green]wrote[/green] {out}: {int(analysis.summary['nodes']):,} nodes, "
+        f"{int(analysis.summary['edges']):,} edges, {len(analysis.groups)} "
+        f"{analysis.group_noun}(s)"
+    )
+    if analysis.louvain_result is not None:
+        console.print(
+            f"  modularity {analysis.louvain_result.modularity:.4f}, "
+            f"stability (ARI) {analysis.louvain_result.stability:.3f}"
+        )
+    if analysis.null_model is not None:
+        console.print(
+            f"  null model z={analysis.null_model.z_score:.2f} — {analysis.null_model.verdict}"
+        )
+    for note in analysis.notes:
+        err.print(f"  note: {note}")
+    if as_json is not None:
+        _warn_if_ephemeral(as_json)
+        as_json.parent.mkdir(parents=True, exist_ok=True)
+        as_json.write_text(json.dumps(to_payload(analysis), indent=2), encoding="utf-8")
+        console.print(f"[green]wrote[/green] {as_json}")
+
+
+@sna_app.command("guide")
+def sna_guide() -> None:
+    """Print the method-selection rules: which network, which method, which centrality."""
+    from graphrag.sna.guide import render_guide
+
+    console.print(render_guide(), markup=False, highlight=False)
 
 
 if __name__ == "__main__":

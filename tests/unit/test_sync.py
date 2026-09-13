@@ -25,7 +25,7 @@ from graphrag.sync import (
     summary_lines,
     sync_persona,
 )
-from tests.conftest import write_sample_corpus
+from tests.conftest import THREAD_POSTS, write_sample_corpus
 
 PERSONA_ID = "test-multi"
 TRANSCRIPTS = "test-podcast"
@@ -438,3 +438,231 @@ def test_summary_lines_report_what_a_real_run_did() -> None:
     assert lines[1] == "  bad.json: invalid"
     assert lines[2] == "b: up to date"
     assert lines[-1] == "p: synced 1 source(s), 1 documents were missing"
+
+
+# ----------------------------------------------------------------------------- attribution
+
+THREADS = "threads"
+
+
+@pytest.fixture
+def thread_persona(thread_source: SourceSpec) -> PersonaSpec:
+    """One source of prose documents: ingesting it gives the graph no speakers at all."""
+    return PersonaSpec(id=PERSONA_ID, name="Test Threads", sources=[thread_source])
+
+
+@pytest.fixture
+def attribution_root(tmp_path: Path) -> Path:
+    path = tmp_path / "attribution"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture
+def threaded(
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+) -> str:
+    """The ingested thread's document id: the state sync is supposed to find a speaker gap in."""
+    IngestPipeline(memory_store, hash_embedder).ingest(
+        raw_root, thread_persona, thread_persona.sources[0]
+    )
+    return next(iter(memory_store.document_ids(PERSONA_ID, THREADS)))
+
+
+def write_attribution(directory: Path, doc_id: str, speaker: str = "quill-maker") -> Path:
+    """One attribution file whose single anchor is the thread's opening sentence."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{doc_id.rsplit(':', 1)[-1]}.json"
+    payload = {
+        "doc_id": doc_id,
+        "posts": [{"speaker": speaker, "anchor": THREAD_POSTS[0][2][:60], "role": "op"}],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_an_up_to_date_source_imports_files_for_documents_with_no_speakers(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """Ingest and attribution are separate steps, exactly as ingest and extraction are."""
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded)
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.stale is False  # `no_embedder` proves nothing was re-ingested
+    assert threads.attribution_files == 1
+    assert threads.attribution_errors == ()
+    assert memory_store.documents[threaded].speakers == ["quill-maker"]
+    assert memory_store.attributed_document_ids(PERSONA_ID, THREADS) == {threaded}
+    assert report.wrote is True
+    assert summary_lines(report)[0] == (
+        f"{THREADS}: up to date, imported 1 attribution files for documents without speakers"
+    )
+    assert summary_lines(report)[-1] == (
+        f"{PERSONA_ID}: nothing to ingest, imported 1 attribution files for documents "
+        f"without speakers"
+    )
+
+
+def test_a_document_that_already_has_speakers_is_not_imported_again(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """Otherwise every run would re-attribute the whole corpus for nothing."""
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded, speaker="from-the-file")
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "already-here"
+    )
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.attribution_files == 0
+    assert memory_store.documents[threaded].speakers == ["already-here"]
+    assert report.wrote is False
+    assert summary_lines(report)[-1] == f"{PERSONA_ID}: nothing to sync"
+
+
+def test_attribution_is_reimported_because_a_re_ingest_drops_speakers(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """SPOKE edges hang off chunks, so a re-ingest costs a document its attributed speakers."""
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded)
+    memory_store.delete_documents([threaded])  # as if the thread never reached the graph
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        embedder=lambda: hash_embedder,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.missing == (threaded,)
+    assert threads.attribution_files == 1
+    assert memory_store.documents[threaded].speakers == ["quill-maker"]
+    assert summary_lines(report)[0].endswith(
+        "re-imported 0 extraction files and 1 attribution files"
+    )
+
+
+def test_an_unimportable_attribution_file_is_reported_not_raised(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    broken = attribution_root / PERSONA_ID / THREADS / "broken.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text(json.dumps({"doc_id": f"{PERSONA_ID}:{THREADS}:gone"}), encoding="utf-8")
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded)
+    memory_store.delete_documents([threaded])
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        embedder=lambda: hash_embedder,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.attribution_files == 1
+    assert len(threads.attribution_errors) == 1
+    assert "unknown document" in threads.attribution_errors[0]
+    assert report.errors == threads.attribution_errors
+    assert summary_lines(report)[1] == f"  broken.json: {threads.attribution_errors[0][13:]}"
+
+
+def test_a_dry_run_counts_attribution_files_without_importing_them(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded)
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        dry_run=True,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.attribution_files == 1
+    assert memory_store.documents[threaded].speakers == []
+    assert report.wrote is False
+    assert summary_lines(report)[0] == (
+        f"{THREADS}: up to date, would import 1 attribution files for documents without speakers"
+    )
+
+
+def test_no_attribution_directory_is_not_a_finding(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """Most personas have none, and their sync output must read as it always did."""
+    report = run(memory_store, thread_persona, raw_root, enrichment_root)
+
+    assert report.backfilled_attribution_files == 0
+    assert summary_lines(report) == [f"{THREADS}: up to date", f"{PERSONA_ID}: nothing to sync"]
+
+
+def test_summary_lines_report_both_layers_when_both_did_something() -> None:
+    report = SyncReport(
+        persona_id="p",
+        sources=(SourceReport(source_id="a", enrichment_files=2, attribution_files=3),),
+    )
+    assert summary_lines(report)[0] == (
+        "a: up to date, imported 2 extraction files for documents without entities, "
+        "imported 3 attribution files for documents without speakers"
+    )
+    assert summary_lines(report)[-1] == (
+        "p: nothing to ingest, imported 2 extraction files for documents without entities, "
+        "imported 3 attribution files for documents without speakers"
+    )

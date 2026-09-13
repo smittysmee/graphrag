@@ -9,12 +9,15 @@ from graphrag.models import (
     Document,
     Enrichment,
     Entity,
+    EntityChunk,
     GraphStats,
     PersonaSpec,
     RelatedTopic,
     ScoredChunk,
     SpeakerCount,
+    SpeakerDocument,
     TopicCount,
+    TopicEdge,
 )
 
 
@@ -79,3 +82,28 @@ class GraphStore(Protocol):
     def run_readonly_cypher(
         self, query: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]: ...
+
+    # attribution: speakers for documents whose loader parsed no speaker turns
+    # Idempotent: re-attaching the same speaker to the same passage changes nothing.
+    def attach_speaker(self, doc_id: str, chunk_id: str, speaker: str) -> None: ...
+    # documents of one source that already carry at least one speaker
+    def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
+
+    # network analysis (graphrag.sna)
+    # Bipartite edges the speaker and entity networks are projected from, plus the persisted
+    # topic co-occurrence edges. Read-only, paged, and scoped to one persona.
+    def speaker_document_pairs(
+        self, persona_id: str, source_id: str | None = None
+    ) -> list[SpeakerDocument]: ...
+    def entity_chunk_pairs(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityChunk]: ...
+    def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]: ...
+    # Mean chunk embedding per document or per entity, L2-normalised, for clustering by content
+    # rather than by graph structure. Returns the key order and a matrix aligned to it.
+    def mean_embeddings(
+        self, persona_id: str, level: str = "document"
+    ) -> tuple[list[str], Matrix]: ...

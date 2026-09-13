@@ -279,3 +279,34 @@ class SnapshotManifest(BaseModel):
     sources: list[SourceSpec] = Field(default_factory=list)
     source_commit: str | None = None
     tool_version: str = ""
+
+
+# ----------------------------------------------------------------------------- network analysis
+
+
+class SpeakerDocument(BaseModel):
+    """One speaker's participation in one document: the bipartite edge the speaker network is
+    projected from."""
+
+    speaker: str
+    doc_id: str
+    chunks: int = 0
+
+
+class EntityChunk(BaseModel):
+    """One entity mentioned in one passage: the bipartite edge the entity network is projected
+    from."""
+
+    entity_id: str
+    name: str
+    type: str = "other"
+    chunk_id: str
+    doc_id: str
+
+
+class TopicEdge(BaseModel):
+    """A persisted ``Topic-[:CO_OCCURS]-Topic`` edge, oriented so ``source < target``."""
+
+    source: str
+    target: str
+    weight: int = 1

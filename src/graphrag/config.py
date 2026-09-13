@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     raw_dir: Path = Path("data/raw")
     snapshots_dir: Path = Path("data/snapshots")
     enrichment_dir: Path = Path("data/enrichment")
+    attribution_dir: Path = Path("data/attribution")
     model_cache_dir: Path = Path("/models")
     skills_dir: Path = Path(".claude/skills")
 

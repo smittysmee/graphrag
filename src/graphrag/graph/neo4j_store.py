@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from datetime import date
 from itertools import pairwise
@@ -16,11 +17,13 @@ from neo4j import GraphDatabase, RoutingControl
 from graphrag.config import Neo4jSettings
 from graphrag.embed.base import Matrix, Vector
 from graphrag.graph.schema import FULLTEXT_INDEX, VECTOR_INDEX, lucene_escape, schema_statements
+from graphrag.graph.vectors import stack_means
 from graphrag.models import (
     Chunk,
     Document,
     Enrichment,
     Entity,
+    EntityChunk,
     GraphStats,
     Mention,
     PersonaSpec,
@@ -28,7 +31,9 @@ from graphrag.models import (
     Relation,
     ScoredChunk,
     SpeakerCount,
+    SpeakerDocument,
     TopicCount,
+    TopicEdge,
 )
 
 BATCH = 500
@@ -612,3 +617,156 @@ class Neo4jGraphStore:
         with self._driver.session(database=self._db, default_access_mode="READ") as session:
             result = session.run(query, params or {})
             return [record.data() for record in result][:500]
+
+    # ------------------------------------------------------------- attribution
+    def attach_speaker(self, doc_id: str, chunk_id: str, speaker: str) -> None:
+        """Record that ``speaker`` wrote the passage ``chunk_id`` of document ``doc_id``.
+
+        Writes the same shape the transcripts path writes on upsert -- a ``Speaker`` node, a
+        ``SPOKE`` edge to the passage and a ``FEATURES`` edge from the document -- plus the
+        ``speakers`` properties those edges are rebuilt from, so an attributed document survives
+        a snapshot export and load. Every ``MERGE`` makes re-import a no-op. A ``chunk_id`` that
+        is not a passage of ``doc_id`` matches nothing and writes nothing.
+        """
+        self._run(
+            """
+            MATCH (d:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk {id: $chunk_id})
+            MERGE (s:Speaker {name: $speaker})
+            MERGE (s)-[:SPOKE]->(c)
+            MERGE (d)-[:FEATURES]->(s)
+            SET c.speakers = CASE
+                    WHEN $speaker IN coalesce(c.speakers, []) THEN c.speakers
+                    ELSE coalesce(c.speakers, []) + $speaker END,
+                d.speakers = CASE
+                    WHEN $speaker IN coalesce(d.speakers, []) THEN d.speakers
+                    ELSE coalesce(d.speakers, []) + $speaker END
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+            speaker=speaker,
+        )
+
+    def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id AND EXISTS { MATCH (d)-[:FEATURES]->(:Speaker) }
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
+    # ------------------------------------------------------------- network analysis
+    def _paged(self, query: str, **params: Any) -> Iterator[dict[str, Any]]:
+        """Run a read-only query in ``BATCH``-row pages. The query must end in SKIP/LIMIT."""
+        skip = 0
+        while True:
+            rows = self._read(query, skip=skip, page=BATCH, **params)
+            yield from rows
+            if len(rows) < BATCH:
+                return
+            skip += BATCH
+
+    def speaker_document_pairs(
+        self, persona_id: str, source_id: str | None = None
+    ) -> list[SpeakerDocument]:
+        # A speaker belongs to a document either because the document credits them (FEATURES)
+        # or because they hold one of its passages (SPOKE); ingestion writes both, but an
+        # attribution pass can land one before the other, so take the union.
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE $source_id IS NULL OR d.source_id = $source_id
+            CALL {
+              WITH d
+              MATCH (d)-[:FEATURES]->(s:Speaker) RETURN s
+              UNION
+              WITH d
+              MATCH (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(s:Speaker) RETURN s
+            }
+            WITH d, s
+            OPTIONAL MATCH (s)-[:SPOKE]->(c:Chunk {doc_id: d.id})
+            RETURN s.name AS speaker, d.id AS doc_id, count(c) AS chunks
+            ORDER BY speaker, doc_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return [
+            SpeakerDocument(speaker=r["speaker"], doc_id=r["doc_id"], chunks=int(r["chunks"]))
+            for r in rows
+        ]
+
+    def entity_chunk_pairs(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityChunk]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+            MATCH (c)-[:MENTIONS]->(e:Entity)
+            WHERE ($source_id IS NULL OR d.source_id = $source_id)
+              AND ($types IS NULL OR e.type IN $types)
+            RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
+                   c.id AS chunk_id, d.id AS doc_id
+            ORDER BY entity_id, chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+            types=list(types) if types else None,
+        )
+        return [EntityChunk.model_validate(r) for r in rows]
+
+    def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]:
+        rows = self._paged(
+            """
+            MATCH (a:Topic)-[r:CO_OCCURS]-(b:Topic)
+            WHERE a.name < b.name AND coalesce(r.weight, 1) >= $min_weight
+              AND EXISTS { MATCH (:Document {persona_id: $persona_id})-[:ABOUT]->(a) }
+              AND EXISTS { MATCH (:Document {persona_id: $persona_id})-[:ABOUT]->(b) }
+            RETURN a.name AS source, b.name AS target, coalesce(r.weight, 1) AS weight
+            ORDER BY source, target
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            min_weight=min_weight,
+        )
+        return [
+            TopicEdge(source=r["source"], target=r["target"], weight=int(r["weight"])) for r in rows
+        ]
+
+    def mean_embeddings(self, persona_id: str, level: str = "document") -> tuple[list[str], Matrix]:
+        if level == "document":
+            query = """
+                MATCH (c:Chunk {persona_id: $persona_id})
+                RETURN c.doc_id AS key, c.embedding AS embedding
+                ORDER BY c.doc_id, c.ordinal
+                SKIP $skip LIMIT $page
+                """
+        elif level == "entity":
+            query = """
+                MATCH (c:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+                RETURN e.id AS key, c.embedding AS embedding
+                ORDER BY e.id, c.id
+                SKIP $skip LIMIT $page
+                """
+        else:
+            msg = f"level must be 'document' or 'entity', got {level!r}"
+            raise ValueError(msg)
+        sums: dict[str, np.ndarray] = {}
+        counts: Counter[str] = Counter()
+        for row in self._paged(query, persona_id=persona_id):
+            raw = row["embedding"]
+            if not raw:
+                continue
+            vec = np.asarray(raw, dtype=np.float32)
+            key = row["key"]
+            sums[key] = sums.get(key, np.zeros_like(vec)) + vec
+            counts[key] += 1
+        return stack_means(sums, counts)

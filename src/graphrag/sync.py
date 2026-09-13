@@ -14,6 +14,11 @@ A source that is up to date still gets one more check, because ingesting and ext
 separate steps: a document can sit in the graph with no entities at all, because its extraction
 file was written after it was ingested or because importing that file failed. Those files are
 imported too, so "up to date" means the entity layer is complete rather than only the documents.
+
+Attribution files ride along on exactly the same reasoning. ``SPOKE`` edges hang off chunks, so a
+re-ingest drops them; and a document loaded without speaker turns can sit in the graph with no
+speaker at all until its attribution file lands. Both cases are handled beside the extraction
+ones, against :func:`graphrag.extract.attribution.import_attribution_file`.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from graphrag.embed.base import Embedder
+from graphrag.extract.attribution import import_attribution_file
 from graphrag.extract.importer import import_extraction_file, read_doc_id
 from graphrag.graph.store import GraphStore
 from graphrag.ingest.loaders import load_source
@@ -34,6 +40,7 @@ __all__ = [
     "SyncReport",
     "UnknownSourceError",
     "expected_document_ids",
+    "index_attributions",
     "index_extractions",
     "missing_document_ids",
     "summary_lines",
@@ -57,6 +64,8 @@ class SourceReport:
     ingested_chunks: int = 0
     enrichment_files: int = 0  # extraction files imported (or, dry run, that would be)
     enrichment_errors: tuple[str, ...] = ()
+    attribution_files: int = 0  # attribution files imported (or, dry run, that would be)
+    attribution_errors: tuple[str, ...] = ()
 
     @property
     def stale(self) -> bool:
@@ -85,13 +94,22 @@ class SyncReport:
         return sum(s.enrichment_files for s in self.sources if not s.stale)
 
     @property
+    def backfilled_attribution_files(self) -> int:
+        """Attribution files imported for sources that needed no re-ingest, or that would be."""
+        return sum(s.attribution_files for s in self.sources if not s.stale)
+
+    @property
     def wrote(self) -> bool:
         """Whether the graph changed, which is what decides if a new snapshot is worth taking."""
-        return not self.dry_run and any(s.stale or s.enrichment_files for s in self.sources)
+        return not self.dry_run and any(
+            s.stale or s.enrichment_files or s.attribution_files for s in self.sources
+        )
 
     @property
     def errors(self) -> tuple[str, ...]:
-        return tuple(err for s in self.sources for err in s.enrichment_errors)
+        return tuple(
+            err for s in self.sources for err in (*s.enrichment_errors, *s.attribution_errors)
+        )
 
 
 def expected_document_ids(raw_root: Path, persona: PersonaSpec, source: SourceSpec) -> list[str]:
@@ -143,6 +161,16 @@ def index_extractions(enrichment_root: Path) -> dict[str, list[Path]]:
     return grouped
 
 
+def index_attributions(attribution_root: Path | None) -> dict[str, list[Path]]:
+    """Every attribution file under ``attribution_root``, grouped by ``<persona>:<source>:``.
+
+    The same grouping as :func:`index_extractions`, and for the same reason: what ties a file to
+    a source is the ``doc_id`` inside it. ``None`` means the caller has no attribution directory,
+    which is not a finding.
+    """
+    return index_extractions(attribution_root) if attribution_root else {}
+
+
 def sync_persona(
     persona: PersonaSpec,
     *,
@@ -150,6 +178,7 @@ def sync_persona(
     embedder: Callable[[], Embedder],
     raw_root: Path,
     enrichment_root: Path,
+    attribution_root: Path | None = None,
     source_id: str | None = None,
     dry_run: bool = False,
     progress: Progress | None = None,
@@ -161,17 +190,24 @@ def sync_persona(
     """
     say = progress or (lambda _msg: None)
     extractions = index_extractions(enrichment_root)
+    attributions = index_attributions(attribution_root)
     pipeline: IngestPipeline | None = None
     reports: list[SourceReport] = []
 
     for source in _select(persona, source_id):
         missing = missing_document_ids(store, raw_root, persona, source)
-        files = extractions.get(f"{persona.id}:{source.id}:", [])
+        key = f"{persona.id}:{source.id}:"
+        files = extractions.get(key, [])
+        voices = attributions.get(key, [])
         if dry_run:
             pending = _pending(store, persona, source, files, reingested=bool(missing))
+            waiting = _pending_attribution(store, persona, source, voices, reingested=bool(missing))
             reports.append(
                 SourceReport(
-                    source_id=source.id, missing=tuple(missing), enrichment_files=len(pending)
+                    source_id=source.id,
+                    missing=tuple(missing),
+                    enrichment_files=len(pending),
+                    attribution_files=len(waiting),
                 )
             )
             continue
@@ -185,6 +221,11 @@ def sync_persona(
         # After the re-ingest, so the documents it replaced count as needing their entities back.
         pending = _pending(store, persona, source, files, reingested=bool(missing))
         imported, errors = _reimport(store, pending, say, reingested=bool(missing))
+        # Likewise for speakers: a re-ingest deleted the chunks their SPOKE edges hung off.
+        waiting = _pending_attribution(store, persona, source, voices, reingested=bool(missing))
+        attributed, voice_errors = _reimport_attribution(
+            store, waiting, say, reingested=bool(missing)
+        )
         reports.append(
             SourceReport(
                 source_id=source.id,
@@ -193,6 +234,8 @@ def sync_persona(
                 ingested_chunks=chunks,
                 enrichment_files=imported,
                 enrichment_errors=errors,
+                attribution_files=attributed,
+                attribution_errors=voice_errors,
             )
         )
     return SyncReport(persona_id=persona.id, sources=tuple(reports), dry_run=dry_run)
@@ -254,6 +297,53 @@ def _reimport(
     return imported, tuple(errors)
 
 
+def _pending_attribution(
+    store: GraphStore,
+    persona: PersonaSpec,
+    source: SourceSpec,
+    files: list[Path],
+    *,
+    reingested: bool,
+) -> list[Path]:
+    """The attribution files this source needs put into the graph now.
+
+    The reasoning is :func:`_pending`'s, one layer over: a re-ingested source needs all of them,
+    because re-ingesting deleted the chunks its ``SPOKE`` edges hung off. A source that was left
+    alone needs only the files whose document carries no speaker at all -- a thread whose
+    attribution JSON was written after it was ingested, or whose import failed at the time.
+    """
+    if reingested:
+        return files
+    unattributed = store.document_ids(persona.id, source.id) - store.attributed_document_ids(
+        persona.id, source.id
+    )
+    if not unattributed:
+        return []
+    return [path for path in files if read_doc_id(path) in unattributed]
+
+
+def _reimport_attribution(
+    store: GraphStore, files: list[Path], say: Progress, *, reingested: bool
+) -> tuple[int, tuple[str, ...]]:
+    """Put a source's pending attribution files back into the graph.
+
+    A file whose anchors all came loose still counts as imported: it was read and applied, and
+    the loose anchors are ``attribution-import``'s report to make, not this one's.
+    """
+    if files:
+        what = "re-importing" if reingested else "importing"
+        say(f"{what} {len(files)} attribution files")
+    imported = 0
+    errors: list[str] = []
+    for path in files:
+        result = import_attribution_file(store, path)
+        if result.ok:
+            imported += 1
+        else:
+            errors.append(f"{path.name}: {result.error}")
+    return imported, tuple(errors)
+
+
 def _backfill_clause(src: SourceReport, dry_run: bool) -> str:
     """What an up-to-date source did about documents that had no entities, if anything."""
     if not src.enrichment_files:
@@ -262,40 +352,73 @@ def _backfill_clause(src: SourceReport, dry_run: bool) -> str:
     return f", {verb} {src.enrichment_files} extraction files for documents without entities"
 
 
+def _attribution_clause(src: SourceReport, dry_run: bool) -> str:
+    """What an up-to-date source did about documents that had no speakers, if anything.
+
+    Empty unless there were attribution files, so a corpus that uses none reads exactly as it
+    did before the attribution layer existed.
+    """
+    if not src.attribution_files:
+        return ""
+    verb = "would import" if dry_run else "imported"
+    return f", {verb} {src.attribution_files} attribution files for documents without speakers"
+
+
+def _reimported_clause(src: SourceReport) -> str:
+    """The attribution half of a stale source's line, left out when there is none."""
+    if not src.attribution_files:
+        return ""
+    return f" and {src.attribution_files} attribution files"
+
+
+def _closing_line(report: SyncReport) -> str:
+    """The last line: what the run did overall, in the terms the run was about."""
+    if report.missing_total and report.dry_run:
+        return (
+            f"{report.persona_id}: {report.missing_total} documents would be ingested "
+            f"across {len(report.stale_sources)} source(s)"
+        )
+    if report.missing_total:
+        return (
+            f"{report.persona_id}: synced {len(report.stale_sources)} source(s), "
+            f"{report.missing_total} documents were missing"
+        )
+    verb = "would import" if report.dry_run else "imported"
+    clauses = []
+    if report.backfilled_files:
+        clauses.append(
+            f"{verb} {report.backfilled_files} extraction files for documents without entities"
+        )
+    if report.backfilled_attribution_files:
+        clauses.append(
+            f"{verb} {report.backfilled_attribution_files} attribution files for documents "
+            f"without speakers"
+        )
+    if not clauses:
+        return f"{report.persona_id}: nothing to sync"
+    return f"{report.persona_id}: nothing to ingest, " + ", ".join(clauses)
+
+
 def summary_lines(report: SyncReport) -> list[str]:
     """One line per source, plus a closing line. Pure, so it is what the tests assert on."""
     lines: list[str] = []
     for src in report.sources:
         if not src.stale:
-            lines.append(f"{src.source_id}: up to date{_backfill_clause(src, report.dry_run)}")
+            lines.append(
+                f"{src.source_id}: up to date{_backfill_clause(src, report.dry_run)}"
+                f"{_attribution_clause(src, report.dry_run)}"
+            )
         elif report.dry_run:
             lines.append(
                 f"{src.source_id}: {len(src.missing)} documents missing; would re-ingest and "
-                f"re-import {src.enrichment_files} extraction files"
+                f"re-import {src.enrichment_files} extraction files{_reimported_clause(src)}"
             )
         else:
             lines.append(
                 f"{src.source_id}: {len(src.missing)} missing -> ingested "
                 f"{src.ingested_documents} documents / {src.ingested_chunks} chunks, "
-                f"re-imported {src.enrichment_files} extraction files"
+                f"re-imported {src.enrichment_files} extraction files{_reimported_clause(src)}"
             )
-        lines.extend(f"  {err}" for err in src.enrichment_errors)
-    if report.missing_total == 0 and report.backfilled_files == 0:
-        lines.append(f"{report.persona_id}: nothing to sync")
-    elif report.missing_total == 0:
-        verb = "would import" if report.dry_run else "imported"
-        lines.append(
-            f"{report.persona_id}: nothing to ingest, {verb} {report.backfilled_files} "
-            f"extraction files for documents without entities"
-        )
-    elif report.dry_run:
-        lines.append(
-            f"{report.persona_id}: {report.missing_total} documents would be ingested "
-            f"across {len(report.stale_sources)} source(s)"
-        )
-    else:
-        lines.append(
-            f"{report.persona_id}: synced {len(report.stale_sources)} source(s), "
-            f"{report.missing_total} documents were missing"
-        )
+        lines.extend(f"  {err}" for err in (*src.enrichment_errors, *src.attribution_errors))
+    lines.append(_closing_line(report))
     return lines

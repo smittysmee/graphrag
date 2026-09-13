@@ -17,7 +17,8 @@ content (see NOTICE.md), otherwise each user ingests locally.
 `ingest/` (loaders + chunker), `embed/` (Embedder Protocol: fastembed | http | hash, plus the
 embed server), `graph/` (GraphStore Protocol: neo4j_store, memory_store, snapshot),
 `extract/` (topic co-occurrence; optional Claude enrichment), `retrieve/` (hybrid RRF search,
-context packs), `personas/` (registry, brief, skill export), `pipeline.py`, `cli.py`,
+context packs), `personas/` (registry, brief, skill export), `sna/` (network export,
+centrality, Louvain/K-means/GMM with stability and null-model checks), `pipeline.py`, `cli.py`,
 `mcp_server.py`, `app.py` (composition root).
 `hooks/` (host-side Claude Code hooks, stdlib only; shell wrappers in `.claude/hooks/`).
 

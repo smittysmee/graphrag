@@ -108,6 +108,7 @@ make lsp                # python-lsp-server over stdio for your editor
 | [PERSONAS.md](docs/PERSONAS.md) | Persona spec and lifecycle |
 | [SDLC.md](docs/SDLC.md) | Which persona applies at which stage |
 | [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Testing conventions, LSP setup |
+| [SNA.md](docs/SNA.md) | Network analysis: centrality, communities, clustering |
 | [NOTICE.md](NOTICE.md) | Attribution, third-party licenses, what you may redistribute |
 
 ## License
