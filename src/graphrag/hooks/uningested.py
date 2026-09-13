@@ -12,6 +12,10 @@ Two kinds of comparison, matching how the loaders behave (see ``graphrag.ingest.
 * a ``transcripts`` source dedupes archived re-uploads by body hash, so a raw-file count
   above the graph's document count is normal, not a finding. Only a source with raw files
   but *zero* matching documents in the graph is reported.
+
+A third check covers the entity layer: a document that is in the graph but has no extraction
+JSON under ``data/enrichment`` is searchable yet invisible to entity and relation queries. That
+gap is agent work (the ``graph-rag-enrich`` skill), so the hook names it rather than fixing it.
 """
 
 from __future__ import annotations
@@ -25,7 +29,15 @@ from typing import Any
 from graphrag.hooks import project
 from graphrag.hooks.mcp_client import McpClient, McpUnavailable, connect
 
-__all__ = ["Finding", "Report", "find_uningested", "main", "render_message", "summary_line"]
+__all__ = [
+    "Finding",
+    "Report",
+    "Unenriched",
+    "find_uningested",
+    "main",
+    "render_message",
+    "summary_line",
+]
 
 _PAGE_SIZE = 500
 _MAX_PAGES = 40  # guards against an unbounded loop if the server misbehaves
@@ -50,11 +62,21 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class Unenriched:
+    """Documents in the graph for one persona/source that have no extraction JSON yet."""
+
+    persona_id: str
+    source_id: str
+    doc_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Report:
     """What :func:`find_uningested` found, plus enough to build the sync command."""
 
     source: str  # "graph" (the live server answered) or "snapshot" (it was down)
     findings: tuple[Finding, ...] = ()
+    unenriched: tuple[Unenriched, ...] = ()
 
     @property
     def total_files(self) -> int:
@@ -69,6 +91,24 @@ class Report:
             counts[finding.persona_id] = counts.get(finding.persona_id, 0) + finding.file_count
         return counts
 
+    @property
+    def total_unenriched(self) -> int:
+        """Total ingested documents that have no extraction JSON."""
+        return sum(len(u.doc_ids) for u in self.unenriched)
+
+    @property
+    def unenriched_by_persona(self) -> dict[str, int]:
+        """Un-enriched document counts per persona, in the order personas were first found."""
+        counts: dict[str, int] = {}
+        for item in self.unenriched:
+            counts[item.persona_id] = counts.get(item.persona_id, 0) + len(item.doc_ids)
+        return counts
+
+    @property
+    def is_clean(self) -> bool:
+        """True when there is nothing to report at all."""
+        return self.total_files == 0 and self.total_unenriched == 0
+
 
 def find_uningested(root: Path, client: McpClient | None) -> Report:
     """Raw files that are not represented in the graph, persona by persona.
@@ -81,7 +121,9 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
     personas = project.load_personas(root)
     source_kind = "graph" if client is not None else "snapshot"
     snapshot_cache: dict[str, set[str]] = {}
+    enriched = project.enriched_doc_ids(root)
     findings: list[Finding] = []
+    unenriched: list[Unenriched] = []
 
     for pid in sorted(personas):
         persona = personas[pid]
@@ -93,6 +135,10 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
                 existing = _existing_ids(root, client, persona, source, snapshot_cache)
             except McpUnavailable:
                 continue
+
+            gap = tuple(sorted(existing - enriched))
+            if gap:
+                unenriched.append(Unenriched(pid, source.id, gap))
 
             if source.loader == "transcripts":
                 if not existing:
@@ -108,7 +154,7 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
             if missing:
                 findings.append(Finding(pid, source.id, source.loader, missing_files=missing))
 
-    return Report(source=source_kind, findings=tuple(findings))
+    return Report(source=source_kind, findings=tuple(findings), unenriched=tuple(unenriched))
 
 
 def _existing_ids(
@@ -159,20 +205,31 @@ def _row_id(row: Any) -> str:
 
 def summary_line(report: Report) -> str:
     """One short line for the session card; empty when nothing is missing."""
-    total = report.total_files
-    if total <= 0:
+    if report.is_clean:
         return ""
-    plural = "file" if total == 1 else "files"
-    parts = ", ".join(f"{pid}: {n}" for pid, n in report.by_persona.items())
+    clauses: list[str] = []
+    total = report.total_files
+    if total > 0:
+        plural = "file" if total == 1 else "files"
+        parts = ", ".join(f"{pid}: {n}" for pid, n in report.by_persona.items())
+        clauses.append(f"not yet ingested: {total} {plural} ({parts})")
+    missing = report.total_unenriched
+    if missing > 0:
+        plural = "document" if missing == 1 else "documents"
+        parts = ", ".join(f"{pid}: {n}" for pid, n in report.unenriched_by_persona.items())
+        clauses.append(f"without entity extraction: {missing} {plural} ({parts})")
     suffix = " (vs committed snapshot)" if report.source == "snapshot" else ""
-    return f"not yet ingested: {total} {plural} ({parts}){suffix}"
+    return "; ".join(clauses) + suffix
 
 
 def render_message(report: Report) -> str | None:
     """The Stop-hook ``systemMessage`` (under 500 characters), or ``None`` when nothing missing."""
+    if report.is_clean:
+        return None
+    enrich = _enrich_clause(report)
     total = report.total_files
     if total <= 0:
-        return None
+        return _fit(f"graphrag:{enrich}")
     entries = _entries(report)
     plural = "file" if total == 1 else "files"
     against = " (vs committed snapshot)" if report.source == "snapshot" else ""
@@ -185,11 +242,33 @@ def render_message(report: Report) -> str | None:
         if more > 0:
             names = f"{names} (+{more} more)" if names else f"(+{more} more)"
         message = (
-            f"graphrag: {total} raw {plural} not in the graph{against}: {names}. Run {sync_cmd}."
+            f"graphrag: {total} raw {plural} not in the graph{against}: {names}. "
+            f"Run {sync_cmd}.{enrich}"
         )
         if len(message) <= _MAX_MESSAGE:
             return message
+    return _fit(message)
+
+
+def _fit(message: str) -> str:
+    if len(message) <= _MAX_MESSAGE:
+        return message
     return message[: _MAX_MESSAGE - 1] + "…"
+
+
+def _enrich_clause(report: Report) -> str:
+    """`` N ingested documents have no entity extraction (...); run the graph-rag-enrich skill``."""
+    missing = report.total_unenriched
+    if missing <= 0:
+        return ""
+    by_persona = report.unenriched_by_persona
+    parts = ", ".join(f"{pid}: {n}" for pid, n in by_persona.items())
+    verb = "document has" if missing == 1 else "documents have"
+    persona = min(by_persona, key=lambda pid: (-by_persona[pid], pid))
+    return (
+        f" {missing} ingested {verb} no entity extraction ({parts}); "
+        f"run the graph-rag-enrich skill for {persona}."
+    )
 
 
 def _entries(report: Report) -> list[str]:

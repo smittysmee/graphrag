@@ -26,6 +26,7 @@ __all__ = [
     "PersonaInfo",
     "SourceInfo",
     "cache_dir",
+    "enriched_doc_ids",
     "expected_doc_id",
     "find_root",
     "load_manifests",
@@ -297,6 +298,32 @@ def snapshot_doc_ids(root: Path, persona: PersonaInfo | str) -> set[str]:
                     out.add(doc_id)
     except (OSError, EOFError, gzip.BadGzipFile):  # no snapshot, or a partial one
         return out
+    return out
+
+
+ENRICHMENT_DIR = "data/enrichment"
+
+
+def enriched_doc_ids(root: Path) -> set[str]:
+    """``doc_id`` of every extraction JSON under ``data/enrichment``, whatever the layout.
+
+    The agent-driven enrichment path writes one ``{doc_id, entities, relations}`` file per
+    document, flat or nested per persona/source; the id inside the file is what counts, not
+    its path. Unreadable files are skipped, so this never raises.
+    """
+    base = root / ENRICHMENT_DIR
+    out: set[str] = set()
+    if not base.is_dir():
+        return out
+    for path in base.rglob("*.json"):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        doc_id = record.get("doc_id") if isinstance(record, dict) else None
+        if isinstance(doc_id, str) and doc_id.strip():
+            out.add(doc_id.strip())
     return out
 
 

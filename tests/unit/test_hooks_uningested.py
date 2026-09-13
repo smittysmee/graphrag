@@ -66,6 +66,17 @@ def _write_snapshot(root: Path, persona_id: str, doc_ids: list[str]) -> None:
             fh.write(json.dumps({"id": doc_id}) + "\n")
 
 
+def _write_enrichment(root: Path, doc_ids: list[str], *, flat: bool = False) -> None:
+    """One extraction JSON per id, nested under the persona (the default) or flat."""
+    base = root / "data" / "enrichment"
+    for i, doc_id in enumerate(doc_ids):
+        directory = base if flat else base / doc_id.split(":")[0]
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"x{i}.json").write_text(
+            json.dumps({"doc_id": doc_id, "entities": [], "relations": []}), encoding="utf-8"
+        )
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     """One persona: a ``documents`` source with two files, a ``transcripts`` source with two."""
@@ -111,8 +122,42 @@ def test_transcripts_source_is_not_flagged_once_any_document_exists(root: Path) 
         "demo-persona",
         ["demo-persona:notes:one", "demo-persona:notes:two", "demo-persona:talks:ep1"],
     )
+    _write_enrichment(
+        root, ["demo-persona:notes:one", "demo-persona:notes:two", "demo-persona:talks:ep1"]
+    )
     report = uningested.find_uningested(root, None)
     assert report.findings == ()
+    assert report.unenriched == ()
+    assert report.is_clean
+
+
+def test_documents_in_the_graph_without_extraction_json_are_reported(root: Path) -> None:
+    _write_snapshot(
+        root,
+        "demo-persona",
+        ["demo-persona:notes:one", "demo-persona:notes:two", "demo-persona:talks:ep1"],
+    )
+    _write_enrichment(root, ["demo-persona:notes:one"])
+    report = uningested.find_uningested(root, None)
+
+    assert report.findings == ()
+    by_source = {(u.persona_id, u.source_id): u.doc_ids for u in report.unenriched}
+    assert by_source == {
+        ("demo-persona", "notes"): ("demo-persona:notes:two",),
+        ("demo-persona", "talks"): ("demo-persona:talks:ep1",),
+    }
+    assert report.total_unenriched == 2
+    assert report.unenriched_by_persona == {"demo-persona": 2}
+    assert not report.is_clean
+
+
+def test_extraction_json_is_matched_by_its_doc_id_not_its_path(root: Path) -> None:
+    """The older flat layout under ``data/enrichment/*.json`` counts just the same."""
+    _write_snapshot(root, "demo-persona", ["demo-persona:notes:one", "demo-persona:notes:two"])
+    _write_enrichment(root, ["demo-persona:notes:one", "demo-persona:notes:two"], flat=True)
+    (root / "data" / "enrichment" / "broken.json").write_text("{not json", encoding="utf-8")
+    report = uningested.find_uningested(root, None)
+    assert report.unenriched == ()
 
 
 def test_live_graph_is_used_and_pages_past_five_hundred_rows(root: Path) -> None:
@@ -179,6 +224,23 @@ def test_summary_line_uses_the_singular_for_one_file() -> None:
         ),
     )
     assert uningested.summary_line(report) == "not yet ingested: 1 file (demo-persona: 1)"
+
+
+def test_summary_line_reports_missing_extraction_alone_and_alongside_files() -> None:
+    gap = uningested.Unenriched("demo-persona", "notes", ("demo-persona:notes:a", "b"))
+    alone = uningested.Report(source="graph", unenriched=(gap,))
+    assert uningested.summary_line(alone) == (
+        "without entity extraction: 2 documents (demo-persona: 2)"
+    )
+    both = uningested.Report(
+        source="graph",
+        findings=(uningested.Finding("demo-persona", "notes", "documents", ("c.md",)),),
+        unenriched=(gap,),
+    )
+    assert uningested.summary_line(both) == (
+        "not yet ingested: 1 file (demo-persona: 1); "
+        "without entity extraction: 2 documents (demo-persona: 2)"
+    )
 
 
 def test_summary_line_notes_the_snapshot_fallback() -> None:
@@ -258,6 +320,35 @@ def test_render_message_picks_the_persona_with_the_most_missing_files() -> None:
     message = uningested.render_message(report)
     assert message is not None
     assert "`make sync PERSONA=beta`" in message
+
+
+def test_render_message_names_the_enrich_skill_when_only_extraction_is_missing() -> None:
+    report = uningested.Report(
+        source="graph",
+        unenriched=(uningested.Unenriched("demo-persona", "notes", ("demo-persona:notes:a",)),),
+    )
+    assert uningested.render_message(report) == (
+        "graphrag: 1 ingested document has no entity extraction (demo-persona: 1); "
+        "run the graph-rag-enrich skill for demo-persona."
+    )
+
+
+def test_render_message_combines_both_clauses_and_stays_under_budget() -> None:
+    report = uningested.Report(
+        source="graph",
+        findings=(uningested.Finding("demo-persona", "notes", "documents", ("a.md",)),),
+        unenriched=(
+            uningested.Unenriched("demo-persona", "notes", tuple(f"id{i}" for i in range(7))),
+            uningested.Unenriched("other", "talks", ("x",)),
+        ),
+    )
+    message = uningested.render_message(report)
+    assert message is not None
+    assert message.startswith("graphrag: 1 raw file not in the graph: a.md. ")
+    assert "Run `make sync PERSONA=demo-persona`." in message
+    assert "8 ingested documents have no entity extraction (demo-persona: 7, other: 1)" in message
+    assert message.endswith("run the graph-rag-enrich skill for demo-persona.")
+    assert len(message) <= 500
 
 
 def test_render_message_notes_the_snapshot_fallback() -> None:
