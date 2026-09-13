@@ -313,6 +313,8 @@ def sync(
     One command instead of three: it compares the document ids the loaders would produce for
     the persona's raw files with the ids already in the graph, re-ingests only the sources that
     are behind, then re-imports their extraction files, since a re-ingest drops entity mentions.
+    Sources that were already complete are still checked for documents the graph holds without
+    any entity, and the extraction files for those are imported too.
     """
     from graphrag.sync import UnknownSourceError, summary_lines, sync_persona
 
@@ -337,7 +339,7 @@ def sync(
             console.print(line)
         if report.errors:
             err.print(f"[yellow]{len(report.errors)} extraction files failed to import[/yellow]")
-        if export and not dry_run and report.stale_sources:
+        if export and report.wrote:
             snap.export_snapshot(
                 ctx.store,
                 spec,

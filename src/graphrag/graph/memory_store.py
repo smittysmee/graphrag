@@ -233,6 +233,17 @@ class InMemoryGraphStore:
         chunk_to_doc = {c.id: c.doc_id for c in self.chunks.values() if c.persona_id == persona_id}
         return {chunk_to_doc[m.chunk_id] for m in self.mentions if m.chunk_id in chunk_to_doc}
 
+    def enriched_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        wanted = self.document_ids(persona_id, source_id)
+        chunk_to_doc = {c.id: c.doc_id for c in self.chunks.values() if c.doc_id in wanted}
+        # Neo4j can only hold a MENTIONS edge to an Entity node, so an entity-less mention
+        # does not count here either.
+        return {
+            chunk_to_doc[m.chunk_id]
+            for m in self.mentions
+            if m.chunk_id in chunk_to_doc and m.entity_id in self.entities
+        }
+
     # ------------------------------------------------------------- bulk
     def iter_documents(self, persona_id: str) -> Iterator[Document]:
         yield from sorted(

@@ -495,6 +495,19 @@ class Neo4jGraphStore:
         )
         return {r["doc_id"] for r in rows}
 
+    def enriched_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id
+              AND EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity) }
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
     # ------------------------------------------------------------- bulk
     def iter_documents(self, persona_id: str) -> Iterator[Document]:
         rows = self._read(

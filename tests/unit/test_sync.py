@@ -14,7 +14,7 @@ import pytest
 from graphrag.embed.base import Embedder
 from graphrag.embed.hashing import HashEmbedder
 from graphrag.graph.memory_store import InMemoryGraphStore
-from graphrag.models import Mention, PersonaSpec, SourceSpec
+from graphrag.models import Enrichment, Entity, Mention, PersonaSpec, SourceSpec
 from graphrag.pipeline import IngestPipeline
 from graphrag.sync import (
     SourceReport,
@@ -74,8 +74,9 @@ def synced(
 
 
 def write_extraction(directory: Path, doc_id: str, name: str = "Retention") -> Path:
+    """One extraction file, named after its document so a test can write several at once."""
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{name.lower()}.json"
+    path = directory / f"{doc_id.rsplit(':', 1)[-1]}.json"
     payload = {
         "doc_id": doc_id,
         "entities": [{"name": name, "type": "metric", "description": "Users who come back."}],
@@ -83,6 +84,17 @@ def write_extraction(directory: Path, doc_id: str, name: str = "Retention") -> P
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+def give_entities(store: InMemoryGraphStore, doc_id: str) -> None:
+    """Put one entity mention on a document, which is what makes sync count it as enriched."""
+    chunk = store.document_chunks(doc_id, 0, 1)[0]
+    store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="metric:existing", name="Existing", type="metric")],
+            mentions=[Mention(chunk_id=chunk.id, entity_id="metric:existing")],
+        )
+    )
 
 
 def run(
@@ -209,6 +221,60 @@ def test_an_unimportable_extraction_file_is_reported_not_raised(
     assert report.errors == docs.enrichment_errors
 
 
+# ------------------------------------------------------------------- ingested but not extracted
+
+
+def test_an_up_to_date_source_imports_files_for_documents_with_no_entities(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """Ingest and extraction are separate steps, so a complete source can still lack entities."""
+    doc_ids = sorted(memory_store.document_ids(PERSONA_ID, TRANSCRIPTS))
+    give_entities(memory_store, doc_ids[0])
+    for doc_id in doc_ids[:2]:
+        write_extraction(enrichment_root / PERSONA_ID / TRANSCRIPTS, doc_id)
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root)
+
+    transcripts = next(s for s in report.sources if s.source_id == TRANSCRIPTS)
+    assert transcripts.stale is False  # `no_embedder` proves nothing was re-ingested
+    assert transcripts.enrichment_files == 1  # the file for doc_ids[1] only
+    assert transcripts.enrichment_errors == ()
+    assert memory_store.enriched_document_ids(PERSONA_ID, TRANSCRIPTS) == set(doc_ids[:2])
+    assert any(m.entity_id == "metric:retention" for m in memory_store.mentions)
+    assert report.wrote is True
+    assert summary_lines(report)[0] == (
+        f"{TRANSCRIPTS}: up to date, imported 1 extraction files for documents without entities"
+    )
+
+
+def test_a_document_that_already_has_entities_is_not_imported_again(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """Otherwise every run would re-import the whole corpus for nothing."""
+    doc_ids = sorted(memory_store.document_ids(PERSONA_ID, DOCS))
+    for doc_id in doc_ids:
+        give_entities(memory_store, doc_id)
+        write_extraction(enrichment_root / PERSONA_ID / DOCS, doc_id)
+    before = list(memory_store.mentions)
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root)
+
+    docs = next(s for s in report.sources if s.source_id == DOCS)
+    assert docs.enrichment_files == 0
+    assert memory_store.mentions == before
+    assert set(memory_store.entities) == {"metric:existing"}  # the files' entity never landed
+    assert report.wrote is False
+    assert summary_lines(report)[-1] == f"{PERSONA_ID}: nothing to sync"
+
+
 # ----------------------------------------------------------------------------- dry run
 
 
@@ -232,6 +298,29 @@ def test_dry_run_reports_and_writes_nothing(
     assert transcripts.ingested_documents == 0
     assert memory_store.documents == before
     assert memory_store.entities == {}
+
+
+def test_dry_run_counts_files_for_documents_with_no_entities_without_importing_them(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    doc_ids = sorted(memory_store.document_ids(PERSONA_ID, TRANSCRIPTS))
+    write_extraction(enrichment_root / PERSONA_ID / TRANSCRIPTS, doc_ids[0])
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root, dry_run=True)
+
+    transcripts = next(s for s in report.sources if s.source_id == TRANSCRIPTS)
+    assert transcripts.stale is False
+    assert transcripts.enrichment_files == 1
+    assert memory_store.entities == {}
+    assert memory_store.mentions == []
+    assert report.wrote is False
+    assert summary_lines(report)[0] == (
+        f"{TRANSCRIPTS}: up to date, would import 1 extraction files for documents without entities"
+    )
 
 
 # ----------------------------------------------------------------------------- source selection

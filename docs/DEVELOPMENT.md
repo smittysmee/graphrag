@@ -49,8 +49,12 @@ a thin `.claude/hooks/*.sh` wrapper around a module in `src/graphrag/hooks/`.
 - **`Stop` → `uningested.sh`** names any files under `data/raw/` that the graph does not contain
   and tells you to run `make sync PERSONA=<id>`, which is the one command that fixes it: it
   re-ingests only the sources that are behind and re-imports their extraction JSON. It also
-  counts documents that are in the graph but have no extraction JSON under `data/enrichment/`;
-  that gap is agent work (the `graph-rag-enrich` skill), so the hook names it rather than fixing it.
+  counts documents that are in the graph but have no entity mentions. While the server answers,
+  "enriched" means the graph actually holds mentions for the document, so extraction JSON that was
+  written but never imported is still reported, with `make sync` as the fix; when the server is
+  down the check falls back to the JSON files under `data/enrichment/`. Documents with no JSON at
+  all need the `graph-rag-enrich` skill, which the message names instead. `make sync` imports
+  waiting JSON for documents without mentions even when a source is otherwise up to date.
 
 **The router has no keyword list.** Vocabulary is derived from the graph at runtime: the persona
 id and name (weight 3), its `tags` (2), and its top 60 topics from the MCP `topics` tool (1).

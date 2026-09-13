@@ -8,8 +8,12 @@ thins out. And nothing on disk says which of those two things is needed.
 
 :func:`sync_persona` works it out instead: it asks the loaders which document ids the raw files
 would produce, compares them with the ids the store already holds, and for each source that is
-behind, re-ingests it and re-imports its extraction files. A source that is already complete is
-left alone, so running this when nothing changed costs one query per source and writes nothing.
+behind, re-ingests it and re-imports its extraction files.
+
+A source that is up to date still gets one more check, because ingesting and extracting are
+separate steps: a document can sit in the graph with no entities at all, because its extraction
+file was written after it was ingested or because importing that file failed. Those files are
+imported too, so "up to date" means the entity layer is complete rather than only the documents.
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ class SourceReport:
     missing: tuple[str, ...] = ()  # document ids the raw files imply but the graph lacks
     ingested_documents: int = 0
     ingested_chunks: int = 0
-    enrichment_files: int = 0  # extraction files re-imported (or, dry run, that would be)
+    enrichment_files: int = 0  # extraction files imported (or, dry run, that would be)
     enrichment_errors: tuple[str, ...] = ()
 
     @property
@@ -74,6 +78,16 @@ class SyncReport:
     @property
     def missing_total(self) -> int:
         return sum(len(s.missing) for s in self.sources)
+
+    @property
+    def backfilled_files(self) -> int:
+        """Extraction files imported for sources that needed no re-ingest, or that would be."""
+        return sum(s.enrichment_files for s in self.sources if not s.stale)
+
+    @property
+    def wrote(self) -> bool:
+        """Whether the graph changed, which is what decides if a new snapshot is worth taking."""
+        return not self.dry_run and any(s.stale or s.enrichment_files for s in self.sources)
 
     @property
     def errors(self) -> tuple[str, ...]:
@@ -153,27 +167,30 @@ def sync_persona(
     for source in _select(persona, source_id):
         missing = missing_document_ids(store, raw_root, persona, source)
         files = extractions.get(f"{persona.id}:{source.id}:", [])
-        if not missing:  # the summary reports this; no progress noise for a no-op
-            reports.append(SourceReport(source_id=source.id))
-            continue
         if dry_run:
+            pending = _pending(store, persona, source, files, reingested=bool(missing))
             reports.append(
                 SourceReport(
-                    source_id=source.id, missing=tuple(missing), enrichment_files=len(files)
+                    source_id=source.id, missing=tuple(missing), enrichment_files=len(pending)
                 )
             )
             continue
-        if pipeline is None:
-            pipeline = IngestPipeline(store, embedder(), progress=say)
-        say(f"{source.id}: {len(missing)} documents missing, re-ingesting")
-        ingested = pipeline.ingest(raw_root, persona, source)
-        imported, errors = _reimport(store, files, say)
+        documents = chunks = 0
+        if missing:
+            if pipeline is None:
+                pipeline = IngestPipeline(store, embedder(), progress=say)
+            say(f"{source.id}: {len(missing)} documents missing, re-ingesting")
+            ingested = pipeline.ingest(raw_root, persona, source)
+            documents, chunks = ingested.documents, ingested.chunks
+        # After the re-ingest, so the documents it replaced count as needing their entities back.
+        pending = _pending(store, persona, source, files, reingested=bool(missing))
+        imported, errors = _reimport(store, pending, say, reingested=bool(missing))
         reports.append(
             SourceReport(
                 source_id=source.id,
                 missing=tuple(missing),
-                ingested_documents=ingested.documents,
-                ingested_chunks=ingested.chunks,
+                ingested_documents=documents,
+                ingested_chunks=chunks,
                 enrichment_files=imported,
                 enrichment_errors=errors,
             )
@@ -192,10 +209,40 @@ def _select(persona: PersonaSpec, source_id: str | None) -> list[SourceSpec]:
     return matches
 
 
-def _reimport(store: GraphStore, files: list[Path], say: Progress) -> tuple[int, tuple[str, ...]]:
-    """Re-import a source's extraction files; re-ingesting dropped their mentions."""
+def _pending(
+    store: GraphStore,
+    persona: PersonaSpec,
+    source: SourceSpec,
+    files: list[Path],
+    *,
+    reingested: bool,
+) -> list[Path]:
+    """The extraction files this source needs put into the graph now.
+
+    A re-ingested source needs all of them: re-ingesting replaced its documents, which deleted
+    the chunks its mentions hung off. A source that was left alone needs only the files whose
+    document is in the graph with no entity at all -- extraction JSON written after the document
+    was ingested, or whose import failed at the time. Files naming a document the graph does not
+    hold are left out of that second set on purpose: on an untouched source that means the raw
+    file is gone, and reporting it on every run would be noise rather than news.
+    """
+    if reingested:
+        return files
+    unenriched = store.document_ids(persona.id, source.id) - store.enriched_document_ids(
+        persona.id, source.id
+    )
+    if not unenriched:
+        return []
+    return [path for path in files if read_doc_id(path) in unenriched]
+
+
+def _reimport(
+    store: GraphStore, files: list[Path], say: Progress, *, reingested: bool
+) -> tuple[int, tuple[str, ...]]:
+    """Put a source's pending extraction files back into the graph."""
     if files:
-        say(f"re-importing {len(files)} extraction files")
+        what = "re-importing" if reingested else "importing"
+        say(f"{what} {len(files)} extraction files")
     imported = 0
     errors: list[str] = []
     for path in files:
@@ -207,12 +254,20 @@ def _reimport(store: GraphStore, files: list[Path], say: Progress) -> tuple[int,
     return imported, tuple(errors)
 
 
+def _backfill_clause(src: SourceReport, dry_run: bool) -> str:
+    """What an up-to-date source did about documents that had no entities, if anything."""
+    if not src.enrichment_files:
+        return ""
+    verb = "would import" if dry_run else "imported"
+    return f", {verb} {src.enrichment_files} extraction files for documents without entities"
+
+
 def summary_lines(report: SyncReport) -> list[str]:
     """One line per source, plus a closing line. Pure, so it is what the tests assert on."""
     lines: list[str] = []
     for src in report.sources:
         if not src.stale:
-            lines.append(f"{src.source_id}: up to date")
+            lines.append(f"{src.source_id}: up to date{_backfill_clause(src, report.dry_run)}")
         elif report.dry_run:
             lines.append(
                 f"{src.source_id}: {len(src.missing)} documents missing; would re-ingest and "
@@ -225,8 +280,14 @@ def summary_lines(report: SyncReport) -> list[str]:
                 f"re-imported {src.enrichment_files} extraction files"
             )
         lines.extend(f"  {err}" for err in src.enrichment_errors)
-    if report.missing_total == 0:
+    if report.missing_total == 0 and report.backfilled_files == 0:
         lines.append(f"{report.persona_id}: nothing to sync")
+    elif report.missing_total == 0:
+        verb = "would import" if report.dry_run else "imported"
+        lines.append(
+            f"{report.persona_id}: nothing to ingest, {verb} {report.backfilled_files} "
+            f"extraction files for documents without entities"
+        )
     elif report.dry_run:
         lines.append(
             f"{report.persona_id}: {report.missing_total} documents would be ingested "

@@ -43,6 +43,7 @@ def test_end_to_end_on_neo4j(
     assert len(ids) == 3
     assert clean_store.document_ids("it-pm", "test-podcast") == ids
     assert clean_store.document_ids("it-pm", "absent") == set()
+    assert clean_store.enriched_document_ids("it-pm", "test-podcast") == set()  # nothing extracted
     doc = clean_store.list_documents("it-pm", speaker="Ada North")[0]
     assert clean_store.document_chunks(doc.id, 0, 1)[0].ordinal == 0
     assert clean_store.list_speakers("it-pm")[0].speaker == "Lenny Rachitsky"
@@ -68,6 +69,10 @@ def test_end_to_end_on_neo4j(
     )
     assert [e.name for e in clean_store.entities_for_chunks([chunk_id])] == ["Retention"]
     assert clean_store.enriched_doc_ids("it-pm") == {doc.id}
+    # same contract the in-memory store is held to in tests/unit/test_pipeline_and_store.py
+    assert clean_store.enriched_document_ids("it-pm", "test-podcast") == {doc.id}
+    assert clean_store.enriched_document_ids("it-pm", "absent") == set()
+    assert clean_store.enriched_document_ids("other-persona", "test-podcast") == set()
     assert len(clean_store.enrichment_for_persona("it-pm").relations) == 1
 
     # snapshot export -> delete -> load
