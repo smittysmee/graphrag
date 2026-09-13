@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from graphrag.ingest.frontmatter import split_frontmatter
+from graphrag.ingest.hygiene import clean_text
 from graphrag.models import Document, LoadedDocument, Scalar, Turn
 from graphrag.textutil import slugify
 
@@ -59,6 +60,7 @@ def _title_from(meta: dict[str, Any], body: str, path: Path) -> str:
 
 def load_document(path: Path, *, root: Path, persona_id: str, source_id: str) -> LoadedDocument:
     meta, body = read_text(path)
+    body = clean_text(body)  # front-matter is parsed first; only the body is cleaned
     turns = paragraphs_to_turns(body)
     rel = path.relative_to(root)
     doc_id = f"{persona_id}:{source_id}:{slugify(str(rel.with_suffix('')))}"

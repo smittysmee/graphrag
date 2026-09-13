@@ -58,6 +58,21 @@ def _progress(msg: str) -> None:
     err.print(f"[dim]{msg}[/dim]")
 
 
+FLAGGED_LINES = 20
+
+
+def _print_flagged(flagged: list[tuple[str, str]]) -> None:
+    """Report files whose raw text looked like an injection attempt. Advisory: they were
+    ingested. Excerpts are printed with markup off so bracketed chat tokens survive."""
+    if not flagged:
+        return
+    err.print(f"[yellow]flagged {len(flagged)} file(s) carrying untrusted-text patterns[/yellow]")
+    for path, reason in flagged[:FLAGGED_LINES]:
+        err.print(f"  {path}: {reason}", style="yellow", markup=False, highlight=False)
+    if len(flagged) > FLAGGED_LINES:
+        err.print(f"  (+{len(flagged) - FLAGGED_LINES} more)", style="yellow", markup=False)
+
+
 def _utc_now() -> str:
     from datetime import UTC, datetime
 
@@ -266,6 +281,7 @@ def ingest(
         )
         if report.skipped:
             err.print(f"[yellow]skipped (empty): {len(report.skipped)} files[/yellow]")
+        _print_flagged(report.flagged)
         if export:
             manifest = snap.export_snapshot(
                 ctx.store,
