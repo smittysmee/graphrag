@@ -1,0 +1,255 @@
+"""Stop hook: notice when files under ``data/raw`` have not reached the graph.
+
+Writing a note under ``data/raw/<persona>/...`` does nothing until someone runs
+``make ingest``; this hook checks after each turn so nobody has to remember. It is
+read-only and fail-silent: ``main`` always exits 0, and it stays quiet when nothing is
+missing or when this ``Stop`` itself is a hook continuation (``stop_hook_active``).
+
+Two kinds of comparison, matching how the loaders behave (see ``graphrag.ingest.loaders``):
+
+* a ``documents`` source is compared file by file, since each raw file maps to one
+  predictable document id (:func:`graphrag.hooks.project.expected_doc_id`);
+* a ``transcripts`` source dedupes archived re-uploads by body hash, so a raw-file count
+  above the graph's document count is normal, not a finding. Only a source with raw files
+  but *zero* matching documents in the graph is reported.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from graphrag.hooks import project
+from graphrag.hooks.mcp_client import McpClient, McpUnavailable, connect
+
+__all__ = ["Finding", "Report", "find_uningested", "main", "render_message", "summary_line"]
+
+_PAGE_SIZE = 500
+_MAX_PAGES = 40  # guards against an unbounded loop if the server misbehaves
+_MAX_NAMED = 3
+_MAX_MESSAGE = 500
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One persona/source pair that has raw files the graph does not know about."""
+
+    persona_id: str
+    source_id: str
+    loader: str
+    missing_files: tuple[str, ...] = ()  # ``documents`` loader: rel paths not in the graph
+    raw_count: int = 0  # ``transcripts`` loader: files found when the graph has none
+
+    @property
+    def file_count(self) -> int:
+        """How many raw files this finding is about, for totals and the summary line."""
+        return len(self.missing_files) if self.missing_files else self.raw_count
+
+
+@dataclass(frozen=True)
+class Report:
+    """What :func:`find_uningested` found, plus enough to build the ingest command."""
+
+    source: str  # "graph" (the live server answered) or "snapshot" (it was down)
+    findings: tuple[Finding, ...] = ()
+    raw_roots: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def total_files(self) -> int:
+        """Total raw files across every finding."""
+        return sum(f.file_count for f in self.findings)
+
+    @property
+    def by_persona(self) -> dict[str, int]:
+        """Total raw files per persona, in the order personas were first found."""
+        counts: dict[str, int] = {}
+        for finding in self.findings:
+            counts[finding.persona_id] = counts.get(finding.persona_id, 0) + finding.file_count
+        return counts
+
+
+def find_uningested(root: Path, client: McpClient | None) -> Report:
+    """Raw files that are not represented in the graph, persona by persona.
+
+    Uses the live graph (paged Cypher on ``Document.id``) when ``client`` answers; otherwise
+    falls back to the committed snapshot and labels the report ``source="snapshot"``. A
+    source whose check itself fails (a transient server error) is skipped rather than guessed
+    at, so it never produces a false finding.
+    """
+    personas = project.load_personas(root)
+    source_kind = "graph" if client is not None else "snapshot"
+    snapshot_cache: dict[str, set[str]] = {}
+    findings: list[Finding] = []
+    raw_roots: dict[str, str] = {}
+
+    for pid in sorted(personas):
+        persona = personas[pid]
+        for source in persona.sources:
+            files = project.raw_files(root, persona, source)
+            if not files:
+                continue
+            try:
+                existing = _existing_ids(root, client, persona, source, snapshot_cache)
+            except McpUnavailable:
+                continue
+
+            if source.loader == "transcripts":
+                if not existing:
+                    findings.append(Finding(pid, source.id, source.loader, raw_count=len(files)))
+                continue
+
+            base = project.source_base(root, persona, source)
+            missing = tuple(
+                project.rel_path(base, path)
+                for path in files
+                if project.expected_doc_id(root, persona, source, path) not in existing
+            )
+            if missing:
+                findings.append(Finding(pid, source.id, source.loader, missing_files=missing))
+
+        if pid not in raw_roots and any(f.persona_id == pid for f in findings):
+            raw_roots[pid] = str(project.raw_root(root, persona))
+
+    return Report(source=source_kind, findings=tuple(findings), raw_roots=raw_roots)
+
+
+def _existing_ids(
+    root: Path,
+    client: McpClient | None,
+    persona: project.PersonaInfo,
+    source: project.SourceInfo,
+    snapshot_cache: dict[str, set[str]],
+) -> set[str]:
+    """Document ids already known for this persona/source, live or from the snapshot."""
+    prefix = f"{persona.id}:{source.id}:"
+    if client is not None:
+        return _graph_doc_ids(client, prefix)
+    if persona.id not in snapshot_cache:
+        snapshot_cache[persona.id] = project.snapshot_doc_ids(root, persona)
+    return {doc_id for doc_id in snapshot_cache[persona.id] if doc_id.startswith(prefix)}
+
+
+def _graph_doc_ids(client: McpClient, prefix: str) -> set[str]:
+    """Every ``Document.id`` under ``prefix``, paged 500 rows at a time."""
+    ids: set[str] = set()
+    skip = 0
+    query = (
+        "MATCH (d:Document) WHERE d.id STARTS WITH $prefix "
+        "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
+    )
+    for _ in range(_MAX_PAGES):
+        params = {"prefix": prefix, "skip": skip}
+        rows = client.call_tool("cypher", {"query": query, "params": params})
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            doc_id = _row_id(row)
+            if doc_id:
+                ids.add(doc_id)
+        if len(rows) < _PAGE_SIZE:
+            break
+        skip += _PAGE_SIZE
+    return ids
+
+
+def _row_id(row: Any) -> str:
+    if not isinstance(row, dict) or not row:
+        return ""
+    value = next(iter(row.values()))
+    return value if isinstance(value, str) else ""
+
+
+def summary_line(report: Report) -> str:
+    """One short line for the session card; empty when nothing is missing."""
+    total = report.total_files
+    if total <= 0:
+        return ""
+    plural = "file" if total == 1 else "files"
+    parts = ", ".join(f"{pid}: {n}" for pid, n in report.by_persona.items())
+    suffix = " (vs committed snapshot)" if report.source == "snapshot" else ""
+    return f"not yet ingested: {total} {plural} ({parts}){suffix}"
+
+
+def render_message(report: Report) -> str | None:
+    """The Stop-hook ``systemMessage`` (under 500 characters), or ``None`` when nothing missing."""
+    total = report.total_files
+    if total <= 0:
+        return None
+    entries = _entries(report)
+    persona_id, raw_root = _primary(report)
+    plural = "file" if total == 1 else "files"
+    against = " (vs committed snapshot)" if report.source == "snapshot" else ""
+    ingest_cmd = f"`make ingest PERSONA={persona_id} SRC={raw_root}`"
+    message = ""
+    for shown_n in (_MAX_NAMED, 2, 1, 0):
+        shown = entries[:shown_n]
+        more = len(entries) - len(shown)
+        names = ", ".join(shown)
+        if more > 0:
+            names = f"{names} (+{more} more)" if names else f"(+{more} more)"
+        message = (
+            f"graphrag: {total} raw {plural} not in the graph{against}: {names}. "
+            f"Ingest with {ingest_cmd} then re-import enrichment JSON."
+        )
+        if len(message) <= _MAX_MESSAGE:
+            return message
+    return message[: _MAX_MESSAGE - 1] + "…"
+
+
+def _entries(report: Report) -> list[str]:
+    names: list[str] = []
+    for finding in report.findings:
+        if finding.missing_files:
+            names.extend(finding.missing_files)
+        else:
+            names.append(f"{finding.source_id}/ (0 of {finding.raw_count} ingested)")
+    return names
+
+
+def _primary(report: Report) -> tuple[str, str]:
+    """The persona with the most missing files (ties broken by id), for the ingest command."""
+    by_persona = report.by_persona
+    persona_id = min(by_persona, key=lambda pid: (-by_persona[pid], pid))
+    return persona_id, report.raw_roots.get(persona_id, "")
+
+
+def _read_stdin_payload() -> dict[str, Any]:
+    try:
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def main() -> int:
+    """Read the ``Stop`` stdin payload; print a ``systemMessage`` when files are un-ingested."""
+    try:
+        payload = _read_stdin_payload()
+        if payload.get("stop_hook_active"):
+            return 0
+        cwd = payload.get("cwd")
+        start = Path(cwd) if isinstance(cwd, str) and cwd else None
+        root = project.find_root(start)
+        if root is None:
+            return 0
+        client = connect()
+        message = render_message(find_uningested(root, client))
+        if message:
+            print(json.dumps({"systemMessage": message}))
+    except Exception:  # a broken hook must never fail a turn
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
