@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from graphrag.extract.attribution import import_attribution_file
+from graphrag.extract.attribution import import_attribution_file, report_lines
 from graphrag.graph.memory_store import InMemoryGraphStore
 from graphrag.models import Chunk
 from tests.conftest import THREAD_POSTS
@@ -98,6 +98,12 @@ def test_an_anchor_in_no_passage_is_loose_and_costs_only_its_own_post(
     assert result.speakers == ("quill-maker",)
     assert len(result.loose) == 1 and result.loose[0].startswith("ledger-ann: something")
     assert memory_store.documents[thread_document].speakers == ["quill-maker"]
+    # One block on one stream: a loose anchor printed apart from its own file's line can be read
+    # as belonging to the file above it, which sends a reviewer to the wrong JSON.
+    assert report_lines(result) == [
+        f"{thread_document}: 1/2 posts attached, 1 speakers; 1 loose anchors",
+        "  loose: ledger-ann: something this thread never says anywhere at all",
+    ]
 
 
 def test_re_importing_the_same_file_changes_nothing(

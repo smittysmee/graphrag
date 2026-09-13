@@ -22,6 +22,13 @@ ones, against :func:`graphrag.extract.attribution.import_attribution_file`. Anno
 the stance on a mention, the facets on a passage -- are a third layer with the same two triggers,
 and hang off chunks for the same reason.
 
+Both of those triggers ask whether a layer is *absent*, which is the wrong question after a
+sidecar is rewritten: an attribution file that gains posted dates, or an annotation file that
+gains facets, names a document that already has speakers or stances, so nothing would re-import
+it and the new fields would never reach the graph. ``refresh_attribution`` and
+``refresh_annotations`` answer that case by re-importing every sidecar of that kind the persona
+has, whatever the graph already holds, and each source's line says so.
+
 The persona's alias table is applied once at the end, after every file has landed. An import can
 only canonicalise the names inside the file it is reading; folding two spellings that arrived in
 different files into one node is a whole-graph operation, so it runs when the graph is whole.
@@ -77,6 +84,8 @@ class SourceReport:
     attribution_errors: tuple[str, ...] = ()
     annotation_files: int = 0  # annotation files imported (or, dry run, that would be)
     annotation_errors: tuple[str, ...] = ()
+    attribution_refreshed: bool = False  # every attribution file was re-imported, not only gaps
+    annotation_refreshed: bool = False  # every annotation file was re-imported, not only gaps
 
     @property
     def stale(self) -> bool:
@@ -114,6 +123,16 @@ class SyncReport:
     def backfilled_annotation_files(self) -> int:
         """Annotation files imported for sources that needed no re-ingest, or that would be."""
         return sum(s.annotation_files for s in self.sources if not s.stale)
+
+    @property
+    def refreshed_attribution(self) -> bool:
+        """Whether this run re-imported attribution files it was not asked to by a gap."""
+        return any(s.attribution_refreshed for s in self.sources)
+
+    @property
+    def refreshed_annotations(self) -> bool:
+        """Whether this run re-imported annotation files it was not asked to by a gap."""
+        return any(s.annotation_refreshed for s in self.sources)
 
     @property
     def wrote(self) -> bool:
@@ -212,6 +231,8 @@ def sync_persona(
     aliases: AliasTable = EMPTY_ALIASES,
     facets: FacetTable | None = None,
     source_id: str | None = None,
+    refresh_attribution: bool = False,
+    refresh_annotations: bool = False,
     dry_run: bool = False,
     progress: Progress | None = None,
 ) -> SyncReport:
@@ -219,6 +240,10 @@ def sync_persona(
 
     ``embedder`` is a factory rather than an ``Embedder`` so a dry run, or a run where every
     source is already complete, never loads model weights.
+
+    ``refresh_attribution`` and ``refresh_annotations`` re-import every sidecar of that kind
+    rather than only the ones filling a gap, which is what a rewritten file needs: it names a
+    document that already has the layer, so nothing else would pick the new fields up.
     """
     say = progress or (lambda _msg: None)
     extractions = index_extractions(enrichment_root)
@@ -235,8 +260,22 @@ def sync_persona(
         readings = annotations.get(key, [])
         if dry_run:
             pending = _pending(store, persona, source, files, reingested=bool(missing))
-            waiting = _pending_attribution(store, persona, source, voices, reingested=bool(missing))
-            unread = _pending_annotation(store, persona, source, readings, reingested=bool(missing))
+            waiting = _pending_attribution(
+                store,
+                persona,
+                source,
+                voices,
+                reingested=bool(missing),
+                refresh=refresh_attribution,
+            )
+            unread = _pending_annotation(
+                store,
+                persona,
+                source,
+                readings,
+                reingested=bool(missing),
+                refresh=refresh_annotations,
+            )
             reports.append(
                 SourceReport(
                     source_id=source.id,
@@ -244,6 +283,8 @@ def sync_persona(
                     enrichment_files=len(pending),
                     attribution_files=len(waiting),
                     annotation_files=len(unread),
+                    attribution_refreshed=refresh_attribution,
+                    annotation_refreshed=refresh_annotations,
                 )
             )
             continue
@@ -258,14 +299,24 @@ def sync_persona(
         pending = _pending(store, persona, source, files, reingested=bool(missing))
         imported, errors = _reimport(store, pending, say, aliases, reingested=bool(missing))
         # Likewise for speakers: a re-ingest deleted the chunks their SPOKE edges hung off.
-        waiting = _pending_attribution(store, persona, source, voices, reingested=bool(missing))
+        waiting = _pending_attribution(
+            store, persona, source, voices, reingested=bool(missing), refresh=refresh_attribution
+        )
         attributed, voice_errors = _reimport_attribution(
-            store, waiting, say, reingested=bool(missing)
+            store, waiting, say, reingested=bool(missing) or refresh_attribution
         )
         # And for the readings, which hang off the same chunks and the mentions on them.
-        unread = _pending_annotation(store, persona, source, readings, reingested=bool(missing))
+        unread = _pending_annotation(
+            store, persona, source, readings, reingested=bool(missing), refresh=refresh_annotations
+        )
         annotated, reading_errors = _reimport_annotation(
-            store, unread, say, persona.id, aliases, facets, reingested=bool(missing)
+            store,
+            unread,
+            say,
+            persona.id,
+            aliases,
+            facets,
+            reingested=bool(missing) or refresh_annotations,
         )
         reports.append(
             SourceReport(
@@ -279,6 +330,8 @@ def sync_persona(
                 attribution_errors=voice_errors,
                 annotation_files=annotated,
                 annotation_errors=reading_errors,
+                attribution_refreshed=refresh_attribution,
+                annotation_refreshed=refresh_annotations,
             )
         )
     # Last, and over the whole persona: one file can only canonicalise its own names, so two
@@ -359,6 +412,7 @@ def _pending_attribution(
     files: list[Path],
     *,
     reingested: bool,
+    refresh: bool = False,
 ) -> list[Path]:
     """The attribution files this source needs put into the graph now.
 
@@ -366,12 +420,19 @@ def _pending_attribution(
     because re-ingesting deleted the chunks its ``SPOKE`` edges hung off. A source that was left
     alone needs only the files whose document carries no speaker at all -- a thread whose
     attribution JSON was written after it was ingested, or whose import failed at the time.
+
+    ``refresh`` is the caller saying the files themselves changed, which no state in the graph
+    can reveal: a file that gained posted dates names a document that already has speakers. Every
+    file whose document the graph holds is then re-imported. Files naming a document the graph
+    does not hold stay out, for the reason :func:`_pending` gives -- on a source nothing
+    re-ingested, that is a raw file that is gone, and it would be reported on every run.
     """
     if reingested:
         return files
-    unattributed = store.document_ids(persona.id, source.id) - store.attributed_document_ids(
-        persona.id, source.id
-    )
+    present = store.document_ids(persona.id, source.id)
+    if refresh:
+        return [path for path in files if read_doc_id(path) in present]
+    unattributed = present - store.attributed_document_ids(persona.id, source.id)
     if not unattributed:
         return []
     return [path for path in files if read_doc_id(path) in unattributed]
@@ -406,6 +467,7 @@ def _pending_annotation(
     files: list[Path],
     *,
     reingested: bool,
+    refresh: bool = False,
 ) -> list[Path]:
     """The annotation files this source needs put into the graph now.
 
@@ -413,12 +475,16 @@ def _pending_annotation(
     stance lives on a mention and the facets on a passage, and re-ingesting deleted both. A
     source that was left alone needs only the files whose document carries no stance and no
     facet -- annotation JSON written after the document was ingested, or whose import failed.
+
+    ``refresh`` means the files changed, which :func:`_pending_attribution` explains: a reading
+    added to a document that already carries one is invisible to the gap test.
     """
     if reingested:
         return files
-    unannotated = store.document_ids(persona.id, source.id) - store.annotated_document_ids(
-        persona.id, source.id
-    )
+    present = store.document_ids(persona.id, source.id)
+    if refresh:
+        return [path for path in files if read_doc_id(path) in present]
+    unannotated = present - store.annotated_document_ids(persona.id, source.id)
     if not unannotated:
         return []
     return [path for path in files if read_doc_id(path) in unannotated]
@@ -465,28 +531,54 @@ def _backfill_clause(src: SourceReport, dry_run: bool) -> str:
     return f", {verb} {src.enrichment_files} extraction files for documents without entities"
 
 
+def _layer_phrase(count: int, layer: str, without: str, *, dry_run: bool, refreshed: bool) -> str:
+    """``imported 3 attribution files for documents without speakers``, or the refresh wording.
+
+    The two are worth telling apart in the line, because they answer different questions. The
+    backfill wording says a gap was filled; the refresh wording says every file was read again
+    whether or not the graph had a gap, which is what a rewritten sidecar needs and what a
+    reader would otherwise mistake for the corpus having lost its speakers.
+    """
+    if refreshed:
+        return f"{'would re-import' if dry_run else 're-imported'} {count} {layer} files"
+    verb = "would import" if dry_run else "imported"
+    return f"{verb} {count} {layer} files for documents without {without}"
+
+
 def _attribution_clause(src: SourceReport, dry_run: bool) -> str:
-    """What an up-to-date source did about documents that had no speakers, if anything.
+    """What an up-to-date source did about its attribution files, if anything.
 
     Empty unless there were attribution files, so a corpus that uses none reads exactly as it
     did before the attribution layer existed.
     """
     if not src.attribution_files:
         return ""
-    verb = "would import" if dry_run else "imported"
-    return f", {verb} {src.attribution_files} attribution files for documents without speakers"
+    phrase = _layer_phrase(
+        src.attribution_files,
+        "attribution",
+        "speakers",
+        dry_run=dry_run,
+        refreshed=src.attribution_refreshed,
+    )
+    return f", {phrase}"
 
 
 def _annotation_clause(src: SourceReport, dry_run: bool) -> str:
-    """What an up-to-date source did about documents that had no stance or facet, if anything.
+    """What an up-to-date source did about its annotation files, if anything.
 
     Empty unless there were annotation files, so a corpus that uses none reads exactly as it did
     before the annotation layer existed.
     """
     if not src.annotation_files:
         return ""
-    verb = "would import" if dry_run else "imported"
-    return f", {verb} {src.annotation_files} annotation files for documents without annotations"
+    phrase = _layer_phrase(
+        src.annotation_files,
+        "annotation",
+        "annotations",
+        dry_run=dry_run,
+        refreshed=src.annotation_refreshed,
+    )
+    return f", {phrase}"
 
 
 def _reimported_clause(src: SourceReport) -> str:
@@ -519,13 +611,23 @@ def _closing_line(report: SyncReport) -> str:
         )
     if report.backfilled_attribution_files:
         clauses.append(
-            f"{verb} {report.backfilled_attribution_files} attribution files for documents "
-            f"without speakers"
+            _layer_phrase(
+                report.backfilled_attribution_files,
+                "attribution",
+                "speakers",
+                dry_run=report.dry_run,
+                refreshed=report.refreshed_attribution,
+            )
         )
     if report.backfilled_annotation_files:
         clauses.append(
-            f"{verb} {report.backfilled_annotation_files} annotation files for documents "
-            f"without annotations"
+            _layer_phrase(
+                report.backfilled_annotation_files,
+                "annotation",
+                "annotations",
+                dry_run=report.dry_run,
+                refreshed=report.refreshed_annotations,
+            )
         )
     if not clauses:
         return f"{report.persona_id}: nothing to sync"

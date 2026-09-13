@@ -76,6 +76,7 @@ __all__ = [
     "load_facets",
     "load_persona_facets",
     "loose_totals",
+    "report_lines",
 ]
 
 #: Why an annotation was skipped, and what a reviewer does about each one. The three are worth
@@ -405,6 +406,32 @@ def _add_mention(store: GraphStore, chunk_id: str, entity: Entity, stance: Stanc
             mentions=[Mention(chunk_id=chunk_id, entity_id=entity.id, stance=stance)],
         )
     )
+
+
+def report_lines(result: AnnotationResult) -> list[str]:
+    """One file's report: its own line, then the entries that did not land, indented under it.
+
+    Returned as one block, and printed as one, because the two halves used to go to different
+    streams -- the count to stdout, the loose entries to stderr. Nothing orders one stream
+    against another: piped together, or demultiplexed by a container runtime, they arrive
+    interleaved, and the first loose line of one file reads as though it belonged to the file
+    above it, which sends a reviewer to the wrong JSON.
+
+    Plain text, no markup: every line quotes back what an agent wrote, and an anchor containing
+    square brackets is not a colour tag.
+    """
+    head = (
+        f"{result.doc_id}: {result.applied}/{result.annotations} annotations, "
+        f"{result.stances} stances, {result.facets} facets"
+        + (f", {result.created} mentions created" if result.created else "")
+        + (f"; {len(result.loose)} loose" if result.loose else "")
+        + (f"; {len(result.unknown_facets)} unknown facets" if result.unknown_facets else "")
+    )
+    return [
+        head,
+        *(f"  loose: {item}" for item in result.loose),
+        *(f"  unknown facet: {facet}" for facet in result.unknown_facets),
+    ]
 
 
 def loose_totals(results: Iterable[AnnotationResult]) -> dict[LooseReason, int]:

@@ -548,6 +548,100 @@ def test_a_document_that_already_has_speakers_is_not_imported_again(
     assert summary_lines(report)[-1] == f"{PERSONA_ID}: nothing to sync"
 
 
+def test_refresh_attribution_re_imports_a_document_that_already_has_speakers(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """The case the gap test cannot see: a file rewritten with new fields for a document that
+    already has speakers. Nothing in the graph says the file changed, so only the flag does."""
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded, speaker="from-the-file")
+    write_attribution(attribution_root / PERSONA_ID / THREADS, f"{PERSONA_ID}:{THREADS}:ghost")
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "already-here"
+    )
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        refresh_attribution=True,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.stale is False  # `no_embedder` proves nothing was re-ingested
+    assert threads.attribution_files == 1  # the file for a document the graph lacks stays out
+    assert threads.attribution_errors == ()
+    assert "from-the-file" in memory_store.documents[threaded].speakers
+    assert report.wrote is True
+    assert summary_lines(report)[0] == f"{THREADS}: up to date, re-imported 1 attribution files"
+    assert summary_lines(report)[-1] == (
+        f"{PERSONA_ID}: nothing to ingest, re-imported 1 attribution files"
+    )
+
+
+def test_without_the_flag_a_rewritten_attribution_file_is_left_alone(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """Which is the behaviour the flag exists to override, asserted beside it."""
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded, speaker="from-the-file")
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "already-here"
+    )
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+    )
+
+    assert next(s for s in report.sources if s.source_id == THREADS).attribution_files == 0
+    assert memory_store.documents[threaded].speakers == ["already-here"]
+
+
+def test_a_dry_run_counts_a_refresh_without_importing_it(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    write_attribution(attribution_root / PERSONA_ID / THREADS, threaded, speaker="from-the-file")
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "already-here"
+    )
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        refresh_attribution=True,
+        dry_run=True,
+    )
+
+    assert next(s for s in report.sources if s.source_id == THREADS).attribution_files == 1
+    assert memory_store.documents[threaded].speakers == ["already-here"]
+    assert report.wrote is False
+    assert summary_lines(report)[0] == (
+        f"{THREADS}: up to date, would re-import 1 attribution files"
+    )
+
+
 def test_attribution_is_reimported_because_a_re_ingest_drops_speakers(
     threaded: str,
     memory_store: InMemoryGraphStore,
@@ -736,6 +830,38 @@ def test_a_document_that_already_has_annotations_is_not_imported_again(
     assert next(s for s in report.sources if s.source_id == THREADS).annotation_files == 0
     assert memory_store.chunk_facets(PERSONA_ID)[0].facets == ["already-here"]
     assert report.wrote is False
+
+
+def test_refresh_annotations_re_imports_a_document_that_already_has_annotations(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    """The annotation layer's half of the same problem: a reading added to a document that
+    already carries one is invisible to a check that only asks whether the layer is there."""
+    write_annotation(annotation_root / PERSONA_ID / THREADS, threaded, facet="from-the-file")
+    memory_store.annotate_chunk(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, ["already-here"]
+    )
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        annotation_root=annotation_root,
+        refresh_annotations=True,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.annotation_files == 1
+    assert threads.annotation_errors == ()
+    assert "from-the-file" in memory_store.chunk_facets(PERSONA_ID)[0].facets
+    assert report.wrote is True
+    assert summary_lines(report)[0] == f"{THREADS}: up to date, re-imported 1 annotation files"
 
 
 def test_annotations_are_reimported_because_a_re_ingest_drops_them(
@@ -940,6 +1066,32 @@ def test_summary_lines_report_all_three_layers_when_all_three_did_something() ->
     assert summary_lines(report)[-1] == (
         "p: nothing to ingest, imported 2 extraction files for documents without entities, "
         "imported 3 attribution files for documents without speakers, "
+        "imported 4 annotation files for documents without annotations"
+    )
+
+
+def test_summary_lines_tell_a_refresh_apart_from_a_backfill() -> None:
+    """The two answer different questions, so a reader should not have to guess which ran."""
+    report = SyncReport(
+        persona_id="p",
+        sources=(
+            SourceReport(
+                source_id="a",
+                enrichment_files=2,
+                attribution_files=3,
+                annotation_files=4,
+                attribution_refreshed=True,
+            ),
+        ),
+    )
+    assert summary_lines(report)[0] == (
+        "a: up to date, imported 2 extraction files for documents without entities, "
+        "re-imported 3 attribution files, "
+        "imported 4 annotation files for documents without annotations"
+    )
+    assert summary_lines(report)[-1] == (
+        "p: nothing to ingest, imported 2 extraction files for documents without entities, "
+        "re-imported 3 attribution files, "
         "imported 4 annotation files for documents without annotations"
     )
 

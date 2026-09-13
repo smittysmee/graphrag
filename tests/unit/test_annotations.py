@@ -21,6 +21,7 @@ from graphrag.extract.annotations import (
     load_persona_facets,
     loose_summary,
     loose_totals,
+    report_lines,
 )
 from graphrag.graph.memory_store import InMemoryGraphStore
 from graphrag.models import Enrichment, Entity, Mention
@@ -570,6 +571,67 @@ def test_the_cli_reports_a_dry_run_before_it_writes(
     missing = tmp_path / "missing.json"
     missing.write_text(json.dumps({"doc_id": "nope", "annotations": []}))
     assert runner.invoke(app, ["annotations-import", "test-docs", str(missing)]).exit_code == 2
+
+
+def test_each_files_loose_lines_print_under_its_own_file(
+    cli_context: AppContext, thread_document: str, annotated_thread: dict[str, str], tmp_path: Path
+) -> None:
+    """A loose line used to go to stderr while its file's line went to stdout.
+
+    Nothing orders one stream against the other, so with several files the first loose line of
+    one could surface under the line of the file before it, and a reviewer would open the wrong
+    JSON. One block on one stream is the fix, so the two files here are asserted in order.
+    """
+    from typer.testing import CliRunner
+
+    from graphrag.cli import app
+
+    clean = write_annotations(
+        tmp_path / "clean.json",
+        thread_document,
+        [annotation(FIRST, entity="Handbook", stance="praise")],
+    )
+    loose = write_annotations(
+        tmp_path / "loose.json",
+        thread_document,
+        [annotation("no sentence of this thread reads like this", facets=["access"])],
+    )
+
+    for argv in (
+        ["annotations-import", "test-docs", str(clean), str(loose), "--dry-run"],
+        ["annotations-import", "test-docs", str(clean), str(loose), "--no-export"],
+    ):
+        result = CliRunner().invoke(app, argv)
+
+        assert result.exit_code == 0, result.output
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert lines[0] == f"{thread_document}: 1/1 annotations, 1 stances, 0 facets"
+        assert lines[1] == f"{thread_document}: 0/1 annotations, 0 stances, 0 facets; 1 loose"
+        assert lines[2] == "  loose: anchor not found: no sentence of this thread reads like this"
+
+
+def test_a_files_report_is_one_block_a_reader_can_attribute(
+    cli_context: AppContext, thread_document: str, tmp_path: Path
+) -> None:
+    """The rendering on its own: pure, so the ordering is asserted without a terminal."""
+    result = import_annotation_file(
+        cli_context.store,
+        write_annotations(
+            tmp_path / "one.json",
+            thread_document,
+            [
+                annotation(FIRST, facets=["handover"]),
+                annotation("nothing in the thread says this", facets=["handover"]),
+            ],
+        ),
+        dry_run=True,
+        facets=load_facets(write_facets(tmp_path / "personas", "test-docs")),
+    )
+
+    assert report_lines(result) == [
+        f"{thread_document}: 1/2 annotations, 0 stances, 1 facets; 1 loose",
+        "  loose: anchor not found: nothing in the thread says this",
+    ]
 
 
 def test_the_summary_line_breaks_the_loose_count_into_its_three_reasons(

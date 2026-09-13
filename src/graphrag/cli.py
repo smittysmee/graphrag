@@ -304,6 +304,20 @@ def sync(
     source: Annotated[
         str | None, typer.Option("--source", "-s", help="Only this source id.")
     ] = None,
+    refresh_attribution: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-attribution",
+            help="Re-import every attribution file, not only those filling a gap.",
+        ),
+    ] = False,
+    refresh_annotations: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-annotations",
+            help="Re-import every annotation file, not only those filling a gap.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Report what is missing; write nothing.")
     ] = False,
@@ -316,6 +330,11 @@ def sync(
     are behind, then re-imports their extraction files, since a re-ingest drops entity mentions.
     Sources that were already complete are still checked for documents the graph holds without
     any entity, and the extraction files for those are imported too.
+
+    That check asks whether a layer is missing, so a rewritten sidecar is invisible to it: an
+    attribution file that gained posted dates names a document that already has speakers.
+    `--refresh-attribution` and `--refresh-annotations` re-import every sidecar of that kind
+    instead, whatever the graph already holds, and each source's line says which it did.
     """
     from graphrag.sync import UnknownSourceError, summary_lines, sync_persona
 
@@ -334,6 +353,8 @@ def sync(
                 aliases=_alias_table(ctx, spec.id),
                 facets=_facet_table(ctx, spec.id),
                 source_id=source,
+                refresh_attribution=refresh_attribution,
+                refresh_annotations=refresh_annotations,
                 dry_run=dry_run,
                 progress=_progress,
             )
@@ -926,7 +947,7 @@ def attribution_import(
     the document's passages. Reports posts whose anchor occurs in no passage (they are skipped,
     never guessed at), so a reviewer can fix the quote before writing.
     """
-    from graphrag.extract.attribution import import_attribution_file
+    from graphrag.extract.attribution import import_attribution_file, report_lines
 
     ctx = State.context()
     try:
@@ -944,13 +965,8 @@ def attribution_import(
             total_attached += result.attached
             total_loose += len(result.loose)
             voices.update(result.speakers)
-            console.print(
-                f"{result.doc_id}: {result.attached}/{result.posts} posts attached, "
-                f"{len(result.speakers)} speakers"
-                + (f"; [yellow]{len(result.loose)} loose anchors[/yellow]" if result.loose else "")
-            )
-            for post in result.loose:
-                err.print(f"  loose: {post}", markup=False, highlight=False)
+            for line in report_lines(result):
+                console.print(line, markup=False, highlight=False)
         verb = "validated" if dry_run else "imported"
         console.print(
             f"[green]{verb}[/green] {len(files) - problems} files: {total_attached}/{total_posts} "
@@ -1486,6 +1502,7 @@ def annotations_import(
         import_annotation_file,
         loose_summary,
         loose_totals,
+        report_lines,
     )
 
     ctx = State.context()
@@ -1515,21 +1532,8 @@ def annotations_import(
                 problems += 1
                 continue
             results.append(result)
-            console.print(
-                f"{result.doc_id}: {result.applied}/{result.annotations} annotations, "
-                f"{result.stances} stances, {result.facets} facets"
-                + (f", {result.created} mentions created" if result.created else "")
-                + (f"; [yellow]{len(result.loose)} loose[/yellow]" if result.loose else "")
-                + (
-                    f"; [yellow]{len(result.unknown_facets)} unknown facets[/yellow]"
-                    if result.unknown_facets
-                    else ""
-                )
-            )
-            for item in result.loose:
-                err.print(f"  loose: {item}", markup=False, highlight=False)
-            for facet in result.unknown_facets:
-                err.print(f"  unknown facet: {facet}", markup=False, highlight=False)
+            for line in report_lines(result):
+                console.print(line, markup=False, highlight=False)
         verb = "validated" if dry_run else "imported"
         totals = loose_totals(results)
         loose = sum(totals.values())

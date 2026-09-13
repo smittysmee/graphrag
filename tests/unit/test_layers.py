@@ -128,6 +128,33 @@ def test_a_path_no_source_covers_is_an_error(docs_persona: PersonaSpec) -> None:
         doc_id_for_file(docs_persona, Path("/repo/data/raw/test-docs"), Path("/elsewhere/stray.md"))
 
 
+def test_a_relative_raw_root_answers_an_absolute_file(
+    persona: PersonaSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings keep ``data/raw`` relative; a hook or an editor hands over an absolute path."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data/raw/test-pm/episodes/ada-north/transcript.md"
+
+    doc_id, _source = doc_id_for_file(persona, Path("data/raw/test-pm"), target)
+
+    assert doc_id == "test-pm:test-podcast:ada-north"
+
+
+def test_a_relative_raw_root_answers_a_relative_file(
+    persona: PersonaSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the form a person types, which is relative to the directory the command runs in."""
+    monkeypatch.chdir(tmp_path)
+
+    doc_id, _source = doc_id_for_file(
+        persona,
+        Path("data/raw/test-pm"),
+        Path("data/raw/test-pm/episodes/ada-north/transcript.md"),
+    )
+
+    assert doc_id == "test-pm:test-podcast:ada-north"
+
+
 # ----------------------------------------------------------------------------- disk index
 
 
@@ -331,6 +358,84 @@ def test_the_command_takes_a_raw_file_and_derives_the_id(
     result = runner.invoke(app, ["layers", "check", "test-pm", "--file", str(raw)])
 
     # A derived id that missed would have found no extraction file and exited 1.
+    assert result.exit_code == 0, result.output
+    assert "test-pm: 1 documents checked" in result.output
+
+
+@pytest.fixture
+def relative_raw_dir(
+    cli_context: AppContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AppContext:
+    """The container's shape: ``raw_dir`` relative, resolved against the directory the CLI runs in.
+
+    The fixtures elsewhere make every path absolute, which hid the one comparison this command
+    depends on: a relative base against whatever form the caller typed.
+    """
+    from graphrag.cli import State
+
+    workdir = tmp_path / "workdir"
+    (workdir / "data" / "raw").mkdir(parents=True)
+    monkeypatch.chdir(workdir)
+    relative = cli_context.settings.model_copy(update={"raw_dir": Path("data/raw")})
+    ctx = AppContext(
+        settings=relative,
+        store=cli_context.store,
+        registry=cli_context.registry,
+        embedder=cli_context.embedder,
+    )
+    State.factory = lambda: ctx
+    return ctx
+
+
+def write_raw_episode(raw_dir: Path) -> Path:
+    """The raw file whose folder name the transcripts loader turns into the document id."""
+    path = raw_dir / "test-pm" / "episodes" / "ada-north" / "transcript.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# a transcript\n", encoding="utf-8")
+    return path
+
+
+def test_the_command_takes_a_relative_file_against_a_relative_raw_dir(
+    relative_raw_dir: AppContext, ingested: IngestReport
+) -> None:
+    """`--file data/raw/...`, the form a person types. It used to cover no source at all."""
+    write_raw_episode(relative_raw_dir.settings.raw_dir)
+    write_extraction(
+        relative_raw_dir.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "layers",
+            "check",
+            "test-pm",
+            "--file",
+            "data/raw/test-pm/episodes/ada-north/transcript.md",
+        ],
+    )
+
+    assert "no source" not in result.output
+    assert result.exit_code == 0, result.output
+    assert "test-pm: 1 documents checked" in result.output
+
+
+def test_the_command_takes_an_absolute_file_against_a_relative_raw_dir(
+    relative_raw_dir: AppContext, ingested: IngestReport
+) -> None:
+    """And the form a hook hands over, which is the same file spelled from the root."""
+    raw = write_raw_episode(relative_raw_dir.settings.raw_dir)
+    write_extraction(
+        relative_raw_dir.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--file", str(raw.resolve())])
+
+    assert "no source" not in result.output
     assert result.exit_code == 0, result.output
     assert "test-pm: 1 documents checked" in result.output
 

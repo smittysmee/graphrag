@@ -101,6 +101,41 @@ def test_sync_ingests_what_is_missing_then_goes_quiet(cli_context: AppContext) -
     assert unknown.exit_code == 2
 
 
+def test_sync_refreshes_attribution_when_asked(cli_context: AppContext) -> None:
+    """A rewritten sidecar names a document that already has the layer, so the usual gap test
+    never picks it up. `--refresh-attribution` is what gets its new fields into the graph."""
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+    assert runner.invoke(app, ["sync", "test-pm"]).exit_code == 0
+    doc_id = "test-pm:test-podcast:ada-north"
+    sidecar = cli_context.settings.attribution_dir / "test-pm" / "test-podcast" / "ada-north.json"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        json.dumps(
+            {
+                "doc_id": doc_id,
+                "posts": [
+                    {
+                        "speaker": "ada-north-handle",
+                        "anchor": "Product-market fit is when retention curves flatten",
+                        "role": "op",
+                        "date": "2025-01-10",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    quiet = runner.invoke(app, ["sync", "test-pm"])
+    assert quiet.exit_code == 0, quiet.output
+    assert "nothing to sync" in quiet.stdout  # the transcript already has its parsed speakers
+
+    refreshed = runner.invoke(app, ["sync", "test-pm", "--refresh-attribution"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert "re-imported 1 attribution files" in refreshed.stdout
+    assert "ada-north-handle" in cli_context.store.documents[doc_id].speakers
+
+
 def test_enrich_import_from_agent_json(
     cli_context: AppContext, ingested: IngestReport, tmp_path: Path
 ) -> None:

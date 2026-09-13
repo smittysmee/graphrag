@@ -497,6 +497,13 @@ it when nothing changed writes nothing. Add `SOURCE=<id>` to limit it to one sou
 `make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` is still there when you want to force one
 source through regardless.
 
+Sync decides what to re-import by asking whether a layer is *missing*, which a rewritten sidecar
+never is: an attribution file that gained posted dates, or an annotation file that gained facets,
+names a document that already has speakers or stances, so nothing picks the new fields up. Pass
+`--refresh-attribution` or `--refresh-annotations` to re-import every sidecar of that kind for the
+persona whatever the graph already holds; each source's line then says `re-imported N attribution
+files` rather than the backfill wording, and `--dry-run` reports the same count without writing.
+
 ---
 
 ## 6. Where the compute runs

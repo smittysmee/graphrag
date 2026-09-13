@@ -238,11 +238,10 @@ def doc_id_for_file(persona: PersonaSpec, raw_root: Path, path: Path) -> tuple[s
     A file under two sources belongs to the more specific one (the deepest base directory).
     Raises :class:`SourceNotFoundError` when no source of this persona covers the path.
     """
-    target = path if path.is_absolute() else Path.cwd() / path
-    target = Path(_normalise(target))
+    target = _resolve(path)
     best: tuple[int, SourceSpec, Path] | None = None
     for source in persona.sources:
-        base = Path(_normalise(source_base(raw_root, source)))
+        base = _resolve(source_base(raw_root, source))
         try:
             rel = target.relative_to(base)
         except ValueError:
@@ -251,8 +250,9 @@ def doc_id_for_file(persona: PersonaSpec, raw_root: Path, path: Path) -> tuple[s
         if best is None or depth > best[0]:
             best = (depth, source, rel)
     if best is None:
-        known = ", ".join(str(source_base(raw_root, s)) for s in persona.sources) or "(none)"
-        msg = f"no source of {persona.id} covers {path}; sources live under {known}"
+        bases = [str(_resolve(source_base(raw_root, s))) for s in persona.sources]
+        known = ", ".join(bases) or "(none)"
+        msg = f"no source of {persona.id} covers {target}; sources live under {known}"
         raise SourceNotFoundError(msg)
     _depth, source, rel = best
     if source.loader == "transcripts":
@@ -261,6 +261,18 @@ def doc_id_for_file(persona: PersonaSpec, raw_root: Path, path: Path) -> tuple[s
     else:
         slug = slugify(str(rel.with_suffix("")))
     return f"{persona.id}:{source.id}:{slug}", source
+
+
+def _resolve(path: Path) -> Path:
+    """``path`` made absolute against the working directory, with ``.`` and ``..`` folded out.
+
+    The target and the source bases go through the same call because they arrive in different
+    shapes and comparing them as they come is meaningless. A base is built from settings, which
+    keep ``data/raw`` relative to wherever the command runs -- ``/app`` in the container -- while
+    the target is whatever the caller typed: ``data/raw/...`` from a shell, or an absolute path
+    from a hook or an editor. Anchoring both to the working directory makes either form answer.
+    """
+    return Path(_normalise(path if path.is_absolute() else Path.cwd() / path))
 
 
 def _normalise(path: Path) -> str:

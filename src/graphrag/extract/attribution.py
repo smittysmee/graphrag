@@ -48,6 +48,7 @@ __all__ = [
     "find_anchor",
     "fold_passage",
     "import_attribution_file",
+    "report_lines",
 ]
 
 #: Enough to cover any single document; the store pages, so this is one read either way.
@@ -117,6 +118,22 @@ def find_anchor(anchor: str, folded: list[tuple[str, str]]) -> str | None:
     if not needle:
         return None
     return next((chunk_id for chunk_id, text in folded if needle in text), None)
+
+
+def report_lines(result: AttributionResult) -> list[str]:
+    """One file's report: its own line, then the anchors that matched nothing, under it.
+
+    One block on one stream, for the reason :func:`graphrag.extract.annotations.report_lines`
+    gives: a count on stdout and its loose anchors on stderr are two streams with no order
+    between them, so a loose line can surface under the wrong document's line. Plain text, no
+    markup, because each loose line quotes an anchor an agent wrote.
+    """
+    head = (
+        f"{result.doc_id}: {result.attached}/{result.posts} posts attached, "
+        f"{len(result.speakers)} speakers"
+        + (f"; {len(result.loose)} loose anchors" if result.loose else "")
+    )
+    return [head, *(f"  loose: {post}" for post in result.loose)]
 
 
 def import_attribution_file(
