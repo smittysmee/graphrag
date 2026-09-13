@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 from graphrag.app import AppContext
 from graphrag.cli import app
 from graphrag.pipeline import IngestReport
+from tests.conftest import write_sample_corpus
 
 runner = CliRunner()
 
@@ -76,6 +77,28 @@ def test_doctor_reports_backend(cli_context: AppContext) -> None:
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0, result.output
     assert "backend=hash" in result.stdout
+
+
+def test_sync_ingests_what_is_missing_then_goes_quiet(cli_context: AppContext) -> None:
+    """`make sync` is one command, so the CLI behind it has to be safe to re-run."""
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+
+    dry = runner.invoke(app, ["sync", "test-pm", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "3 documents missing" in dry.stdout
+    assert cli_context.store.stats().documents == 0  # a dry run writes nothing
+
+    done = runner.invoke(app, ["sync", "test-pm"])
+    assert done.exit_code == 0, done.output
+    assert cli_context.store.stats().documents == 3
+    assert (cli_context.settings.snapshots_dir / "test-pm" / "manifest.json").exists()
+
+    again = runner.invoke(app, ["sync", "test-pm"])
+    assert again.exit_code == 0, again.output
+    assert "nothing to sync" in again.stdout
+
+    unknown = runner.invoke(app, ["sync", "test-pm", "--source", "nope"])
+    assert unknown.exit_code == 2
 
 
 def test_enrich_import_from_agent_json(

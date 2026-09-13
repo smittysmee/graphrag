@@ -46,8 +46,9 @@ a thin `.claude/hooks/*.sh` wrapper around a module in `src/graphrag/hooks/`.
 - **`UserPromptSubmit` → `route-prompt.sh`** detects that a prompt belongs to a persona and
   injects a one-paragraph nudge to call `context(query, persona_id=...)` first, plus up to three
   matching document titles. Routing only: it never injects passages.
-- **`Stop` → `uningested.sh`** names any files under `data/raw/` that the graph does not contain,
-  and the `make ingest` command that fixes it.
+- **`Stop` → `uningested.sh`** names any files under `data/raw/` that the graph does not contain
+  and tells you to run `make sync PERSONA=<id>`, which is the one command that fixes it: it
+  re-ingests only the sources that are behind and re-imports their extraction JSON.
 
 **The router has no keyword list.** Vocabulary is derived from the graph at runtime: the persona
 id and name (weight 3), its `tags` (2), and its top 60 topics from the MCP `topics` tool (1).

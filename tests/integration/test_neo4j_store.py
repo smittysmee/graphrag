@@ -39,6 +39,10 @@ def test_end_to_end_on_neo4j(
 
     assert clean_store.fulltext_search("roadmap (review)", 3, "it-pm")  # lucene specials escaped
     assert clean_store.related_topics("retention", "it-pm")
+    ids = clean_store.document_ids("it-pm")
+    assert len(ids) == 3
+    assert clean_store.document_ids("it-pm", "test-podcast") == ids
+    assert clean_store.document_ids("it-pm", "absent") == set()
     doc = clean_store.list_documents("it-pm", speaker="Ada North")[0]
     assert clean_store.document_chunks(doc.id, 0, 1)[0].ordinal == 0
     assert clean_store.list_speakers("it-pm")[0].speaker == "Lenny Rachitsky"

@@ -1,7 +1,7 @@
 """Stop hook: notice when files under ``data/raw`` have not reached the graph.
 
 Writing a note under ``data/raw/<persona>/...`` does nothing until someone runs
-``make ingest``; this hook checks after each turn so nobody has to remember. It is
+``make sync``; this hook checks after each turn so nobody has to remember. It is
 read-only and fail-silent: ``main`` always exits 0, and it stays quiet when nothing is
 missing or when this ``Stop`` itself is a hook continuation (``stop_hook_active``).
 
@@ -18,8 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +51,10 @@ class Finding:
 
 @dataclass(frozen=True)
 class Report:
-    """What :func:`find_uningested` found, plus enough to build the ingest command."""
+    """What :func:`find_uningested` found, plus enough to build the sync command."""
 
     source: str  # "graph" (the live server answered) or "snapshot" (it was down)
     findings: tuple[Finding, ...] = ()
-    raw_roots: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def total_files(self) -> int:
@@ -84,7 +82,6 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
     source_kind = "graph" if client is not None else "snapshot"
     snapshot_cache: dict[str, set[str]] = {}
     findings: list[Finding] = []
-    raw_roots: dict[str, str] = {}
 
     for pid in sorted(personas):
         persona = personas[pid]
@@ -111,10 +108,7 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
             if missing:
                 findings.append(Finding(pid, source.id, source.loader, missing_files=missing))
 
-        if pid not in raw_roots and any(f.persona_id == pid for f in findings):
-            raw_roots[pid] = str(project.raw_root(root, persona))
-
-    return Report(source=source_kind, findings=tuple(findings), raw_roots=raw_roots)
+    return Report(source=source_kind, findings=tuple(findings))
 
 
 def _existing_ids(
@@ -180,10 +174,9 @@ def render_message(report: Report) -> str | None:
     if total <= 0:
         return None
     entries = _entries(report)
-    persona_id, raw_root = _primary(report)
     plural = "file" if total == 1 else "files"
     against = " (vs committed snapshot)" if report.source == "snapshot" else ""
-    ingest_cmd = f"`make ingest PERSONA={persona_id} SRC={raw_root}`"
+    sync_cmd = f"`make sync PERSONA={_primary(report)}`"
     message = ""
     for shown_n in (_MAX_NAMED, 2, 1, 0):
         shown = entries[:shown_n]
@@ -192,8 +185,7 @@ def render_message(report: Report) -> str | None:
         if more > 0:
             names = f"{names} (+{more} more)" if names else f"(+{more} more)"
         message = (
-            f"graphrag: {total} raw {plural} not in the graph{against}: {names}. "
-            f"Ingest with {ingest_cmd} then re-import enrichment JSON."
+            f"graphrag: {total} raw {plural} not in the graph{against}: {names}. Run {sync_cmd}."
         )
         if len(message) <= _MAX_MESSAGE:
             return message
@@ -210,11 +202,10 @@ def _entries(report: Report) -> list[str]:
     return names
 
 
-def _primary(report: Report) -> tuple[str, str]:
-    """The persona with the most missing files (ties broken by id), for the ingest command."""
+def _primary(report: Report) -> str:
+    """The persona with the most missing files (ties broken by id), for the sync command."""
     by_persona = report.by_persona
-    persona_id = min(by_persona, key=lambda pid: (-by_persona[pid], pid))
-    return persona_id, report.raw_roots.get(persona_id, "")
+    return min(by_persona, key=lambda pid: (-by_persona[pid], pid))
 
 
 def _read_stdin_payload() -> dict[str, Any]:

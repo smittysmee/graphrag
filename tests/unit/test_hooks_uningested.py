@@ -102,7 +102,6 @@ def test_snapshot_fallback_reports_missing_files_and_a_zero_ingested_source(root
     assert by_source[("demo-persona", "talks")].raw_count == 2
     assert report.total_files == 3
     assert report.by_persona == {"demo-persona": 3}
-    assert report.raw_roots["demo-persona"] == str(root / "data" / "raw" / "demo-persona")
 
 
 def test_transcripts_source_is_not_flagged_once_any_document_exists(root: Path) -> None:
@@ -199,7 +198,8 @@ def test_render_message_is_none_when_nothing_is_missing() -> None:
     assert uningested.render_message(uningested.Report(source="graph")) is None
 
 
-def test_render_message_names_files_and_gives_the_ingest_command() -> None:
+def test_render_message_names_files_and_gives_the_sync_command() -> None:
+    """One command, not three: `make sync` covers the ingest and the enrichment re-import."""
     report = uningested.Report(
         source="graph",
         findings=(
@@ -207,15 +207,11 @@ def test_render_message_names_files_and_gives_the_ingest_command() -> None:
                 "demo-persona", "notes", "documents", missing_files=("a.md", "b.md")
             ),
         ),
-        raw_roots={"demo-persona": "/repo/data/raw/demo-persona"},
     )
     message = uningested.render_message(report)
     assert message == (
-        "graphrag: 2 raw files not in the graph: a.md, b.md. "
-        "Ingest with `make ingest PERSONA=demo-persona SRC=/repo/data/raw/demo-persona` "
-        "then re-import enrichment JSON."
+        "graphrag: 2 raw files not in the graph: a.md, b.md. Run `make sync PERSONA=demo-persona`."
     )
-    assert message is not None
     assert len(message) <= 500
 
 
@@ -224,7 +220,6 @@ def test_render_message_shows_at_most_three_names_then_a_count() -> None:
     report = uningested.Report(
         source="graph",
         findings=(uningested.Finding("demo-persona", "notes", "documents", missing_files=files),),
-        raw_roots={"demo-persona": "/repo"},
     )
     message = uningested.render_message(report)
     assert message is not None
@@ -236,7 +231,6 @@ def test_render_message_stays_under_the_budget_with_long_names() -> None:
     report = uningested.Report(
         source="graph",
         findings=(uningested.Finding("demo-persona", "notes", "documents", missing_files=files),),
-        raw_roots={"demo-persona": "/repo/data/raw/demo-persona"},
     )
     message = uningested.render_message(report)
     assert message is not None
@@ -247,7 +241,6 @@ def test_render_message_labels_a_transcripts_zero_ingested_finding() -> None:
     report = uningested.Report(
         source="graph",
         findings=(uningested.Finding("demo-persona", "talks", "transcripts", raw_count=2),),
-        raw_roots={"demo-persona": "/repo/data/raw/demo-persona"},
     )
     message = uningested.render_message(report)
     assert message is not None
@@ -261,11 +254,10 @@ def test_render_message_picks_the_persona_with_the_most_missing_files() -> None:
             uningested.Finding("alpha", "notes", "documents", missing_files=("a.md",)),
             uningested.Finding("beta", "notes", "documents", missing_files=("b.md", "c.md")),
         ),
-        raw_roots={"alpha": "/repo/alpha", "beta": "/repo/beta"},
     )
     message = uningested.render_message(report)
     assert message is not None
-    assert "PERSONA=beta SRC=/repo/beta" in message
+    assert "`make sync PERSONA=beta`" in message
 
 
 def test_render_message_notes_the_snapshot_fallback() -> None:
@@ -274,7 +266,6 @@ def test_render_message_notes_the_snapshot_fallback() -> None:
         findings=(
             uningested.Finding("demo-persona", "notes", "documents", missing_files=("a.md",)),
         ),
-        raw_roots={"demo-persona": "/repo"},
     )
     message = uningested.render_message(report)
     assert message is not None

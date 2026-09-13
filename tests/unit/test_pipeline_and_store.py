@@ -60,6 +60,18 @@ def test_topic_cooccurrence_and_filters(
     assert memory_store.list_speakers("test-pm")[0].speaker == "Lenny Rachitsky"
 
 
+def test_document_ids_are_scoped_by_persona_and_source(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag sync` compares the raw files against."""
+    ids = memory_store.document_ids("test-pm")
+    assert len(ids) == 3
+    assert all(i.startswith("test-pm:test-podcast:") for i in ids)
+    assert memory_store.document_ids("test-pm", "test-podcast") == ids
+    assert memory_store.document_ids("test-pm", "nope") == set()
+    assert memory_store.document_ids("other-persona") == set()
+
+
 def test_delete_persona_removes_everything(
     ingested: IngestReport, memory_store: InMemoryGraphStore
 ) -> None:

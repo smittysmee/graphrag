@@ -183,6 +183,13 @@ class InMemoryGraphStore:
         docs.sort(key=lambda d: (d.published or "", d.title), reverse=True)
         return docs[:limit]
 
+    def document_ids(self, persona_id: str, source_id: str | None = None) -> set[str]:
+        return {
+            doc_id
+            for doc_id, doc in self.documents.items()
+            if doc.persona_id == persona_id and (source_id is None or doc.source_id == source_id)
+        }
+
     def document_chunks(self, doc_id: str, start: int = 0, count: int = 5) -> list[Chunk]:
         chunks = sorted(
             (c for c in self.chunks.values() if c.doc_id == doc_id), key=lambda c: c.ordinal

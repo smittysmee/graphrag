@@ -282,6 +282,61 @@ def ingest(
 
 
 @app.command()
+def sync(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    source: Annotated[
+        str | None, typer.Option("--source", "-s", help="Only this source id.")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what is missing; write nothing.")
+    ] = False,
+    export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
+) -> None:
+    """Ingest whatever the graph is missing for a persona and re-import its extraction JSON.
+
+    One command instead of three: it compares the document ids the loaders would produce for
+    the persona's raw files with the ids already in the graph, re-ingests only the sources that
+    are behind, then re-imports their extraction files, since a re-ingest drops entity mentions.
+    """
+    from graphrag.sync import UnknownSourceError, summary_lines, sync_persona
+
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        try:
+            report = sync_persona(
+                spec,
+                store=ctx.store,
+                embedder=ctx.require_embedder,
+                raw_root=ctx.settings.raw_dir / spec.id,
+                enrichment_root=ctx.settings.enrichment_dir,
+                source_id=source,
+                dry_run=dry_run,
+                progress=_progress,
+            )
+        except UnknownSourceError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
+        for line in summary_lines(report):
+            console.print(line)
+        if report.errors:
+            err.print(f"[yellow]{len(report.errors)} extraction files failed to import[/yellow]")
+        if export and not dry_run and report.stale_sources:
+            snap.export_snapshot(
+                ctx.store,
+                spec,
+                ctx.snapshots_dir,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
+            )
+            console.print(f"snapshot exported to {snap.snapshot_dir(ctx.snapshots_dir, spec.id)}")
+        if report.errors:
+            raise typer.Exit(2)
+    finally:
+        ctx.close()
+
+
+@app.command()
 def enrich(
     persona: Annotated[str, typer.Argument(help="Persona id.")],
     limit: Annotated[int, typer.Option(help="Max documents to enrich this run.")] = 10,
@@ -343,7 +398,7 @@ def enrich_import(
     Reports entity names that do not occur verbatim in any passage (their mention falls back
     to the first passage), so reviewers can spot non-canonical names.
     """
-    from graphrag.extract.llm import DocumentExtraction, match_chunks, result_to_enrichment
+    from graphrag.extract.importer import import_extraction_file
 
     ctx = State.context()
     try:
@@ -351,44 +406,34 @@ def enrich_import(
         total_entities = total_mentions = total_relations = 0
         problems = 0
         for file in files:
-            try:
-                payload = DocumentExtraction.model_validate_json(file.read_text(encoding="utf-8"))
-            except ValueError as exc:
-                err.print(f"[red]{file}: invalid: {exc}[/red]")
+            result = import_extraction_file(ctx.store, file, dry_run=dry_run)
+            if not result.ok:
+                err.print(f"[red]{file}: {result.error}[/red]")
                 problems += 1
                 continue
-            chunks = ctx.store.document_chunks(payload.doc_id, 0, 100_000)
-            if not chunks:
-                err.print(f"[red]{file}: unknown document {payload.doc_id}[/red]")
-                problems += 1
-                continue
-            tiers = {e.name: match_chunks(e.name.strip(), chunks)[1] for e in payload.entities}
-            unmatched = [n for n, tier in tiers.items() if tier == "none"]
-            loose = [n for n, tier in tiers.items() if tier == "loose"]
-            names = {e.name.strip().lower() for e in payload.entities}
-            dangling = [
-                f"{r.source} -> {r.target}"
-                for r in payload.relations
-                if r.source.strip().lower() not in names or r.target.strip().lower() not in names
-            ]
-            enrichment = result_to_enrichment(payload, chunks)
-            if not dry_run:
-                ctx.store.upsert_enrichment(enrichment)
-            total_entities += len(enrichment.entities)
-            total_mentions += len(enrichment.mentions)
-            total_relations += len(enrichment.relations)
+            total_entities += result.entities
+            total_mentions += result.mentions
+            total_relations += result.relations
             console.print(
-                f"{payload.doc_id}: {len(enrichment.entities)} entities, "
-                f"{len(enrichment.mentions)} mentions, {len(enrichment.relations)} relations"
-                + (f"; {len(loose)} loosely matched" if loose else "")
-                + (f"; [yellow]{len(unmatched)} unmatched names[/yellow]" if unmatched else "")
-                + (f"; [yellow]{len(dangling)} dangling relations[/yellow]" if dangling else "")
+                f"{result.doc_id}: {result.entities} entities, "
+                f"{result.mentions} mentions, {result.relations} relations"
+                + (f"; {len(result.loose)} loosely matched" if result.loose else "")
+                + (
+                    f"; [yellow]{len(result.unmatched)} unmatched names[/yellow]"
+                    if result.unmatched
+                    else ""
+                )
+                + (
+                    f"; [yellow]{len(result.dangling)} dangling relations[/yellow]"
+                    if result.dangling
+                    else ""
+                )
             )
-            for name in loose:
+            for name in result.loose:
                 err.print(f"  loose: {name}")
-            for name in unmatched:
+            for name in result.unmatched:
                 err.print(f"  unmatched: {name}")
-            for rel in dangling:
+            for rel in result.dangling:
                 err.print(f"  dangling: {rel}")
         verb = "validated" if dry_run else "imported"
         console.print(

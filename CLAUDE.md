@@ -8,7 +8,8 @@ content (see NOTICE.md), otherwise each user ingests locally.
 - `make setup` — first-time: hooks, images, Neo4j, load snapshots, MCP on :8765
 - `make check` — ruff format check, ruff lint, mypy --strict, unit tests (this is the pre-commit hook)
 - `make test-integration` — against a throwaway Neo4j (pre-push hook)
-- `make ingest PERSONA=<id> SRC=<path>` / `make enrich` / `make search Q="..."` / `make context`
+- `make sync PERSONA=<id>` — ingest what is missing and re-import that source's enrichment JSON
+- `make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` / `make enrich` / `make search Q="..."` / `make context`
 - `make doctor` — Neo4j, embedder placement (local vs http), snapshot compatibility
 
 ## Layout

@@ -305,11 +305,19 @@ persona design.
 
 ```bash
 git submodule update --remote data/raw/product-leader
-make ingest PERSONA=product-leader SRC=data/raw/product-leader
+make sync PERSONA=product-leader
 git add data/raw/product-leader data/snapshots/product-leader && git commit
 ```
 
-Re-ingesting replaces a document rather than merging into it, so edits and deletions land cleanly.
+`make sync` is the one command to reach for after files under `data/raw/<persona>/` change. It asks
+the loaders which document ids those files would produce, compares them with what the graph holds,
+and for each source that is behind it re-ingests that source and re-imports its extraction JSON —
+which matters because re-ingesting replaces a document rather than merging into it, and entity
+mentions hang off the chunks it deletes. Sources that are already complete are skipped, so running
+it when nothing changed writes nothing. Add `SOURCE=<id>` to limit it to one source, or run
+`docker compose run --rm -T graphrag graphrag sync <persona> --dry-run` to see what it would do.
+`make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` is still there when you want to force one
+source through regardless.
 
 ---
 
