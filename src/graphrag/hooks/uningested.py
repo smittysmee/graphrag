@@ -28,6 +28,7 @@ from typing import Any
 
 from graphrag.hooks import project
 from graphrag.hooks.mcp_client import McpClient, McpUnavailable, connect
+from graphrag.textutil import sanitize_inline
 
 __all__ = [
     "Finding",
@@ -43,6 +44,10 @@ _PAGE_SIZE = 500
 _MAX_PAGES = 40  # guards against an unbounded loop if the server misbehaves
 _MAX_NAMED = 3
 _MAX_MESSAGE = 500
+# Persona ids, source ids and raw file paths all reach a rendered line. They come off the
+# filesystem, so each is flattened before it is spliced into a message a session reads.
+_MAX_ID_LEN = 60
+_MAX_FILE_LEN = 100
 
 
 @dataclass(frozen=True)
@@ -203,27 +208,44 @@ def _row_id(row: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _persona(pid: str) -> str:
+    """A persona id, flattened for display."""
+    return sanitize_inline(pid, _MAX_ID_LEN)
+
+
+def _counts(by_persona: dict[str, int]) -> str:
+    """``pid: n`` pairs with every id flattened to one printable line."""
+    return ", ".join(f"{_persona(pid)}: {n}" for pid, n in by_persona.items())
+
+
 def summary_line(report: Report) -> str:
-    """One short line for the session card; empty when nothing is missing."""
+    """One short line for the session card; empty when nothing is missing.
+
+    Every persona id in the line goes through :func:`graphrag.textutil.sanitize_inline`, since
+    this line is embedded in the session card that a model reads as context.
+    """
     if report.is_clean:
         return ""
     clauses: list[str] = []
     total = report.total_files
     if total > 0:
         plural = "file" if total == 1 else "files"
-        parts = ", ".join(f"{pid}: {n}" for pid, n in report.by_persona.items())
-        clauses.append(f"not yet ingested: {total} {plural} ({parts})")
+        clauses.append(f"not yet ingested: {total} {plural} ({_counts(report.by_persona)})")
     missing = report.total_unenriched
     if missing > 0:
         plural = "document" if missing == 1 else "documents"
-        parts = ", ".join(f"{pid}: {n}" for pid, n in report.unenriched_by_persona.items())
+        parts = _counts(report.unenriched_by_persona)
         clauses.append(f"without entity extraction: {missing} {plural} ({parts})")
     suffix = " (vs committed snapshot)" if report.source == "snapshot" else ""
     return "; ".join(clauses) + suffix
 
 
 def render_message(report: Report) -> str | None:
-    """The Stop-hook ``systemMessage`` (under 500 characters), or ``None`` when nothing missing."""
+    """The Stop-hook ``systemMessage`` (under 500 characters), or ``None`` when nothing missing.
+
+    File names, source ids and persona ids are all filesystem-derived, so each is flattened by
+    :func:`graphrag.textutil.sanitize_inline` before it reaches the message.
+    """
     if report.is_clean:
         return None
     enrich = _enrich_clause(report)
@@ -233,7 +255,7 @@ def render_message(report: Report) -> str | None:
     entries = _entries(report)
     plural = "file" if total == 1 else "files"
     against = " (vs committed snapshot)" if report.source == "snapshot" else ""
-    sync_cmd = f"`make sync PERSONA={_primary(report)}`"
+    sync_cmd = f"`make sync PERSONA={_persona(_primary(report))}`"
     message = ""
     for shown_n in (_MAX_NAMED, 2, 1, 0):
         shown = entries[:shown_n]
@@ -262,22 +284,24 @@ def _enrich_clause(report: Report) -> str:
     if missing <= 0:
         return ""
     by_persona = report.unenriched_by_persona
-    parts = ", ".join(f"{pid}: {n}" for pid, n in by_persona.items())
+    parts = _counts(by_persona)
     verb = "document has" if missing == 1 else "documents have"
     persona = min(by_persona, key=lambda pid: (-by_persona[pid], pid))
     return (
         f" {missing} ingested {verb} no entity extraction ({parts}); "
-        f"run the graph-rag-enrich skill for {persona}."
+        f"run the graph-rag-enrich skill for {_persona(persona)}."
     )
 
 
 def _entries(report: Report) -> list[str]:
+    """File and source names for the message, each flattened to one printable line."""
     names: list[str] = []
     for finding in report.findings:
         if finding.missing_files:
-            names.extend(finding.missing_files)
+            names.extend(sanitize_inline(f, _MAX_FILE_LEN) for f in finding.missing_files)
         else:
-            names.append(f"{finding.source_id}/ (0 of {finding.raw_count} ingested)")
+            source = sanitize_inline(finding.source_id, _MAX_ID_LEN)
+            names.append(f"{source}/ (0 of {finding.raw_count} ingested)")
     return names
 
 

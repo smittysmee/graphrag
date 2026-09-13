@@ -16,10 +16,16 @@ from typing import Any
 
 from graphrag.hooks import project
 from graphrag.hooks.mcp_client import McpClient, McpUnavailable, connect, default_url
+from graphrag.textutil import sanitize_inline
 
 __all__ = ["main", "render_card"]
 
 MAX_NEWEST_FILES = 5
+# Persona ids/names come from persona.yaml and paths from the filesystem. Both are attacker-
+# shaped in the sense that matters here: a crafted file name would otherwise inject lines
+# into a card that a session reads as context, so every one is flattened to a single line.
+MAX_NAME_LEN = 60
+MAX_PATH_LEN = 100
 # ``datetime.UTC`` (the alias ruff/UP017 wants) is 3.11+; the host may still run 3.10.
 _UTC = timezone.utc  # noqa: UP017
 
@@ -30,7 +36,13 @@ def render_card(
     now: datetime,
     uningested_line: str | None = None,
 ) -> str:
-    """Render the plain-text status card. Pure: no I/O beyond the given ``client``."""
+    """Render the plain-text status card. Pure: no I/O beyond the given ``client``.
+
+    Persona ids, persona names and raw file paths are passed through
+    :func:`graphrag.textutil.sanitize_inline` on the way in. The card is injected as session
+    context, so a name or file name containing newlines, control characters or zero-width
+    code points must not be able to forge a line of its own.
+    """
     personas = project.load_personas(root)
     manifests = project.load_manifests(root)
     live_stats = _live_per_persona(client)
@@ -65,7 +77,8 @@ def render_card(
 
 def _newest_entry(root: Path, path: Path, mtime: float) -> str:
     date = datetime.fromtimestamp(mtime, tz=_UTC).strftime("%Y-%m-%d")
-    return f"{project.rel_path(root, path)} ({date})"
+    rel = sanitize_inline(project.rel_path(root, path), MAX_PATH_LEN)
+    return f"{rel} ({date})"
 
 
 def _live_per_persona(client: McpClient | None) -> dict[str, dict[str, int]] | None:
@@ -92,7 +105,7 @@ def _persona_line(
     live_stats: dict[str, dict[str, int]] | None,
     now: datetime,
 ) -> str:
-    name = persona.name if persona is not None else pid
+    name = sanitize_inline(persona.name if persona is not None else pid, MAX_NAME_LEN)
     live = live_stats.get(pid) if live_stats is not None else None
     if live is not None:
         counts = f"{_count(live, 'documents')} documents, {_count(live, 'chunks')} chunks"
@@ -103,7 +116,7 @@ def _persona_line(
     else:
         counts = "unknown (no snapshot; server not reachable)"
     snapshot = f", snapshot {manifest.created_date}" if manifest and manifest.created_date else ""
-    return f"- {pid} ({name}): {counts}{snapshot}"
+    return f"- {sanitize_inline(pid, MAX_NAME_LEN)} ({name}): {counts}{snapshot}"
 
 
 def _count(counts: dict[str, int], key: str) -> int:
