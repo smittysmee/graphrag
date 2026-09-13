@@ -18,6 +18,7 @@ embed server), `graph/` (GraphStore Protocol: neo4j_store, memory_store, snapsho
 `extract/` (topic co-occurrence; optional Claude enrichment), `retrieve/` (hybrid RRF search,
 context packs), `personas/` (registry, brief, skill export), `pipeline.py`, `cli.py`,
 `mcp_server.py`, `app.py` (composition root).
+`hooks/` (host-side Claude Code hooks, stdlib only; shell wrappers in `.claude/hooks/`).
 
 ## Data facts worth knowing
 - `product-leader` is grounded in the ChatPRD Lenny's Podcast archive, pinned as a git submodule
