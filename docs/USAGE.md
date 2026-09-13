@@ -274,6 +274,109 @@ is what you fix before writing. Import is idempotent.
 source it had to re-ingest (re-ingesting deletes the passages the speakers hang off), and a
 document sitting in the graph with no speaker at all.
 
+### Fold alias spellings together
+
+Extraction keeps the spelling each passage uses, so one thing can arrive as several nodes: an
+abbreviation, a former name, a typo. Every count over it is then low by however many spellings
+nobody looked for.
+
+A persona answers that with `personas/<persona>/aliases.yaml`:
+
+```yaml
+aliases:
+  Canonical Name: [Alias One, alias two, "Alias, with comma"]
+```
+
+Matching ignores case and how the whitespace fell, on both sides. A name may appear under one
+canonical only; two canonicals claiming the same alias is a contradiction the loader refuses,
+rather than resolving by file order.
+
+```bash
+docker compose run --rm graphrag graphrag aliases apply <persona> --dry-run
+docker compose run --rm graphrag graphrag aliases apply <persona>
+```
+
+The dry run counts the mentions each canonical would gain, from the graph as it stands. The real
+run re-points that persona's mentions and relations onto the canonical node, records the
+spellings on it as `aliases`, and deletes the alias nodes nothing else holds. Another persona's
+mentions of the same spelling are left where they are.
+
+The table also runs at import: `enrich-import` and `annotations-import` map names through it
+before writing, after the passages have been matched, so a new file never creates the alias node
+in the first place. `make sync` applies the table once at the end of a run, when the graph is
+whole.
+
+### Add the stance and facet layer
+
+Extraction records that a passage mentions something. It does not record whether the passage is
+praising it, complaining about it, or saying it was replaced -- so "most discussed" is the only
+question the entity layer can answer. It also does not record which function of a subject a
+passage is about.
+
+Annotations fill both in. An agent reads one document and writes one file per document under
+`data/annotations/<persona>/`:
+
+```json
+{
+  "doc_id": "<persona>:<source>:<slug>",
+  "annotations": [
+    {
+      "anchor": "verbatim six to twenty words of the passage",
+      "entity": "Entity name as written in that passage",
+      "stance": "praise | complaint | substitution | neutral",
+      "facets": ["handover", "access"],
+      "note": "optional short paraphrase, never quoted back as evidence"
+    }
+  ]
+}
+```
+
+`anchor` is required and `entity` is optional, but a `stance` needs an entity: a stance about
+nothing is not a reading. Then:
+
+```bash
+docker compose run --rm graphrag graphrag annotations-import <persona> /app/data/annotations/<persona>/*.json --dry-run
+docker compose run --rm graphrag graphrag annotations-import <persona> /app/data/annotations/<persona>/*.json
+```
+
+Anchors are placed exactly as attribution places them. The stance goes on the `MENTIONS` edge and
+the facets go on the passage, both of which ride the snapshot.
+
+The entity is checked against the graph rather than trusted. If the passage already mentions it,
+the stance goes on that edge. If it does not, the annotation is not thrown away on the spot:
+extraction and annotation read a document separately, so a passage can name a thing the
+extraction pass did not list there, or listed under another spelling. When the persona already
+has an entity of that name and one of its spellings occurs in the passage, the mention is created
+and the stance goes on it. When the persona has no such entity, or none of its spellings is in
+the passage, the annotation is reported as loose and skipped.
+
+Loose annotations are counted by reason, because the three send you to a different file:
+
+| reason | what to do about it |
+| --- | --- |
+| anchor not found | the anchor is a paraphrase; fix the quote in the annotation file |
+| entity unknown to the persona | add the spelling to `aliases.yaml`, or extend the extraction |
+| entity not in the passage | the annotation is pointing at the wrong passage |
+
+The summary line ends with those totals, so a dry run over a whole corpus tells you which of the
+three to fix first:
+
+```
+validated 170 files: 483 annotations, 470 stances, 612 facets, 12 mentions created, 235 loose (18 anchor not found, 190 entity unknown to the persona, 27 entity not in the passage)
+```
+
+When the persona keeps a `facets.yaml`, facets outside it are reported and dropped:
+
+```yaml
+facets:
+  handover: Moving work or knowledge from one person to another.
+  access: Getting the accounts and permissions a job needs.
+```
+
+Without that file, any facet is accepted. Import is idempotent, and `make sync` re-imports these
+files on the same two triggers as the other layers: a source it had to re-ingest, and a document
+sitting in the graph with no stance and no facet.
+
 ### Analyse the networks
 
 Three networks sit inside the graph and nobody has to build them: who appears alongside whom

@@ -28,6 +28,14 @@ class NetworkRule:
     answers: str
 
 
+@dataclass(frozen=True)
+class ReadingRule:
+    """One rule about how to read a filtered network, and why it is easy to get wrong."""
+
+    name: str
+    rule: str
+
+
 METHOD_RULES: tuple[MethodRule, ...] = (
     MethodRule(
         name="Louvain",
@@ -124,6 +132,131 @@ NETWORK_RULES: tuple[NetworkRule, ...] = (
         edges="the stored co-occurrence weight",
         answers="how the corpus was labelled, as a first map before any extraction exists",
     ),
+    NetworkRule(
+        name="speakers-entities",
+        nodes="both the speakers and the entities their passages mention, as two modes",
+        edges=(
+            "a passage by that speaker naming that entity, weighted by how many documents hold one"
+        ),
+        answers=(
+            "who wrote about what; projected onto one side, who wrote about the same things, or "
+            "which things the same people wrote about"
+        ),
+    ),
+)
+
+SIGNED_RULES: tuple[ReadingRule, ...] = (
+    ReadingRule(
+        name="The edge means something else now",
+        rule=(
+            "a stance filter changes the question from 'discussed together' to 'praised "
+            "together' or 'complained about together'. Say which one in the same sentence that "
+            "reports the finding: a reader who sees a co-mention network assumes the "
+            "unfiltered one."
+        ),
+    ),
+    ReadingRule(
+        name="The stances are not complements",
+        rule=(
+            "the praise network and the complaint network do not add up to the unfiltered "
+            "network. A mention nobody annotated is in neither, so what is missing from one is "
+            "not therefore in the other, and 'not complained about' is never evidence of "
+            "approval."
+        ),
+    ),
+    ReadingRule(
+        name="Compare structure only after comparing n",
+        rule=(
+            "a denser complaint network usually means more complaints were annotated, not that "
+            "complaints cluster harder. Report the node and edge counts of each signed network "
+            "before saying anything about the shape of either."
+        ),
+    ),
+    ReadingRule(
+        name="A stance is a reading of one passage",
+        rule=(
+            "it came from an agent reading text, and it describes that passage, not the entity. "
+            "Quote the passage next to the count; a count nobody can trace back to text that "
+            "reads that way is an error in the annotation, not a finding."
+        ),
+    ),
+)
+
+WINDOW_RULES: tuple[ReadingRule, ...] = (
+    ReadingRule(
+        name="Report n for each window",
+        rule=(
+            "a partition over 40 nodes and a partition over 400 are not two measurements of one "
+            "thing. Print both counts beside any before-and-after claim."
+        ),
+    ),
+    ReadingRule(
+        name="Undated is outside",
+        rule=(
+            "a window is answered from dated passages, so every document the attribution pass "
+            "could not date drops out of every network as soon as a window is set. Check each "
+            "window against the unwindowed network before reading a disappearance as a change "
+            "in the world."
+        ),
+    ),
+    ReadingRule(
+        name="Small windows overfit",
+        rule=(
+            "cut a corpus finely enough and every window has tidy communities, because a "
+            "handful of documents partitions cleanly. Run the null model inside each window "
+            "rather than only on the whole corpus."
+        ),
+    ),
+    ReadingRule(
+        name="Community numbers do not survive a rebuild",
+        rule=(
+            "Louvain numbers its communities per run, so 'community 2 grew' is meaningless "
+            "across two windows. Compare the partitions with the adjusted Rand index over the "
+            "nodes both windows contain, and describe groups by their members."
+        ),
+    ),
+    ReadingRule(
+        name="A rank change can be a roster change",
+        rule=(
+            "a node climbing twenty places may have stood still while the nodes above it left "
+            "the window. Read the entering and leaving lists before reading the rank table."
+        ),
+    ),
+)
+
+BIPARTITE_RULES: tuple[ReadingRule, ...] = (
+    ReadingRule(
+        name="Project the side you are asking about",
+        rule=(
+            "onto speakers answers who wrote about the same things; onto entities answers which "
+            "things the same people wrote about. They are different questions and the same "
+            "two-mode network answers only one of them at a time."
+        ),
+    ),
+    ReadingRule(
+        name="Projected weights inflate",
+        rule=(
+            "one document naming twenty entities contributes 190 entity pairs on its own, so a "
+            "projection's weights are combinatorial rather than additive. Raise --min-weight "
+            "before ranking anything, and never compare a projected weight with a two-mode one."
+        ),
+    ),
+    ReadingRule(
+        name="The projection throws the other mode away",
+        rule=(
+            "a heavy speaker-speaker edge does not say which entities it ran through. Export "
+            "the two-mode network beside the projected one, or read the partners recorded on "
+            "each node, before naming what a group has in common."
+        ),
+    ),
+    ReadingRule(
+        name="Sharing a node is not agreement",
+        rule=(
+            "two speakers joined by an entity both named it, which includes one recommending it "
+            "and the other warning against it. Add --stance if the question is whether they "
+            "agreed."
+        ),
+    ),
 )
 
 ALWAYS: tuple[str, ...] = (
@@ -154,6 +287,14 @@ _RATIONALE: dict[str, str] = {
 }
 
 
+#: The filtered-network sections, in the order ``render_guide`` prints them.
+READING_RULES: tuple[tuple[str, tuple[ReadingRule, ...]], ...] = (
+    ("Signed networks (--stance)", SIGNED_RULES),
+    ("Time windows (--since / --until)", WINDOW_RULES),
+    ("Bipartite projections (--network speakers-entities)", BIPARTITE_RULES),
+)
+
+
 def rationale(method: str) -> str:
     """The one-line reason a method was used, for the report's rationale row."""
     return _RATIONALE.get(method, f"{method}: no selection rule recorded.")
@@ -179,6 +320,9 @@ def render_guide() -> str:
         ]
     lines += ["### Which centrality", ""]
     lines += [f"- **{name}** — {meaning}" for name, meaning in CENTRALITY_RULES]
+    for heading, rules in READING_RULES:
+        lines += ["", f"### {heading}", ""]
+        lines += [f"- **{rule.name}** — {rule.rule}" for rule in rules]
     lines += ["", "### Always", ""]
     lines += [f"- {item}" for item in ALWAYS]
     return "\n".join(lines)

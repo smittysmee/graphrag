@@ -16,8 +16,8 @@ attaches the speaker to it::
                 "date": "YYYY-MM-DD" | null,
                 "score": <int> | null}]}
 
-``role``, ``date`` and ``score`` are validated and kept in the file as provenance. Only who spoke
-in which passage reaches the graph, because that is all :meth:`GraphStore.attach_speaker` writes.
+``role``, ``date`` and ``score`` are validated and passed through to the ``SPOKE`` edge, so a
+speaker network can be cut to a time window without going back to the files.
 
 Anchors are matched case-insensitively with whitespace folded, against the document's passages in
 order, and the first passage containing one wins. A post whose anchor matches nothing is reported
@@ -45,6 +45,8 @@ __all__ = [
     "AttributedPost",
     "AttributionResult",
     "DocumentAttribution",
+    "find_anchor",
+    "fold_passage",
     "import_attribution_file",
 ]
 
@@ -96,7 +98,7 @@ class AttributionResult:
         return not self.error
 
 
-def _fold(text: str) -> str:
+def fold_passage(text: str) -> str:
     """Normalise for anchor matching: no invisible characters, single spaces, lower case.
 
     The same flattening :func:`graphrag.textutil.sanitize_inline` performs, at a limit no real
@@ -106,9 +108,12 @@ def _fold(text: str) -> str:
     return sanitize_inline(text, max(len(text), 1)).lower()
 
 
-def _find_anchor(anchor: str, folded: list[tuple[str, str]]) -> str | None:
-    """The id of the first passage containing ``anchor``, or ``None`` when no passage does."""
-    needle = _fold(anchor)
+def find_anchor(anchor: str, folded: list[tuple[str, str]]) -> str | None:
+    """The id of the first passage containing ``anchor``, or ``None`` when no passage does.
+
+    Shared with the annotation layer, which places its passages exactly the same way.
+    """
+    needle = fold_passage(anchor)
     if not needle:
         return None
     return next((chunk_id for chunk_id, text in folded if needle in text), None)
@@ -133,12 +138,12 @@ def import_attribution_file(
         return AttributionResult(
             path=path, doc_id=payload.doc_id, error=f"unknown document {payload.doc_id}"
         )
-    folded = [(c.id, _fold(c.text)) for c in chunks]
+    folded = [(c.id, fold_passage(c.text)) for c in chunks]
     speakers: list[str] = []
     loose: list[str] = []
     attached = 0
     for post in payload.posts:
-        chunk_id = _find_anchor(post.anchor, folded)
+        chunk_id = find_anchor(post.anchor, folded)
         if chunk_id is None:
             loose.append(
                 f"{sanitize_inline(post.speaker, _LABEL)}: {sanitize_inline(post.anchor, _LABEL)}"
@@ -148,7 +153,14 @@ def import_attribution_file(
         if post.speaker not in speakers:
             speakers.append(post.speaker)
         if not dry_run:
-            store.attach_speaker(payload.doc_id, chunk_id, post.speaker)
+            store.attach_speaker(
+                payload.doc_id,
+                chunk_id,
+                post.speaker,
+                posted_at=post.date.isoformat() if post.date else None,
+                role=post.role,
+                score=post.score,
+            )
     return AttributionResult(
         path=path,
         doc_id=payload.doc_id,

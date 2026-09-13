@@ -6,16 +6,20 @@ from typing import Any, Protocol
 from graphrag.embed.base import Matrix, Vector
 from graphrag.models import (
     Chunk,
+    ChunkFacets,
     Document,
     Enrichment,
     Entity,
     EntityChunk,
+    EntityMention,
     GraphStats,
+    MentionStance,
     PersonaSpec,
     RelatedTopic,
     ScoredChunk,
     SpeakerCount,
     SpeakerDocument,
+    Stance,
     TopicCount,
     TopicEdge,
 )
@@ -34,6 +38,10 @@ class GraphStore(Protocol):
     def upsert_chunks(self, chunks: Sequence[Chunk], embeddings: Matrix) -> None: ...
     def upsert_topic_cooccurrence(self, pairs: Sequence[tuple[str, str, int]]) -> None: ...
     def upsert_enrichment(self, enrichment: Enrichment) -> None: ...
+    # Fold the alias spellings of one entity into a single canonical node: re-point this
+    # persona's MENTIONS and RELATED_TO edges, merge the mentions, record `aliases` on the
+    # canonical node and delete the alias nodes nothing else holds. Returns mentions moved.
+    def merge_entities(self, persona_id: str, canonical: str, aliases: Sequence[str]) -> int: ...
     def delete_persona(self, persona_id: str) -> None: ...
     def delete_documents(self, doc_ids: Sequence[str]) -> None: ...
 
@@ -68,6 +76,9 @@ class GraphStore(Protocol):
     ) -> list[SpeakerCount]: ...
     def list_personas(self) -> list[PersonaSpec]: ...
     def entities_for_chunks(self, chunk_ids: Sequence[str]) -> list[Entity]: ...
+    # every entity this persona mentions anywhere, so a name can be resolved to a node without
+    # knowing which passage it was extracted from
+    def persona_entities(self, persona_id: str) -> list[Entity]: ...
     def enriched_doc_ids(self, persona_id: str) -> set[str]: ...
     # documents of one source that already carry at least one entity mention
     def enriched_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
@@ -84,16 +95,45 @@ class GraphStore(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     # attribution: speakers for documents whose loader parsed no speaker turns
-    # Idempotent: re-attaching the same speaker to the same passage changes nothing.
-    def attach_speaker(self, doc_id: str, chunk_id: str, speaker: str) -> None: ...
+    # Idempotent: re-attaching the same speaker to the same passage changes nothing. When given,
+    # `posted_at` (ISO YYYY-MM-DD), `role` and `score` land on the SPOKE edge.
+    def attach_speaker(
+        self,
+        doc_id: str,
+        chunk_id: str,
+        speaker: str,
+        *,
+        posted_at: str | None = None,
+        role: str | None = None,
+        score: int | None = None,
+    ) -> None: ...
     # documents of one source that already carry at least one speaker
     def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
+
+    # annotation: what a passage says about an entity, and which functions it is about
+    # Both are idempotent, and both ignore a chunk that is not a passage of `doc_id`.
+    def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None: ...
+    def annotate_chunk(self, doc_id: str, chunk_id: str, facets: Sequence[str]) -> None: ...
+    # documents of one source that already carry at least one stance or facet
+    def annotated_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
+    # the annotated edges a signed entity network and a facet filter are built from
+    def mention_stances(
+        self, persona_id: str, source_id: str | None = None
+    ) -> list[MentionStance]: ...
+    def chunk_facets(self, persona_id: str, source_id: str | None = None) -> list[ChunkFacets]: ...
 
     # network analysis (graphrag.sna)
     # Bipartite edges the speaker and entity networks are projected from, plus the persisted
     # topic co-occurrence edges. Read-only, paged, and scoped to one persona.
+    # `since`/`until` are inclusive ISO dates read from the SPOKE edge; when either is given,
+    # an edge with no date is left out, because an undated post cannot be put in a window.
     def speaker_document_pairs(
-        self, persona_id: str, source_id: str | None = None
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        *,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[SpeakerDocument]: ...
     def entity_chunk_pairs(
         self,
@@ -107,3 +147,13 @@ class GraphStore(Protocol):
     def mean_embeddings(
         self, persona_id: str, level: str = "document"
     ) -> tuple[list[str], Matrix]: ...
+    # The same bipartite edges as `entity_chunk_pairs`, carrying the annotation layer's stance
+    # and the passage's speakers. Read by the signed entity network (`--stance`) and by the
+    # speakers-entities bipartite network, which cannot be assembled from the two reads
+    # separately because both need the mention and the speaker on the *same* passage.
+    def entity_mention_rows(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityMention]: ...

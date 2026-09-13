@@ -38,15 +38,23 @@ class FakeClient:
     ``doc_ids_by_prefix`` is what the graph holds; ``enriched`` is the subset that has entity
     mentions (the query containing ``MENTIONS`` returns only those). By default every document
     counts as enriched so the ingest-focused tests stay about ingest.
+
+    ``spoken`` and ``annotated`` are the subsets the capture check asks about: documents with a
+    ``SPOKE`` edge, and documents carrying a stance or a facet. Left out, every document counts
+    as both, so the enrichment-focused tests stay about enrichment.
     """
 
     def __init__(
         self,
         doc_ids_by_prefix: dict[str, list[str]] | None = None,
         enriched: set[str] | None = None,
+        spoken: set[str] | None = None,
+        annotated: set[str] | None = None,
     ) -> None:
         self._doc_ids_by_prefix = doc_ids_by_prefix or {}
         self._enriched = enriched
+        self._spoken = spoken
+        self._annotated = annotated
         self.calls: list[dict[str, Any]] = []
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -54,9 +62,20 @@ class FakeClient:
         self.calls.append(arguments)
         params = arguments["params"]
         prefix, skip = params["prefix"], params["skip"]
+        query = arguments["query"]
         ids = sorted(self._doc_ids_by_prefix.get(prefix, []))
-        if "MENTIONS" in arguments["query"] and self._enriched is not None:
-            ids = [i for i in ids if i in self._enriched]
+        # Order matters: the annotation query mentions MENTIONS too, so the narrower markers
+        # are tested first.
+        if "SPOKE" in query:
+            kept = self._spoken
+        elif "m.stance" in query:
+            kept = self._annotated
+        elif "MENTIONS" in query:
+            kept = self._enriched
+        else:
+            kept = None
+        if kept is not None:
+            ids = [i for i in ids if i in kept]
         return [{"d.id": doc_id} for doc_id in ids[skip : skip + 500]]
 
 
@@ -586,3 +605,144 @@ def test_enrich_clause_flattens_hostile_persona_ids() -> None:
     assert message is not None
     assert "\n" not in message
     assert "run the graph-rag-enrich skill for demo persona." in message
+
+
+# ------------------------------------------------------------------ speakers and annotations
+
+
+def _write_sidecar(root: Path, layer: str, doc_ids: list[str]) -> None:
+    """One attribution or annotation file per id, nested under the persona."""
+    for i, doc_id in enumerate(doc_ids):
+        directory = root / "data" / layer / doc_id.split(":")[0]
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"s{i}.json").write_text(
+            json.dumps({"doc_id": doc_id, "posts": []}), encoding="utf-8"
+        )
+
+
+def _write_facets(root: Path, persona_id: str) -> None:
+    path = root / "personas" / persona_id / "facets.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("facets:\n  handover: Moving work from one person to another.\n", "utf-8")
+
+
+def _layer_client(spoken: set[str], annotated: set[str]) -> FakeClient:
+    return FakeClient(
+        {"demo-persona:notes:": ["demo-persona:notes:one", "demo-persona:notes:two"]},
+        spoken=spoken,
+        annotated=annotated,
+    )
+
+
+def test_a_persona_that_keeps_no_layers_is_never_asked_about_them(root: Path) -> None:
+    """No sidecar directory and no facets.yaml means the corpus does not use these layers."""
+    client = _layer_client(spoken=set(), annotated=set())
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert report.unlayered == ()
+    assert not any("SPOKE" in call["query"] for call in client.calls)
+    assert not uningested.uses_layers(root, "demo-persona")
+
+
+def test_a_document_with_no_sidecar_at_all_is_never_counted(root: Path) -> None:
+    """Most of a corpus never carries these layers, so counting it would nag about nothing."""
+    _write_facets(root, "demo-persona")
+    client = _layer_client(spoken=set(), annotated=set())
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert uningested.uses_layers(root, "demo-persona")  # the gate is open
+    assert report.unlayered == ()  # and there is still nothing to say
+    assert not any("SPOKE" in call["query"] for call in client.calls)
+
+
+def test_sidecar_json_that_never_reached_the_graph_is_reported(root: Path) -> None:
+    _write_sidecar(root, "attribution", ["demo-persona:notes:one", "demo-persona:notes:two"])
+    client = _layer_client(spoken=set(), annotated=set())
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert report.unlayered[0].doc_ids == (
+        "demo-persona:notes:one",
+        "demo-persona:notes:two",
+    )
+    assert report.total_unlayered == 2
+    assert report.unlayered_by_persona == {"demo-persona": 2}
+    assert any("SPOKE" in call["query"] for call in client.calls)
+
+
+def test_an_annotation_file_counts_the_same_as_an_attribution_file(root: Path) -> None:
+    _write_sidecar(root, "annotations", ["demo-persona:notes:one"])
+    client = _layer_client(spoken=set(), annotated=set())
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert report.unlayered[0].doc_ids == ("demo-persona:notes:one",)
+
+
+def test_a_sidecar_that_did_reach_the_graph_is_not_reported(root: Path) -> None:
+    """Either layer landing is enough: the import ran, which is what the check is about."""
+    _write_sidecar(root, "attribution", ["demo-persona:notes:one"])
+    _write_sidecar(root, "annotations", ["demo-persona:notes:two"])
+    client = _layer_client(spoken={"demo-persona:notes:one"}, annotated={"demo-persona:notes:two"})
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert report.unlayered == ()
+
+
+def test_only_the_unimported_half_of_a_source_is_reported(root: Path) -> None:
+    _write_sidecar(root, "attribution", ["demo-persona:notes:one", "demo-persona:notes:two"])
+    client = _layer_client(spoken={"demo-persona:notes:one"}, annotated=set())
+
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    assert report.unlayered[0].doc_ids == ("demo-persona:notes:two",)
+
+
+def test_the_message_names_make_sync_and_stays_in_budget(root: Path) -> None:
+    _write_sidecar(root, "attribution", ["demo-persona:notes:one", "demo-persona:notes:two"])
+    client = _layer_client(spoken=set(), annotated=set())
+
+    message = uningested.render_message(
+        uningested.find_uningested(root, client)  # type: ignore[arg-type]
+    )
+
+    assert message is not None
+    assert message.endswith(
+        "2 documents have attribution or annotation JSON that is not in the graph "
+        "(demo-persona: 2); run `make sync PERSONA=demo-persona`."
+    )
+    assert "graph-rag-capture" not in message
+    assert len(message) <= 500
+
+
+def test_the_summary_line_names_the_unimported_sidecars(root: Path) -> None:
+    _write_sidecar(root, "annotations", ["demo-persona:notes:one"])
+    client = _layer_client(spoken=set(), annotated=set())
+
+    line = uningested.summary_line(
+        uningested.find_uningested(root, client)  # type: ignore[arg-type]
+    )
+
+    assert "sidecar JSON not yet imported: 1 document (demo-persona: 1)" in line
+
+
+def test_the_layer_check_is_skipped_when_the_server_is_down(root: Path) -> None:
+    """The snapshot carries no speaker or stance, so there is nothing to compare against."""
+    _write_sidecar(root, "attribution", ["demo-persona:notes:one"])
+    _write_snapshot(root, "demo-persona", ["demo-persona:notes:one"])
+
+    report = uningested.find_uningested(root, None)
+
+    assert report.unlayered == ()
+
+
+def test_layer_clause_flattens_hostile_persona_ids() -> None:
+    gap = uningested.Unlayered("demo\npersona\u202e", "notes", ("a", "b"))
+    message = uningested.render_message(uningested.Report(source="graph", unlayered=(gap,)))
+
+    assert message is not None
+    assert "\n" not in message and "\u202e" not in message
+    assert "run `make sync PERSONA=demo persona`." in message

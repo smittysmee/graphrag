@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from graphrag.sna.analysis import METHODS
-from graphrag.sna.guide import ALWAYS, METHOD_RULES, NETWORK_RULES, rationale, render_guide
+from graphrag.sna.guide import (
+    ALWAYS,
+    METHOD_RULES,
+    NETWORK_RULES,
+    READING_RULES,
+    rationale,
+    render_guide,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 QUOTING_FILES = (
@@ -26,6 +33,17 @@ def test_the_guide_covers_every_method_network_and_caveat() -> None:
         assert rule.answers in text
     for item in ALWAYS:
         assert item in text
+
+
+def test_the_guide_covers_every_filtered_network_rule() -> None:
+    """The filters change what an edge means, so their rules live beside the method rules."""
+    text = render_guide()
+    for heading, rules in READING_RULES:
+        assert f"### {heading}" in text
+        for rule in rules:
+            assert rule.name in text
+            assert rule.rule in text
+    assert len(READING_RULES) == 3  # signed networks, time windows, bipartite projections
 
 
 def test_every_method_has_a_rationale_line_for_the_report() -> None:

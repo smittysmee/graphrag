@@ -37,6 +37,7 @@ __all__ = [
     "raw_files",
     "raw_root",
     "rel_path",
+    "sidecar_doc_ids",
     "snapshot_doc_ids",
     "source_base",
 ]
@@ -302,6 +303,8 @@ def snapshot_doc_ids(root: Path, persona: PersonaInfo | str) -> set[str]:
 
 
 ENRICHMENT_DIR = "data/enrichment"
+ATTRIBUTION_DIR = "data/attribution"
+ANNOTATIONS_DIR = "data/annotations"
 
 
 def enriched_doc_ids(root: Path) -> set[str]:
@@ -311,7 +314,17 @@ def enriched_doc_ids(root: Path) -> set[str]:
     document, flat or nested per persona/source; the id inside the file is what counts, not
     its path. Unreadable files are skipped, so this never raises.
     """
-    base = root / ENRICHMENT_DIR
+    return sidecar_doc_ids(root / ENRICHMENT_DIR)
+
+
+def sidecar_doc_ids(base: Path) -> set[str]:
+    """``doc_id`` of every JSON file under ``base``, whatever the layout beneath it.
+
+    Every sidecar layer -- extraction, attribution, annotation -- writes one
+    ``{"doc_id": ..., ...}`` file per document, flat or nested per persona and source, so the
+    id inside the file is what ties it to a document rather than the directory it sits in.
+    A directory that is not there is not a finding: it means the corpus keeps no such layer.
+    """
     out: set[str] = set()
     if not base.is_dir():
         return out

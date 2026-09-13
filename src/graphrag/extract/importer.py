@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from graphrag.extract.aliases import EMPTY_ALIASES, AliasTable, apply_aliases, fold_name
 from graphrag.extract.llm import DocumentExtraction, match_chunks, result_to_enrichment
 from graphrag.graph.store import GraphStore
 
@@ -28,7 +29,8 @@ class ImportResult:
 
     ``loose`` names were matched by token rather than verbatim, ``unmatched`` ones occur in no
     passage at all (their mention falls back to the first chunk), and ``dangling`` relations
-    point at an entity the file never declared.
+    point at an entity the file never declared. ``renamed`` names were folded onto a canonical
+    spelling by the persona's alias table.
     """
 
     path: Path
@@ -40,18 +42,30 @@ class ImportResult:
     loose: tuple[str, ...] = ()
     unmatched: tuple[str, ...] = ()
     dangling: tuple[str, ...] = ()
+    renamed: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
         return not self.error
 
 
-def import_extraction_file(store: GraphStore, path: Path, *, dry_run: bool = False) -> ImportResult:
+def import_extraction_file(
+    store: GraphStore,
+    path: Path,
+    *,
+    dry_run: bool = False,
+    aliases: AliasTable = EMPTY_ALIASES,
+) -> ImportResult:
     """Validate one extraction file and upsert it into the graph.
 
     Bad input never raises: an unreadable file, invalid JSON or a ``doc_id`` the graph does not
     know comes back as a result whose ``error`` is set, so a caller importing hundreds of files
     can report them all instead of stopping at the first.
+
+    ``aliases`` is applied after the passages have been matched, so an entity is still found by
+    the spelling its passage uses and only the node it lands on is canonical. A file imported
+    with a table therefore never creates the alias node that ``graphrag aliases apply`` exists
+    to clean up.
     """
     try:
         payload = DocumentExtraction.model_validate_json(path.read_text(encoding="utf-8"))
@@ -64,7 +78,7 @@ def import_extraction_file(store: GraphStore, path: Path, *, dry_run: bool = Fal
         )
     tiers = {e.name: match_chunks(e.name.strip(), chunks)[1] for e in payload.entities}
     names = {e.name.strip().lower() for e in payload.entities}
-    enrichment = result_to_enrichment(payload, chunks)
+    enrichment = apply_aliases(result_to_enrichment(payload, chunks), aliases)
     if not dry_run:
         store.upsert_enrichment(enrichment)
     return ImportResult(
@@ -79,6 +93,11 @@ def import_extraction_file(store: GraphStore, path: Path, *, dry_run: bool = Fal
             f"{r.source} -> {r.target}"
             for r in payload.relations
             if r.source.strip().lower() not in names or r.target.strip().lower() not in names
+        ),
+        renamed=tuple(
+            f"{e.name} -> {aliases.canonical(e.name)}"
+            for e in payload.entities
+            if fold_name(aliases.canonical(e.name)) != fold_name(e.name)
         ),
     )
 

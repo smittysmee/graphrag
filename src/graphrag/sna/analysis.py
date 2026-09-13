@@ -8,6 +8,7 @@ model. Those are the things a reader needs in order to disagree with the conclus
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -275,6 +276,74 @@ def _members(analysis: Analysis, group: Sequence[str]) -> str:
     return ", ".join(names) + (f", +{more} more" if more > 0 else "")
 
 
+#: The graph metadata keys that narrowed the network, in the order the report lists them.
+FILTER_KEYS: tuple[tuple[str, str], ...] = (
+    ("source_id", "source"),
+    ("types", "types"),
+    ("stances", "stances"),
+    ("facets", "facets"),
+    ("since", "since"),
+    ("until", "until"),
+    ("project", "projected onto"),
+)
+
+
+def _filter_line(meta: dict[str, Any]) -> str:
+    """Every filter that shaped this network, so a reader can rebuild the exact command."""
+    parts = [f"min_weight={meta.get('min_weight', 1)}"]
+    parts += [f"{label}={meta[key]}" for key, label in FILTER_KEYS if meta.get(key)]
+    return ", ".join(parts)
+
+
+def _cross_mode(analysis: Analysis) -> list[str]:
+    """For the two-mode network: what each group on one side wrote about on the other.
+
+    A projection throws the other mode away, so this does not read it off the graph. Every node
+    of a two-mode network keeps its heaviest opposite-mode partners as ``partners`` and
+    ``partner_weights``, written when the network was built; a group's entities are its own
+    entity members plus the partners of its speakers, and the reverse for its speakers. The
+    counts are documents, the same unit on both sides.
+    """
+    if analysis.graph.graph.get("network") != "speakers-entities" or not analysis.groups:
+        return []
+    lines = [
+        "## Across the two modes",
+        "",
+        f"Each {analysis.group_noun} with the speakers in it and the entities their passages "
+        "named, counted in documents. Read it as who wrote about what, not as who holds an "
+        "opinion: an entity is here because a passage named it.",
+        "",
+    ]
+    rows: list[list[str]] = []
+    for index, group in enumerate(analysis.groups, start=1):
+        speakers: Counter[str] = Counter()
+        entities: Counter[str] = Counter()
+        for node in group:
+            data = analysis.graph.nodes[node]
+            mine, theirs = (
+                (entities, speakers) if data.get("mode") == "entity" else (speakers, entities)
+            )
+            mine[analysis.label(node)] += int(data.get("documents", 0))
+            for name, weight in _partners(data):
+                theirs[name] += weight
+        rows.append([str(index), str(len(group)), _top(speakers), _top(entities)])
+    lines += _table(["#", "size", "speakers", "entities"], rows)
+    return lines
+
+
+def _partners(data: dict[str, Any]) -> list[tuple[str, int]]:
+    """The opposite-mode partners a two-mode node recorded, as (name, documents)."""
+    names = [n for n in str(data.get("partners", "")).split("; ") if n]
+    weights = [w for w in str(data.get("partner_weights", "")).split("; ") if w]
+    return [(n, int(w)) for n, w in zip(names, weights, strict=False)]
+
+
+def _top(counts: Counter[str]) -> str:
+    """The heaviest few names with their counts, or a dash when there are none."""
+    top = counts.most_common(TOP_MEMBERS)
+    return ", ".join(f"{name} ({count})" for name, count in top) if top else "-"
+
+
 def render_markdown(analysis: Analysis) -> str:
     """The analysis as a markdown note, ready to drop into a corpus as a research note."""
     meta = analysis.graph.graph
@@ -294,12 +363,7 @@ def render_markdown(analysis: Analysis) -> str:
             "",
         ]
     frame = str(meta.get("frame", ""))
-    filters = [f"min_weight={meta.get('min_weight', 1)}"]
-    if meta.get("source_id"):
-        filters.append(f"source={meta['source_id']}")
-    if meta.get("types"):
-        filters.append(f"types={meta['types']}")
-    lines += [f"**Sampling frame.** {frame} Filters: {', '.join(filters)}.", ""]
+    lines += [f"**Sampling frame.** {frame} Filters: {_filter_line(meta)}.", ""]
 
     lines += ["## Network summary", ""]
     lines += _table(
@@ -323,6 +387,7 @@ def render_markdown(analysis: Analysis) -> str:
             ],
         )
 
+    lines += _cross_mode(analysis)
     lines += _render_checks(analysis)
 
     lines += ["## Centrality", ""]
@@ -459,8 +524,7 @@ def to_payload(analysis: Analysis) -> dict[str, Any]:
         "frame": analysis.graph.graph.get("frame", ""),
         "filters": {
             "min_weight": analysis.graph.graph.get("min_weight"),
-            "source_id": analysis.graph.graph.get("source_id") or None,
-            "types": analysis.graph.graph.get("types") or None,
+            **{key: analysis.graph.graph.get(key) or None for key, _ in FILTER_KEYS},
         },
         "summary": analysis.summary,
         "centrality": {

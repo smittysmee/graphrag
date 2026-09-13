@@ -18,6 +18,19 @@ only if the graph holds at least one entity mention for it; extraction JSON that
 never imported does not count. When the server is down the check falls back to the JSON files
 under ``data/enrichment``. Writing the JSON is agent work (the ``graph-rag-enrich`` skill);
 importing it is ``make sync``.
+
+A fourth check covers the speaker and annotation layers, and covers exactly one state: a document
+whose attribution or annotation JSON is on disk and whose graph holds neither a ``SPOKE`` edge nor
+a stance or facet. That is an import somebody has not run, and ``make sync`` fixes it.
+
+Documents with no such sidecar at all are deliberately *not* counted. Most of a real corpus never
+carries either layer -- a regulation, a filing, a company page has no posts to attribute and
+nothing to take a stance on -- so counting them would put a number in every turn that nobody can
+act on. New documents are covered at write time by the ``PostToolUse`` capture-contract hook, and
+``graphrag layers check <persona> --all`` audits the backlog when someone actually wants it.
+
+The check runs only for a persona that keeps these layers at all (:func:`uses_layers`), so a
+corpus that uses neither stays as quiet as it was before.
 """
 
 from __future__ import annotations
@@ -36,10 +49,12 @@ __all__ = [
     "Finding",
     "Report",
     "Unenriched",
+    "Unlayered",
     "find_uningested",
     "main",
     "render_message",
     "summary_line",
+    "uses_layers",
 ]
 
 _PAGE_SIZE = 500
@@ -50,6 +65,9 @@ _MAX_MESSAGE = 500
 # filesystem, so each is flattened before it is spliced into a message a session reads.
 _MAX_ID_LEN = 60
 _MAX_FILE_LEN = 100
+#: A persona that declares an annotation vocabulary is using the layers, even before its first
+#: sidecar file exists (mirrors ``graphrag.extract.annotations.FACET_FILE``).
+_FACET_FILE = "facets.yaml"
 
 
 @dataclass(frozen=True)
@@ -84,12 +102,27 @@ class Unenriched:
 
 
 @dataclass(frozen=True)
+class Unlayered:
+    """Documents whose attribution or annotation JSON is on disk but not yet in the graph.
+
+    Only that state: a file somebody wrote and nobody imported, which ``make sync`` fixes. A
+    document that carries no such sidecar is not in here, because most of a corpus never needs
+    one and a count of those is a number nobody can act on.
+    """
+
+    persona_id: str
+    source_id: str
+    doc_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Report:
     """What :func:`find_uningested` found, plus enough to build the sync command."""
 
     source: str  # "graph" (the live server answered) or "snapshot" (it was down)
     findings: tuple[Finding, ...] = ()
     unenriched: tuple[Unenriched, ...] = ()
+    unlayered: tuple[Unlayered, ...] = ()
 
     @property
     def total_files(self) -> int:
@@ -123,9 +156,22 @@ class Report:
         return sum(u.json_on_disk for u in self.unenriched)
 
     @property
+    def total_unlayered(self) -> int:
+        """Total documents with neither speakers nor annotations in the graph."""
+        return sum(len(u.doc_ids) for u in self.unlayered)
+
+    @property
+    def unlayered_by_persona(self) -> dict[str, int]:
+        """Un-layered document counts per persona, in the order personas were first found."""
+        counts: dict[str, int] = {}
+        for item in self.unlayered:
+            counts[item.persona_id] = counts.get(item.persona_id, 0) + len(item.doc_ids)
+        return counts
+
+    @property
     def is_clean(self) -> bool:
         """True when there is nothing to report at all."""
-        return self.total_files == 0 and self.total_unenriched == 0
+        return self.total_files == 0 and self.total_unenriched == 0 and self.total_unlayered == 0
 
 
 def find_uningested(root: Path, client: McpClient | None) -> Report:
@@ -140,11 +186,14 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
     source_kind = "graph" if client is not None else "snapshot"
     snapshot_cache: dict[str, set[str]] = {}
     disk_enriched = project.enriched_doc_ids(root)
+    disk_layered = _sidecar_ids(root)
     findings: list[Finding] = []
     unenriched: list[Unenriched] = []
+    unlayered: list[Unlayered] = []
 
     for pid in sorted(personas):
         persona = personas[pid]
+        layered_persona = client is not None and uses_layers(root, pid)
         for source in persona.sources:
             files = project.raw_files(root, persona, source)
             if not files:
@@ -163,6 +212,18 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
                 on_disk = sum(1 for doc_id in gap if doc_id in disk_enriched)
                 unenriched.append(Unenriched(pid, source.id, gap, json_on_disk=on_disk))
 
+            # Only ever asked about documents whose sidecar is already written: the question is
+            # whether the import ran, so a source with nothing waiting costs no query at all.
+            waiting = {d for d in existing if d in disk_layered}
+            if layered_persona and client is not None and waiting:
+                try:
+                    covered = _layered_ids(client, persona, source)
+                except McpUnavailable:
+                    covered = waiting  # a transient error must not invent a finding
+                bare = tuple(sorted(waiting - covered))
+                if bare:
+                    unlayered.append(Unlayered(pid, source.id, bare))
+
             if source.loader == "transcripts":
                 if not existing:
                     findings.append(Finding(pid, source.id, source.loader, raw_count=len(files)))
@@ -177,7 +238,47 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
             if missing:
                 findings.append(Finding(pid, source.id, source.loader, missing_files=missing))
 
-    return Report(source=source_kind, findings=tuple(findings), unenriched=tuple(unenriched))
+    return Report(
+        source=source_kind,
+        findings=tuple(findings),
+        unenriched=tuple(unenriched),
+        unlayered=tuple(unlayered),
+    )
+
+
+def uses_layers(root: Path, persona_id: str) -> bool:
+    """Whether this persona keeps the speaker and annotation layers at all.
+
+    Judged by what the persona has, never by a list here: a sidecar directory of its own under
+    ``data/attribution`` or ``data/annotations``, or a ``facets.yaml`` declaring the vocabulary
+    its annotations use. A persona that keeps none of those has decided the layers do not apply
+    to its corpus, and a report that nagged it about them every turn would be noise.
+
+    The gate states that intent and short-circuits before anything is read. What a source is
+    actually asked about is narrower still: only the documents whose sidecar is already on disk.
+    """
+    return (
+        (root / project.ATTRIBUTION_DIR / persona_id).is_dir()
+        or (root / project.ANNOTATIONS_DIR / persona_id).is_dir()
+        or (root / project.PERSONAS_DIR / persona_id / _FACET_FILE).is_file()
+    )
+
+
+def _sidecar_ids(root: Path) -> set[str]:
+    """Documents that have an attribution or annotation file on disk, whatever the layout."""
+    return project.sidecar_doc_ids(root / project.ATTRIBUTION_DIR) | project.sidecar_doc_ids(
+        root / project.ANNOTATIONS_DIR
+    )
+
+
+def _layered_ids(
+    client: McpClient, persona: project.PersonaInfo, source: project.SourceInfo
+) -> set[str]:
+    """Documents of this source that the graph holds a speaker or an annotation for."""
+    prefix = f"{persona.id}:{source.id}:"
+    return _graph_doc_ids(client, prefix, _SPOKEN_IDS_QUERY) | _graph_doc_ids(
+        client, prefix, _ANNOTATED_IDS_QUERY
+    )
 
 
 def _existing_ids(
@@ -205,7 +306,7 @@ def _enriched_ids(
     """Documents with entity mentions in the graph; JSON on disk only when the server is down."""
     prefix = f"{persona.id}:{source.id}:"
     if client is not None:
-        return _graph_doc_ids(client, prefix, enriched_only=True)
+        return _graph_doc_ids(client, prefix, _ENRICHED_IDS_QUERY)
     return {doc_id for doc_id in disk_enriched if doc_id.startswith(prefix)}
 
 
@@ -218,17 +319,32 @@ _ENRICHED_IDS_QUERY = (
     "AND EXISTS { (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity) } "
     "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
 )
+#: A document has speakers when somebody is recorded as having written one of its passages.
+#: ``SPOKE`` rather than the document-level ``FEATURES`` credit, because a passage-level edge is
+#: what the attribution layer writes and what a re-ingest would drop.
+_SPOKEN_IDS_QUERY = (
+    "MATCH (d:Document) WHERE d.id STARTS WITH $prefix "
+    "AND EXISTS { (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(:Speaker) } "
+    "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
+)
+#: A document is annotated when a passage carries facets or a mention carries a stance.
+_ANNOTATED_IDS_QUERY = (
+    "MATCH (d:Document) WHERE d.id STARTS WITH $prefix AND ("
+    "EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WHERE size(coalesce(c.facets, [])) > 0 } "
+    "OR EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[m:MENTIONS]->(:Entity) "
+    "WHERE m.stance IS NOT NULL }) "
+    "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
+)
 
 
-def _graph_doc_ids(client: McpClient, prefix: str, *, enriched_only: bool = False) -> set[str]:
-    """Every ``Document.id`` under ``prefix``, paged 500 rows at a time.
+def _graph_doc_ids(client: McpClient, prefix: str, query: str = _DOC_IDS_QUERY) -> set[str]:
+    """Every ``Document.id`` ``query`` returns under ``prefix``, paged 500 rows at a time.
 
-    With ``enriched_only`` the query keeps only documents that have at least one entity
-    mention, which is what "enriched" means once the server can be asked.
+    ``query`` selects which question is being asked: every document of the source, or only the
+    ones that carry entity mentions, speakers, or annotations.
     """
     ids: set[str] = set()
     skip = 0
-    query = _ENRICHED_IDS_QUERY if enriched_only else _DOC_IDS_QUERY
     for _ in range(_MAX_PAGES):
         params = {"prefix": prefix, "skip": skip}
         rows = client.call_tool("cypher", {"query": query, "params": params})
@@ -279,6 +395,11 @@ def summary_line(report: Report) -> str:
         plural = "document" if missing == 1 else "documents"
         parts = _counts(report.unenriched_by_persona)
         clauses.append(f"without entity extraction: {missing} {plural} ({parts})")
+    bare = report.total_unlayered
+    if bare > 0:
+        plural = "document" if bare == 1 else "documents"
+        parts = _counts(report.unlayered_by_persona)
+        clauses.append(f"sidecar JSON not yet imported: {bare} {plural} ({parts})")
     suffix = " (vs committed snapshot)" if report.source == "snapshot" else ""
     return "; ".join(clauses) + suffix
 
@@ -291,7 +412,7 @@ def render_message(report: Report) -> str | None:
     """
     if report.is_clean:
         return None
-    enrich = _enrich_clause(report)
+    enrich = _enrich_clause(report) + _layer_clause(report)
     total = report.total_files
     if total <= 0:
         return _fit(f"graphrag:{enrich}")
@@ -341,6 +462,25 @@ def _enrich_clause(report: Report) -> str:
     else:
         action = f"run the graph-rag-enrich skill for {persona}."
     return f" {missing} ingested {verb} no entity extraction ({parts}); {action}"
+
+
+def _layer_clause(report: Report) -> str:
+    """`` N documents have attribution or annotation JSON that is not in the graph (...); ...``.
+
+    One state and one fix, because that is all this check reports: the file is written and the
+    import has not run. Only ever non-empty for a persona that keeps those layers (see
+    :func:`uses_layers`), so a corpus that uses neither reads exactly as it did before.
+    """
+    bare = report.total_unlayered
+    if bare <= 0:
+        return ""
+    by_persona = report.unlayered_by_persona
+    persona = _persona(min(by_persona, key=lambda pid: (-by_persona[pid], pid)))
+    verb = "document has" if bare == 1 else "documents have"
+    return (
+        f" {bare} {verb} attribution or annotation JSON that is not in the graph "
+        f"({_counts(by_persona)}); run `make sync PERSONA={persona}`."
+    )
 
 
 def _entries(report: Report) -> list[str]:

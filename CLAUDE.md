@@ -21,6 +21,9 @@ context packs), `personas/` (registry, brief, skill export), `sna/` (network exp
 centrality, Louvain/K-means/GMM with stability and null-model checks), `pipeline.py`, `cli.py`,
 `mcp_server.py`, `app.py` (composition root).
 `hooks/` (host-side Claude Code hooks, stdlib only; shell wrappers in `.claude/hooks/`).
+`extract/layers.py` + `graphrag layers check <persona> [--all|--doc-id|--file]` reports which
+sidecars a captured document has on disk, which layers the graph holds, and what each importer
+would leave loose; the `PostToolUse` capture-contract hook names the same contract after a write.
 
 ## Data facts worth knowing
 - `product-leader` is grounded in the ChatPRD Lenny's Podcast archive, pinned as a git submodule

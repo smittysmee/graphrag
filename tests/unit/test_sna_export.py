@@ -17,6 +17,7 @@ from graphrag.sna.export import (
     ego,
     entity_co_mention,
     speaker_co_participation,
+    speaker_entity_bipartite,
     topic_co_occurrence,
     write_graph,
 )
@@ -177,3 +178,156 @@ def test_write_graph_supports_graphml_and_json(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unsupported export format"):
         write_graph(graph, tmp_path / "g.dot")
+
+
+# ------------------------------------------------------------- the annotation and date layers
+
+
+def test_a_date_window_keeps_only_speakers_with_a_dated_post_in_it(
+    layered: InMemoryGraphStore,
+) -> None:
+    """An undated post is outside every window rather than assumed to be inside one."""
+    everyone = speaker_co_participation(layered, "test-layers")
+    assert set(everyone.nodes) == {"ana", "bo", "cy", "dot"}
+
+    early = speaker_co_participation(layered, "test-layers", since="2025-01-01", until="2025-03-01")
+    assert set(early.nodes) == {"ana", "bo"}  # dot is undated, cy posted in June
+    late = speaker_co_participation(layered, "test-layers", since="2025-06-01")
+    assert set(late.nodes) == {"ana", "cy"}
+    assert (
+        speaker_co_participation(layered, "test-layers", since="2030-01-01").number_of_nodes() == 0
+    )
+    assert "2025-06-01" in late.graph["frame"]
+
+
+def test_a_window_reaches_the_entity_network_through_the_dated_passages(
+    layered: InMemoryGraphStore,
+) -> None:
+    """The entity network has no date of its own, so it inherits the documents' dates."""
+    whole = entity_co_mention(layered, "test-layers", min_weight=1)
+    assert set(whole.nodes) == {"product:alpha", "product:beta", "product:gamma"}
+
+    first_half = entity_co_mention(layered, "test-layers", min_weight=1, until="2025-03-01")
+    assert first_half["product:alpha"]["product:beta"]["weight"] == 1  # post 1
+    assert first_half["product:alpha"]["product:gamma"]["weight"] == 1  # post 2
+    assert not first_half.has_edge("product:beta", "product:gamma")
+
+    second_half = entity_co_mention(layered, "test-layers", min_weight=1, since="2025-06-01")
+    assert second_half["product:beta"]["product:gamma"]["weight"] == 1  # post 3
+    assert not second_half.has_edge("product:alpha", "product:beta")
+
+
+def test_a_stance_filter_produces_a_different_network_not_a_thinner_one(
+    layered: InMemoryGraphStore,
+) -> None:
+    """Praise joins Alpha to Beta; complaint joins Alpha to Gamma. The partition flips."""
+    praise = entity_co_mention(layered, "test-layers", min_weight=1, stances=["praise"])
+    assert set(praise.nodes) == {"product:alpha", "product:beta"}
+    assert praise["product:alpha"]["product:beta"]["weight"] == 1
+
+    complaint = entity_co_mention(layered, "test-layers", min_weight=1, stances=["complaint"])
+    assert set(complaint.nodes) == {"product:alpha", "product:gamma"}
+    assert complaint["product:alpha"]["product:gamma"]["weight"] == 2  # posts 2 and 4
+
+    # The two are not complements of the unfiltered network: nothing annotated `substitution`
+    # exists, so asking for it returns an empty network rather than "everything else".
+    assert (
+        entity_co_mention(layered, "test-layers", 1, stances=["substitution"]).number_of_nodes()
+        == 0
+    )
+    both = entity_co_mention(layered, "test-layers", min_weight=1, stances=["praise", "complaint"])
+    assert set(both.nodes) == {"product:alpha", "product:beta", "product:gamma"}
+    assert "praise or complaint" in both.graph["frame"]
+
+
+def test_a_facet_filter_keeps_only_the_passages_about_that_function(
+    layered: InMemoryGraphStore,
+) -> None:
+    quoting = entity_co_mention(layered, "test-layers", min_weight=1, facets=["quoting"])
+    assert quoting["product:alpha"]["product:beta"]["weight"] == 1  # post 1
+    assert quoting["product:beta"]["product:gamma"]["weight"] == 1  # post 3
+    assert not quoting.has_edge("product:alpha", "product:gamma")
+
+    outage = entity_co_mention(layered, "test-layers", min_weight=1, facets=["outage"])
+    assert set(outage.nodes) == {"product:alpha", "product:gamma"}
+    assert outage["product:alpha"]["product:gamma"]["weight"] == 2
+
+    speakers = speaker_co_participation(layered, "test-layers", facets=["outage"])
+    assert set(speakers.nodes) == {"bo", "cy"}  # ana wrote only quoting passages
+    assert "outage" in speakers.graph["frame"]
+
+
+def test_a_facet_recomputes_the_topic_network_over_the_surviving_documents(
+    layered: InMemoryGraphStore,
+) -> None:
+    """A stored aggregate cannot be filtered, so the filtered network is recomputed."""
+    quoting = topic_co_occurrence(layered, "test-layers", min_weight=1, facets=["quoting"])
+    assert set(quoting.edges) == {("pricing", "service")}
+    assert quoting["pricing"]["service"]["weight"] == 2  # posts 1 and 3
+    assert quoting.nodes["pricing"]["documents"] == 2
+
+    outage = topic_co_occurrence(layered, "test-layers", min_weight=1, facets=["outage"])
+    assert set(outage.edges) == {("outages", "service")}
+    assert "outage" in outage.graph["frame"]
+
+
+def test_the_bipartite_network_weighs_speaker_to_entity_edges_in_documents(
+    layered: InMemoryGraphStore,
+) -> None:
+    graph = speaker_entity_bipartite(layered, "test-layers")
+    assert graph.graph["network"] == "speakers-entities"
+    assert set(graph.nodes) == {"ana", "bo", "cy", "product:alpha", "product:beta", "product:gamma"}
+    assert graph.nodes["ana"]["mode"] == "speaker"
+    assert graph.nodes["product:alpha"]["mode"] == "entity"
+    assert graph.nodes["product:alpha"]["label"] == "Alpha"
+    # ana named Beta in two documents and Alpha in one, so the edges differ in weight.
+    assert graph["ana"]["product:beta"]["weight"] == 2
+    assert graph["ana"]["product:alpha"]["weight"] == 1
+    assert not graph.has_edge("ana", "dot")  # dot's post mentions nothing
+    assert graph.nodes["ana"]["partners"].startswith("Beta")
+
+
+def test_projecting_the_bipartite_network_counts_the_nodes_two_share(
+    layered: InMemoryGraphStore,
+) -> None:
+    """Projected weights are co-membership counts, and they inflate: read them as such."""
+    speakers = speaker_entity_bipartite(layered, "test-layers", project="speakers")
+    assert set(speakers.nodes) == {"ana", "bo", "cy"}
+    assert speakers["bo"]["cy"]["weight"] == 2  # both named Alpha and Gamma
+    assert speakers["ana"]["bo"]["weight"] == 2  # Alpha and Gamma again
+    assert speakers.nodes["ana"]["mode"] == "speaker"
+    assert "Beta" in speakers.nodes["ana"]["partners"]
+
+    entities = speaker_entity_bipartite(layered, "test-layers", project="entities")
+    assert entities["product:alpha"]["product:gamma"]["weight"] == 3  # ana, bo and cy
+    assert entities["product:alpha"]["product:beta"]["weight"] == 1  # only ana
+    assert entities.nodes["product:gamma"]["mode"] == "entity"
+    assert "ana" in entities.nodes["product:beta"]["partners"]
+
+    heavy = speaker_entity_bipartite(layered, "test-layers", min_weight=2, project="entities")
+    assert set(heavy.nodes) == {"product:alpha", "product:gamma"}
+
+
+def test_the_bipartite_network_takes_the_same_filters_as_the_others(
+    layered: InMemoryGraphStore,
+) -> None:
+    complaints = speaker_entity_bipartite(layered, "test-layers", stances=["complaint"])
+    assert set(complaints.nodes) == {"bo", "cy", "product:alpha", "product:gamma"}
+    early = speaker_entity_bipartite(layered, "test-layers", until="2025-03-01")
+    assert set(early.nodes) == {"ana", "bo", "product:alpha", "product:beta", "product:gamma"}
+    quoting = speaker_entity_bipartite(
+        layered, "test-layers", facets=["quoting"], project="speakers"
+    )
+    assert set(quoting.nodes) == {"ana"}
+
+
+def test_build_network_rejects_filters_the_chosen_network_cannot_answer(
+    layered: InMemoryGraphStore,
+) -> None:
+    with pytest.raises(ValueError, match="--stance reads the annotation"):
+        build_network(layered, "speakers", "test-layers", stances=["praise"])
+    with pytest.raises(ValueError, match="--stance reads the annotation"):
+        build_network(layered, "topics", "test-layers", stances=["praise"])
+    with pytest.raises(ValueError, match="--project applies to"):
+        build_network(layered, "entities", "test-layers", project="speakers")
+    assert build_network(layered, "speakers-entities", "test-layers").number_of_nodes() == 6

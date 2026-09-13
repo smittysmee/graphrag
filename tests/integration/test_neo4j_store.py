@@ -231,3 +231,144 @@ def test_network_reads_and_mean_embeddings_on_neo4j(
     assert clean_store.mean_embeddings("other-persona")[0] == []
     with pytest.raises(ValueError, match="level must be"):
         clean_store.mean_embeddings("it-pm", level="chunk")
+
+
+def test_dated_speaker_edges_annotations_and_aliases_on_neo4j(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+    tmp_path: Path,
+) -> None:
+    """The other half of the contract the in-memory store is held to in the unit tests.
+
+    Covers ``tests/unit/test_pipeline_and_store.py``'s dated-speaker and annotation assertions,
+    ``tests/unit/test_aliases.py``'s merge assertions, and the snapshot round trip for all three.
+    """
+    persona = PersonaSpec(id="it-layers", name="IT Layers", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
+    doc_id = next(iter(clean_store.document_ids("it-layers", "threads")))
+    chunks = clean_store.document_chunks(doc_id, 0, 100)
+
+    # --- dated speaker edges
+    clean_store.attach_speaker(
+        doc_id, chunks[0].id, "quill-maker", posted_at="2025-02-03", role="op", score=12
+    )
+    clean_store.attach_speaker(
+        doc_id, chunks[-1].id, "ledger-ann", posted_at="2025-02-06", role="reply"
+    )
+    # a second call for the same speaker and passage replaces the record rather than adding one
+    clean_store.attach_speaker(doc_id, chunks[0].id, "quill-maker", posted_at="2025-02-03")
+
+    posts = clean_store.document_chunks(doc_id, 0, 1)[0].speaker_posts
+    assert [(p.speaker, p.posted_at, p.role, p.score) for p in posts] == [
+        ("quill-maker", "2025-02-03", None, None)
+    ]
+    edges = clean_store.run_readonly_cypher(
+        "MATCH (:Speaker)-[r:SPOKE]->(c:Chunk {doc_id: $doc}) "
+        "RETURN r.posted_at AS posted_at, r.role AS role ORDER BY posted_at",
+        {"doc": doc_id},
+    )
+    assert [(e["posted_at"], e["role"]) for e in edges] == [
+        ("2025-02-03", None),
+        ("2025-02-06", "reply"),
+    ]
+    everyone = clean_store.speaker_document_pairs("it-layers")
+    assert [p.speaker for p in everyone] == ["ledger-ann", "quill-maker"]
+    early = clean_store.speaker_document_pairs("it-layers", until="2025-02-04")
+    assert [(p.speaker, p.chunks) for p in early] == [("quill-maker", 1)]
+    assert [
+        p.speaker for p in clean_store.speaker_document_pairs("it-layers", since="2025-02-04")
+    ] == ["ledger-ann"]
+    assert clean_store.speaker_document_pairs("it-layers", since="2030-01-01") == []
+
+    # --- annotations
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="concept:handbook", name="Handbook", type="concept"),
+                Entity(id="concept:hand-book", name="hand book", type="concept"),
+            ],
+            mentions=[
+                Mention(chunk_id=chunks[0].id, entity_id="concept:handbook"),
+                Mention(chunk_id=chunks[-1].id, entity_id="concept:hand-book"),
+            ],
+        )
+    )
+    assert clean_store.annotated_document_ids("it-layers", "threads") == set()
+    clean_store.annotate_mention(doc_id, chunks[0].id, "Handbook", "complaint")
+    clean_store.annotate_chunk(doc_id, chunks[0].id, ["handover", "access"])
+    clean_store.annotate_chunk(doc_id, chunks[0].id, ["handover"])  # idempotent
+    clean_store.annotate_mention(doc_id, chunks[0].id, "Nobody", "praise")  # no such mention
+
+    assert clean_store.annotated_document_ids("it-layers", "threads") == {doc_id}
+    assert clean_store.annotated_document_ids("it-layers", "absent") == set()
+    assert clean_store.annotated_document_ids("other-persona", "threads") == set()
+    stance = clean_store.mention_stances("it-layers")[0]
+    assert (stance.name, stance.stance, stance.doc_id) == ("Handbook", "complaint", doc_id)
+    assert stance.speakers == ["quill-maker"]
+    assert len(clean_store.mention_stances("it-layers")) == 1
+    assert clean_store.chunk_facets("it-layers")[0].facets == ["handover", "access"]
+    assert clean_store.chunk_facets("it-layers", "absent") == []
+    assert clean_store.mention_stances("other-persona") == []
+
+    rows = clean_store.entity_mention_rows("it-layers")
+    assert [(r.entity_id, r.chunk_id) for r in rows] == sorted(
+        (r.entity_id, r.chunk_id) for r in rows
+    )
+    annotated = [r for r in rows if r.stance is not None]
+    assert [(r.name, r.stance, r.speakers) for r in annotated] == [
+        ("Handbook", "complaint", ["quill-maker"])
+    ]
+    # The unannotated mention is still a row, carrying no stance rather than a neutral one.
+    assert [r.stance for r in rows if r.stance is None] == [None]
+    assert [r.type for r in rows] == ["concept", "concept"]
+    assert clean_store.entity_mention_rows("it-layers", types=["person"]) == []
+    assert clean_store.entity_mention_rows("it-layers", "absent") == []
+    assert clean_store.entity_mention_rows("other-persona") == []
+
+    # --- the entity index the annotation fallback resolves a name against
+    index = clean_store.persona_entities("it-layers")
+    assert [e.id for e in index] == ["concept:hand-book", "concept:handbook"]
+    assert clean_store.persona_entities("other-persona") == []
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=chunks[-1].id, entity_id="concept:handbook")],
+        )
+    )
+    assert "concept:handbook" in {e.id for e in clean_store.entities_for_chunks([chunks[-1].id])}
+
+    # --- aliases
+    moved = clean_store.merge_entities("it-layers", "Handbook", ["hand book", "HANDBOOK"])
+
+    assert moved == 1
+    canonical = clean_store.entities_for_chunks([chunks[-1].id])[0]
+    assert (canonical.id, canonical.name) == ("concept:handbook", "Handbook")
+    assert canonical.aliases == ["hand book"]
+    gone = clean_store.run_readonly_cypher(
+        "MATCH (e:Entity {id: 'concept:hand-book'}) RETURN count(e) AS n"
+    )
+    assert gone[0]["n"] == 0
+    assert clean_store.merge_entities("it-layers", "Handbook", ["hand book"]) == 0  # idempotent
+
+    # --- all three ride the snapshot
+    root = tmp_path / "snapshots"
+    snap.export_snapshot(
+        clean_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+    clean_store.delete_persona("it-layers")
+    snap.load_snapshot(
+        clean_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+
+    loaded = clean_store.document_chunks(doc_id, 0, 1)[0]
+    assert loaded.facets == ["handover", "access"]
+    assert [(p.speaker, p.posted_at) for p in loaded.speaker_posts] == [
+        ("quill-maker", "2025-02-03")
+    ]
+    assert [
+        p.speaker for p in clean_store.speaker_document_pairs("it-layers", since="2025-02-01")
+    ] == ["ledger-ann", "quill-maker"]
+    assert clean_store.mention_stances("it-layers")[0].stance == "complaint"
+    assert clean_store.entities_for_chunks([chunks[0].id])[0].aliases == ["hand book"]

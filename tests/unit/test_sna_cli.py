@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from graphrag.app import AppContext
 from graphrag.cli import app
+from graphrag.graph.memory_store import InMemoryGraphStore
 from graphrag.models import Enrichment, Entity, Mention
 from graphrag.pipeline import IngestReport
 
@@ -307,3 +308,229 @@ def test_an_empty_network_reports_itself_instead_of_crashing(
     )
     assert result.exit_code == 0, result.output
     assert "The network is empty" in report.read_text()
+
+
+# ------------------------------------------------------- the stance, facet and window options
+
+
+def test_sna_export_takes_a_window_a_stance_and_a_facet(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    target = tmp_path / "complaints.json"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--network",
+            "entities",
+            "--stance",
+            "complaint",
+            "--min-weight",
+            "1",
+            "-o",
+            str(target),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(target.read_text())
+    assert {n["id"] for n in payload["nodes"]} == {"product:alpha", "product:gamma"}
+    assert "praised together" not in payload["graph"]["frame"]
+    assert "complaint" in payload["graph"]["stances"]
+
+    windowed = tmp_path / "early.json"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--network",
+            "speakers",
+            "--since",
+            "2025-01-01",
+            "--until",
+            "2025-03-01",
+            "-o",
+            str(windowed),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert {n["id"] for n in json.loads(windowed.read_text())["nodes"]} == {"ana", "bo"}
+
+    faceted = tmp_path / "outage.json"
+    result = runner.invoke(
+        app,
+        ["sna", "export", "test-layers", "--facet", "outage", "-o", str(faceted)],
+    )
+    assert result.exit_code == 0, result.output
+    assert {n["id"] for n in json.loads(faceted.read_text())["nodes"]} == {"bo", "cy"}
+
+
+def test_sna_export_writes_the_bipartite_network_and_its_projections(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    both = tmp_path / "two-mode.graphml"
+    result = runner.invoke(
+        app,
+        ["sna", "export", "test-layers", "--network", "speakers-entities", "-o", str(both)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "6 nodes" in result.stdout
+    graph = nx.read_graphml(both)  # the partner strings have to survive GraphML
+    assert graph.nodes["ana"]["mode"] == "speaker"
+    assert "Beta" in graph.nodes["ana"]["partners"]
+
+    onto = tmp_path / "speakers.json"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--network",
+            "speakers-entities",
+            "--project",
+            "speakers",
+            "-o",
+            str(onto),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(onto.read_text())
+    assert {n["id"] for n in payload["nodes"]} == {"ana", "bo", "cy"}
+    assert payload["graph"]["project"] == "speakers"
+
+
+def test_sna_rejects_a_stance_a_projection_and_a_network_it_cannot_serve(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = str(tmp_path / "x.json")
+    bad_stance = runner.invoke(
+        app, ["sna", "export", "test-layers", "--stance", "grumpy", "-o", out]
+    )
+    assert bad_stance.exit_code == 2
+    assert "--stance must be one of" in bad_stance.output
+
+    wrong_network = runner.invoke(
+        app,
+        ["sna", "export", "test-layers", "--network", "speakers", "--stance", "praise", "-o", out],
+    )
+    assert wrong_network.exit_code == 2
+    assert "--stance reads the annotation" in wrong_network.output
+
+    bad_project = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--network",
+            "speakers-entities",
+            "--project",
+            "topics",
+            "-o",
+            out,
+        ],
+    )
+    assert bad_project.exit_code == 2
+    assert "--project must be one of" in bad_project.output
+
+
+def test_sna_analyze_reports_the_filters_and_the_two_modes(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "two-mode.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "analyze",
+            "test-layers",
+            "--network",
+            "speakers-entities",
+            "--facet",
+            "outage",
+            "--seed",
+            "1",
+            "--runs",
+            "2",
+            "--samples",
+            "3",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    text = out.read_text()
+    assert "facets=outage" in text
+    assert "## Across the two modes" in text
+    assert "| # | size | speakers | entities |" in text
+    assert "Alpha" in text and "bo" in text
+
+
+def test_sna_stances_writes_the_report_and_names_an_entity_it_could_not_find(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "stances.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "stances",
+            "test-layers",
+            "--entity",
+            "Alpha",
+            "--entity",
+            "Nope",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 annotated mentions over 1 entities" in result.stdout
+    assert "no annotated mentions for: Nope" in result.output
+    text = out.read_text()
+    assert "| entity | praise | complaint | total | documents |" in text
+    assert "| Alpha | 1 | 2 | 3 | 3 |" in text
+    assert "> Alpha went down on the busiest morning" in text
+
+
+def test_sna_compare_writes_a_two_window_report(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "compare.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "compare",
+            "test-layers",
+            "--network",
+            "speakers",
+            "--until",
+            "2025-03-01",
+            "--since2",
+            "2025-06-01",
+            "--seed",
+            "1",
+            "--runs",
+            "2",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "2 nodes in up to 2025-03-01" in result.stdout
+    assert "1 in both, 1 entered, 1 left" in result.stdout
+    text = out.read_text()
+    assert "## Who entered and who left" in text
+    assert "Largest rank changes (weighted_degree)" in text
+
+    bad = runner.invoke(
+        app,
+        ["sna", "compare", "test-layers", "--centrality", "charisma", "--out", str(out)],
+    )
+    assert bad.exit_code == 2
+    assert "centrality must be one of" in bad.output

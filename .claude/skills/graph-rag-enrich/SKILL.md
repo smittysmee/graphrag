@@ -76,8 +76,108 @@ name or drop the entity) and **dangling relations** (endpoint not in `entities`:
 the relation). Fix the JSON and re-run; import is idempotent (MERGE by entity id).
 Re-importing everything is safe and takes seconds.
 
-## 5. Commit
+## 5. The three passes that go on top of entities
+
+Extraction records *that* a passage names something. Three further passes record who wrote the
+passage, what it said, and which spelling of a name is which. Each is a file an agent writes and
+a command imports, each is idempotent, and each is optional: run the ones the questions need.
+
+### Aliases — one thing, one node
+
+Extraction deliberately keeps the surface form each passage uses, so one thing arrives as
+several nodes (an abbreviation, a former name, a typo) and every count over it is low. The
+persona's table folds them together, in `personas/<persona>/aliases.yaml`:
+
+```yaml
+aliases:
+  Canonical Name: [Alias One, alias two, "Alias, with comma"]
+```
+
+Matching is case-insensitive and whitespace-folded on both sides, and a name may appear under one
+canonical only; two canonicals claiming the same alias is an error, not a precedence question.
+
 ```bash
-git add data/enrichment data/snapshots/<persona>
+docker compose run --rm -T graphrag graphrag aliases apply <persona> --dry-run
+docker compose run --rm -T graphrag graphrag aliases apply <persona>
+```
+
+The dry run reports what each canonical would absorb. The table is also applied at import time,
+so new files never create the alias node in the first place. The spellings are kept on the
+canonical node's `aliases` property, which is where a reader finds out why a node is named what
+it is.
+
+### Attribution — who wrote which passage, and when
+
+A captured thread arrives as one document with no speakers, because the loader knows nothing
+about posts. One file per document under `data/attribution/<persona>/`:
+
+```json
+{"doc_id": "<persona>:<source>:<slug>",
+ "posts": [
+   {"speaker": "handle or name",
+    "anchor": "the verbatim opening words of the post, six to twenty words",
+    "role": "op",
+    "date": "2025-02-03",
+    "score": 12}
+ ]}
+```
+
+```bash
+docker compose run --rm -T graphrag graphrag attribution-import <persona> \
+  /app/data/attribution/<persona>/*.json --dry-run
+```
+
+The anchor is looked for in the document's passages, case and whitespace folded, and the speaker
+is attached to the first passage containing it. A post whose anchor matches nothing is reported
+as loose and skipped, never guessed at, so a paraphrased opening line costs that post rather
+than the file. `date` is what lets `graphrag sna` cut a network to a time window; an undated
+passage falls outside every window.
+
+### Annotations — what a passage says, and which function it is about
+
+Nothing so far records whether a mention is praise or a complaint, or which part of a subject a
+passage is discussing. One file per document under `data/annotations/<persona>/`:
+
+```json
+{"doc_id": "<persona>:<source>:<slug>",
+ "annotations": [
+   {"anchor": "verbatim six to twenty words of the passage",
+    "entity": "Entity name as written in that passage",
+    "stance": "praise | complaint | substitution | neutral",
+    "facets": ["quoting", "outage"],
+    "note": "optional short paraphrase, never quoted back as evidence"}
+ ]}
+```
+
+`anchor` is required. `entity` is optional, and `stance` needs one, because a stance about
+nothing is not a reading. `facets` are slugs for the functions of the subject the corpus talks
+about; when the persona declares them in `personas/<persona>/facets.yaml`, anything outside that
+list is reported and dropped per annotation:
+
+```yaml
+facets:
+  quoting: Getting a price or a comparison before an application.
+  enrollment: Completing and submitting an application.
+```
+
+```bash
+docker compose run --rm -T graphrag graphrag annotations-import <persona> \
+  /app/data/annotations/<persona>/*.json --dry-run
+```
+
+Two things are checked rather than trusted. The anchor must land in a passage, and the entity
+must already be mentioned in the passage it landed in: an annotation about an entity the
+extraction pass never put there has no edge to annotate and is reported as loose. Write one
+annotation per mention worth marking, and keep the anchor verbatim; a paraphrase costs that
+annotation.
+
+The stance goes on the mention and the facets go on the passage, so `graphrag sna` can then
+build a signed network (`--stance complaint`), narrow any network to one facet (`--facet`), and
+report what the corpus says about each entity (`graphrag sna stances`). See the `graph-rag-sna`
+skill.
+
+## 6. Commit
+```bash
+git add data/enrichment data/attribution data/annotations personas data/snapshots/<persona>
 git commit -m "Enrich <persona>: <n> documents"
 ```

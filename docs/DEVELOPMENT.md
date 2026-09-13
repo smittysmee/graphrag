@@ -37,7 +37,7 @@ Implement the Protocol (`graph/store.py`, `embed/base.py`), register it in `AppC
 integration tests run the same scenarios against Neo4j.
 
 ## Claude Code hooks
-`.claude/settings.json` wires three hooks that keep an agent session aware of the graph. Each is
+`.claude/settings.json` wires four hooks that keep an agent session aware of the graph. Each is
 a thin `.claude/hooks/*.sh` wrapper around a module in `src/graphrag/hooks/`.
 
 - **`SessionStart` → `session-card.sh`** prints a status card: every persona with its document
@@ -54,7 +54,27 @@ a thin `.claude/hooks/*.sh` wrapper around a module in `src/graphrag/hooks/`.
   written but never imported is still reported, with `make sync` as the fix; when the server is
   down the check falls back to the JSON files under `data/enrichment/`. Documents with no JSON at
   all need the `graph-rag-enrich` skill, which the message names instead. `make sync` imports
-  waiting JSON for documents without mentions even when a source is otherwise up to date.
+  waiting JSON for documents without mentions even when a source is otherwise up to date. The
+  same check covers the speaker and annotation layers, and covers exactly one state: a document
+  whose attribution or annotation JSON is on disk while the graph holds neither a `SPOKE` edge
+  nor a stance or facet for it, meaning an import nobody ran. `make sync` is the fix and the
+  only one it names. Documents carrying no such sidecar are deliberately not counted, because
+  most of a corpus never needs either layer and the number would be unactionable in every turn;
+  new documents are covered at write time by the capture-contract hook below, and
+  `graphrag layers check <persona> --all` audits the backlog on demand. The check runs only for
+  a persona that keeps those layers at all, meaning one with its own directory under
+  `data/attribution/` or `data/annotations/`, or a `personas/<id>/facets.yaml`; a corpus that
+  uses neither stays as quiet as it was before, and a source with no sidecar waiting costs no
+  query.
+- **`PostToolUse` (`Write|Edit|MultiEdit`) → `capture-contract.sh`** fires after a file is
+  written and, when the path is a corpus document under `data/raw/<persona>/<source>/`, injects
+  the capture contract for it: the document id the loaders will give it, the three sidecar paths
+  it should produce, and `graphrag layers check <persona> --file <path>` as the command that
+  verifies them. Which sidecars it names comes from the file and from the persona, never from a
+  list in the hook: attribution when the text carries two or more attributed post openings,
+  annotation when the text uses a name or facet word the persona's `aliases.yaml` or
+  `facets.yaml` declares. Paths outside `data/raw`, suffixes no loader reads and personas this
+  repository does not define produce no output at all.
 
 **The router has no keyword list.** Vocabulary is derived from the graph at runtime: the persona
 id and name (weight 3), its `tags` (2), and its top 60 topics from the MCP `topics` tool (1).

@@ -251,3 +251,156 @@ def test_mean_embeddings_are_one_unit_vector_per_document_or_entity(
     assert memory_store.mean_embeddings("other-persona")[0] == []
     with pytest.raises(ValueError, match="level must be"):
         memory_store.mean_embeddings("test-pm", level="chunk")
+
+
+def test_attach_speaker_dates_the_edge_so_a_network_can_be_cut_to_a_window(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag attribution-import` passes through, and what `graphrag sna` filters on.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.attach_speaker(
+        thread_document, chunks[0].id, "quill-maker", posted_at="2025-02-03", role="op", score=12
+    )
+    memory_store.attach_speaker(
+        thread_document, chunks[-1].id, "ledger-ann", posted_at="2025-02-06", role="reply"
+    )
+
+    post = memory_store.document_chunks(thread_document, 0, 1)[0].speaker_posts[0]
+    assert (post.speaker, post.posted_at, post.role, post.score) == (
+        "quill-maker",
+        "2025-02-03",
+        "op",
+        12,
+    )
+    everyone = memory_store.speaker_document_pairs("test-docs")
+    assert [p.speaker for p in everyone] == ["ledger-ann", "quill-maker"]
+
+    early = memory_store.speaker_document_pairs("test-docs", until="2025-02-04")
+    assert [(p.speaker, p.chunks) for p in early] == [("quill-maker", 1)]
+    late = memory_store.speaker_document_pairs("test-docs", since="2025-02-04")
+    assert [p.speaker for p in late] == ["ledger-ann"]
+    assert (
+        memory_store.speaker_document_pairs("test-docs", since="2025-02-01", until="2025-02-28")
+        == everyone
+    )
+    assert memory_store.speaker_document_pairs("test-docs", since="2030-01-01") == []
+
+
+def test_an_undated_speaker_drops_out_of_a_window_rather_than_being_assumed_in_range(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """Transcripts carry no post dates, so a window over them has to come back empty."""
+    assert memory_store.speaker_document_pairs("test-pm") != []
+    assert memory_store.speaker_document_pairs("test-pm", since="2000-01-01") == []
+
+
+def test_annotations_write_a_stance_on_a_mention_and_facets_on_a_passage(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """What `graphrag annotations-import` writes, and what `graphrag sync` reads back.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+    assert memory_store.annotated_document_ids("test-docs", "threads") == set()
+
+    memory_store.annotate_mention(thread_document, chunks[0].id, "Handbook", "complaint")
+    memory_store.annotate_chunk(thread_document, chunks[0].id, ["handover", "access"])
+    memory_store.annotate_chunk(thread_document, chunks[0].id, ["handover"])  # idempotent
+
+    assert memory_store.annotated_document_ids("test-docs", "threads") == {thread_document}
+    assert memory_store.annotated_document_ids("test-docs", "docs") == set()
+    assert memory_store.annotated_document_ids("other-persona", "threads") == set()
+    stance = memory_store.mention_stances("test-docs")[0]
+    assert (stance.name, stance.stance, stance.doc_id) == ("Handbook", "complaint", thread_document)
+    assert memory_store.chunk_facets("test-docs")[0].facets == ["handover", "access"]
+    assert memory_store.chunk_facets("test-docs", "docs") == []
+    assert memory_store.mention_stances("other-persona") == []
+
+    # an entity the passage does not mention, and a passage of another document, write nothing
+    memory_store.annotate_mention(thread_document, chunks[0].id, "Nobody", "praise")
+    memory_store.annotate_chunk("other-doc", chunks[0].id, ["ghost"])
+    assert len(memory_store.mention_stances("test-docs")) == 1
+    assert memory_store.chunk_facets("test-docs")[0].facets == ["handover", "access"]
+
+
+def test_persona_entities_answer_with_every_spelling_a_node_holds(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """What the annotation fallback resolves a name against.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    chunk_id = memory_store.document_chunks(thread_document, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(
+                    id="concept:handover",
+                    name="Handover",
+                    type="concept",
+                    aliases=["handbook"],
+                ),
+                Entity(id="concept:unmentioned", name="Unmentioned", type="concept"),
+            ],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="concept:handover")],
+        )
+    )
+
+    entities = memory_store.persona_entities("test-docs")
+
+    assert [e.id for e in entities] == ["concept:handover"]  # an entity nobody mentions is not the
+    assert entities[0].aliases == ["handbook"]  # persona's, whatever else holds it
+    assert memory_store.persona_entities("other-persona") == []
+
+
+def test_entity_mention_rows_carry_the_stance_and_the_passage_speakers(
+    layered: InMemoryGraphStore,
+) -> None:
+    """The store contract behind `--stance` and the speakers-entities network.
+
+    The two facts have to arrive together. A stance sits on the mention and a speaker sits on
+    the passage, so joining two separate reads afterwards would pair a speaker with a stance
+    that belongs to a different passage of the same document.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    rows = layered.entity_mention_rows("test-layers")
+    assert [(r.entity_id, r.chunk_id) for r in rows] == sorted(
+        (r.entity_id, r.chunk_id) for r in rows
+    )
+    keyed = {(r.entity_id, r.doc_id.rsplit(":", 1)[1]): r for r in rows}
+    praised = keyed[("product:alpha", "post-1")]
+    assert (praised.name, praised.type, praised.stance) == ("Alpha", "product", "praise")
+    assert praised.speakers == ["ana"]
+    assert keyed[("product:alpha", "post-2")].stance == "complaint"
+    assert keyed[("product:alpha", "post-2")].speakers == ["bo"]
+    assert keyed[("product:gamma", "post-3")].stance == "neutral"
+
+    # A mention the annotation pass never reached carries no stance, which is not "neutral".
+    layered.upsert_enrichment(
+        Enrichment(
+            mentions=[
+                Mention(chunk_id="test-layers:posts:post-2#0", entity_id="product:beta"),
+            ]
+        )
+    )
+    fresh = layered.entity_mention_rows("test-layers")
+    unannotated = [r for r in fresh if r.entity_id == "product:beta" and "post-2" in r.doc_id]
+    assert [r.stance for r in unannotated] == [None]
+
+    assert layered.entity_mention_rows("test-layers", types=["person"]) == []
+    assert [r.entity_id for r in layered.entity_mention_rows("test-layers", types=["product"])] == [
+        r.entity_id for r in fresh
+    ]
+    assert layered.entity_mention_rows("test-layers", "absent") == []
+    assert layered.entity_mention_rows("other-persona") == []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -329,6 +330,9 @@ def sync(
                 raw_root=ctx.settings.raw_dir / spec.id,
                 enrichment_root=ctx.settings.enrichment_dir,
                 attribution_root=ctx.settings.attribution_dir,
+                annotation_root=ctx.settings.annotations_dir,
+                aliases=_alias_table(ctx, spec.id),
+                facets=_facet_table(ctx, spec.id),
                 source_id=source,
                 dry_run=dry_run,
                 progress=_progress,
@@ -422,10 +426,11 @@ def enrich_import(
     ctx = State.context()
     try:
         spec = ctx.registry.get(persona)
+        table = _alias_table(ctx, spec.id)
         total_entities = total_mentions = total_relations = 0
         problems = 0
         for file in files:
-            result = import_extraction_file(ctx.store, file, dry_run=dry_run)
+            result = import_extraction_file(ctx.store, file, dry_run=dry_run, aliases=table)
             if not result.ok:
                 err.print(f"[red]{file}: {result.error}[/red]")
                 problems += 1
@@ -454,6 +459,8 @@ def enrich_import(
                 err.print(f"  unmatched: {name}")
             for rel in result.dangling:
                 err.print(f"  dangling: {rel}")
+            for renamed in result.renamed:
+                err.print(f"  alias: {renamed}")
         verb = "validated" if dry_run else "imported"
         console.print(
             f"[green]{verb}[/green] {len(files) - problems} files: {total_entities} entities, "
@@ -968,7 +975,10 @@ def attribution_import(
 
 
 sna_app = typer.Typer(
-    help="Build, measure and cluster the graph's networks (speakers, entities, topics).",
+    help=(
+        "Build, measure and cluster the graph's networks (speakers, entities, topics, "
+        "speakers-entities), filtered by stance, facet or date window."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(sna_app, name="sna")
@@ -995,11 +1005,55 @@ def _network_or_exit(network: str) -> str:
     return network
 
 
+def _stances_or_exit(values: list[str] | None) -> list[str] | None:
+    """``--stance`` may be repeated; every value must be one the annotation layer writes."""
+    from graphrag.sna.export import STANCES
+
+    if not values:
+        return None
+    cleaned = [v.strip().lower() for v in values if v.strip()]
+    unknown = [v for v in cleaned if v not in STANCES]
+    if unknown:
+        err.print(
+            f"[red]--stance must be one of {', '.join(STANCES)}; got {', '.join(unknown)}[/red]"
+        )
+        raise typer.Exit(2)
+    return cleaned or None
+
+
+def _project_or_exit(value: str | None) -> Any:
+    from graphrag.sna.export import PROJECTIONS
+
+    if value is None:
+        return None
+    if value not in PROJECTIONS:
+        err.print(f"[red]--project must be one of {', '.join(PROJECTIONS)}[/red]")
+        raise typer.Exit(2)
+    return value
+
+
+def _clean(values: list[str] | None) -> list[str] | None:
+    """A repeated string option with the blanks dropped, or ``None`` when nothing was given."""
+    cleaned = [v.strip() for v in (values or []) if v.strip()]
+    return cleaned or None
+
+
+def _network_or_bad_parameter(build: Callable[[], Any]) -> Any:
+    """Build a network, turning the builder's rejection of a filter combination into exit 2."""
+    try:
+        return build()
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+
+
 @sna_app.command("export")
 def sna_export(
     persona: Annotated[str, typer.Argument(help="Persona id.")],
     out: Annotated[Path, typer.Option("--out", "-o", help="Target .graphml or .json file.")],
-    network: Annotated[str, typer.Option(help="speakers | entities | topics")] = "speakers",
+    network: Annotated[
+        str, typer.Option(help="speakers | entities | topics | speakers-entities")
+    ] = "speakers",
     source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
     min_weight: Annotated[
         int | None, typer.Option("--min-weight", help="Drop edges below this weight.")
@@ -1007,21 +1061,44 @@ def sna_export(
     types: Annotated[
         str | None, typer.Option(help="Entity types to keep, comma separated.")
     ] = None,
+    stance: Annotated[
+        list[str] | None,
+        typer.Option("--stance", help="Keep only mentions with this stance; repeatable."),
+    ] = None,
+    facet: Annotated[
+        list[str] | None,
+        typer.Option("--facet", help="Keep only passages with this facet; repeatable."),
+    ] = None,
+    since: Annotated[str | None, typer.Option(help="Earliest post date, ISO YYYY-MM-DD.")] = None,
+    until: Annotated[str | None, typer.Option(help="Latest post date, ISO YYYY-MM-DD.")] = None,
+    project: Annotated[
+        str | None,
+        typer.Option(help="Collapse the two-mode network onto speakers | entities."),
+    ] = None,
 ) -> None:
     """Write one of the graph's networks to GraphML or node-link JSON."""
     from graphrag.sna.export import build_network, write_graph
 
     network = _network_or_exit(network)
+    stances = _stances_or_exit(stance)
+    side = _project_or_exit(project)
     ctx = State.context()
     try:
         ctx.registry.get(persona)  # fail fast on an unknown persona
-        graph = build_network(
-            ctx.store,
-            network,
-            persona,
-            source_id=source,
-            min_weight=min_weight,
-            types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+        graph = _network_or_bad_parameter(
+            lambda: build_network(
+                ctx.store,
+                network,
+                persona,
+                source_id=source,
+                min_weight=min_weight,
+                types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+                stances=stances,
+                facets=_clean(facet),
+                since=since,
+                until=until,
+                project=side,
+            )
         )
     finally:
         ctx.close()
@@ -1037,7 +1114,9 @@ def sna_export(
 def sna_analyze(
     persona: Annotated[str, typer.Argument(help="Persona id.")],
     out: Annotated[Path, typer.Option("--out", "-o", help="Markdown report to write.")],
-    network: Annotated[str, typer.Option(help="speakers | entities | topics")] = "speakers",
+    network: Annotated[
+        str, typer.Option(help="speakers | entities | topics | speakers-entities")
+    ] = "speakers",
     method: Annotated[str, typer.Option(help="louvain | kmeans | gmm")] = "louvain",
     k: Annotated[int | None, typer.Option("-k", help="Force k; otherwise it is chosen.")] = None,
     k_range: Annotated[str, typer.Option("--k-range", help="Candidates, e.g. 2-10.")] = "2-10",
@@ -1052,6 +1131,20 @@ def sna_analyze(
     source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
     min_weight: Annotated[int | None, typer.Option("--min-weight")] = None,
     types: Annotated[str | None, typer.Option(help="Entity types, comma separated.")] = None,
+    stance: Annotated[
+        list[str] | None,
+        typer.Option("--stance", help="Keep only mentions with this stance; repeatable."),
+    ] = None,
+    facet: Annotated[
+        list[str] | None,
+        typer.Option("--facet", help="Keep only passages with this facet; repeatable."),
+    ] = None,
+    since: Annotated[str | None, typer.Option(help="Earliest post date, ISO YYYY-MM-DD.")] = None,
+    until: Annotated[str | None, typer.Option(help="Latest post date, ISO YYYY-MM-DD.")] = None,
+    project: Annotated[
+        str | None,
+        typer.Option(help="Collapse the two-mode network onto speakers | entities."),
+    ] = None,
     seed: Annotated[int | None, typer.Option(help="Fix every random seed.")] = None,
     as_json: Annotated[Path | None, typer.Option("--json", help="Also write JSON here.")] = None,
 ) -> None:
@@ -1060,6 +1153,8 @@ def sna_analyze(
     from graphrag.sna.export import build_network
 
     network = _network_or_exit(network)
+    stances = _stances_or_exit(stance)
+    side = _project_or_exit(project)
     if method not in METHODS:
         err.print(f"[red]--method must be one of {', '.join(METHODS)}[/red]")
         raise typer.Exit(2)
@@ -1067,13 +1162,20 @@ def sna_analyze(
     ctx = State.context()
     try:
         ctx.registry.get(persona)
-        graph = build_network(
-            ctx.store,
-            network,
-            persona,
-            source_id=source,
-            min_weight=min_weight,
-            types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+        graph = _network_or_bad_parameter(
+            lambda: build_network(
+                ctx.store,
+                network,
+                persona,
+                source_id=source,
+                min_weight=min_weight,
+                types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+                stances=stances,
+                facets=_clean(facet),
+                since=since,
+                until=until,
+                project=side,
+            )
         )
         try:
             analysis = run_analysis(
@@ -1124,12 +1226,440 @@ def sna_analyze(
         console.print(f"[green]wrote[/green] {as_json}")
 
 
+@sna_app.command("stances")
+def sna_stances(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Markdown report to write.")],
+    entity: Annotated[
+        list[str] | None,
+        typer.Option("--entity", help="Limit to this entity by name; repeatable."),
+    ] = None,
+    source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
+    facet: Annotated[
+        list[str] | None,
+        typer.Option("--facet", help="Keep only passages with this facet; repeatable."),
+    ] = None,
+    quotes: Annotated[int, typer.Option(help="Verbatim passages to quote per stance.")] = 3,
+) -> None:
+    """Report what the corpus says about each entity, not merely how often it names it.
+
+    Reads the annotation layer: per entity, how many passages praise it, complain about it,
+    replace it or mention it neutrally, who wrote each kind, which facets those passages carry,
+    and up to `--quotes` verbatim passages per stance. Ends with a signed co-mention table, so
+    entities praised together are separated from entities complained about together.
+
+    Every count is a count of annotations. An entity with no complaints has no annotated
+    complaints, which is not the same as no complaints.
+    """
+    from graphrag.sna.stances import build_stance_report, render_stances
+
+    ctx = State.context()
+    try:
+        ctx.registry.get(persona)
+        report = build_stance_report(
+            ctx.store,
+            persona,
+            source_id=source,
+            entities=_clean(entity) or [],
+            facets=_clean(facet) or [],
+            quotes_per_stance=max(0, quotes),
+        )
+    finally:
+        ctx.close()
+
+    _warn_if_ephemeral(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_stances(report), encoding="utf-8")
+    console.print(
+        f"[green]wrote[/green] {out}: {report.annotations:,} annotated mentions over "
+        f"{len(report.entities):,} entities, {len(report.pairs):,} co-mentioned pairs"
+    )
+    for name in report.missing:
+        err.print(f"  no annotated mentions for: {name}", markup=False, highlight=False)
+
+
+@sna_app.command("compare")
+def sna_compare(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Markdown report to write.")],
+    network: Annotated[
+        str, typer.Option(help="speakers | entities | topics | speakers-entities")
+    ] = "speakers",
+    since: Annotated[str | None, typer.Option(help="First window starts, ISO.")] = None,
+    until: Annotated[str | None, typer.Option(help="First window ends, ISO.")] = None,
+    since2: Annotated[str | None, typer.Option("--since2", help="Second window starts.")] = None,
+    until2: Annotated[str | None, typer.Option("--until2", help="Second window ends.")] = None,
+    source: Annotated[str | None, typer.Option(help="Limit to one source id.")] = None,
+    min_weight: Annotated[int | None, typer.Option("--min-weight")] = None,
+    types: Annotated[str | None, typer.Option(help="Entity types, comma separated.")] = None,
+    stance: Annotated[
+        list[str] | None, typer.Option("--stance", help="Stance filter; repeatable.")
+    ] = None,
+    facet: Annotated[
+        list[str] | None, typer.Option("--facet", help="Facet filter; repeatable.")
+    ] = None,
+    project: Annotated[
+        str | None, typer.Option(help="Collapse the two-mode network onto speakers | entities.")
+    ] = None,
+    centrality: Annotated[
+        str, typer.Option(help="Which ranking the rank changes are read from.")
+    ] = "weighted_degree",
+    resolution: Annotated[float, typer.Option(help="Louvain resolution.")] = 1.0,
+    runs: Annotated[int, typer.Option(help="Louvain seeds to compare for stability.")] = 10,
+    seed: Annotated[int | None, typer.Option(help="Fix every random seed.")] = None,
+) -> None:
+    """Build one network over two time windows and report what changed between them.
+
+    Reports n for each window, which nodes entered and which left, how far the two partitions
+    agree over the nodes both windows hold (adjusted Rand index and normalised mutual
+    information), and the ten largest centrality rank changes among those nodes.
+
+    Community numbers are not comparable between two Louvain runs, so nothing here says
+    "community 2 grew"; a window is read from dated passages, so an undated document is in
+    neither window.
+    """
+    from graphrag.sna.compare import compare_windows, render_comparison
+
+    network = _network_or_exit(network)
+    stances = _stances_or_exit(stance)
+    side = _project_or_exit(project)
+    ctx = State.context()
+    try:
+        ctx.registry.get(persona)
+        comparison = _network_or_bad_parameter(
+            lambda: compare_windows(
+                ctx.store,
+                persona,
+                network,
+                since=since,
+                until=until,
+                since2=since2,
+                until2=until2,
+                source_id=source,
+                min_weight=min_weight,
+                types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
+                stances=stances,
+                facets=_clean(facet),
+                project=side,
+                centrality_kind=centrality,
+                resolution=resolution,
+                runs=runs,
+                seed=seed,
+            )
+        )
+    finally:
+        ctx.close()
+
+    _warn_if_ephemeral(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_comparison(comparison), encoding="utf-8")
+    console.print(
+        f"[green]wrote[/green] {out}: {int(comparison.a.summary['nodes']):,} nodes in "
+        f"{comparison.a.label}, {int(comparison.b.summary['nodes']):,} in {comparison.b.label}; "
+        f"{len(comparison.shared):,} in both, {len(comparison.entered):,} entered, "
+        f"{len(comparison.left):,} left"
+    )
+    if comparison.similarity:
+        console.print(
+            f"  partition similarity ARI {comparison.similarity['adjusted_rand_index']:.3f}, "
+            f"NMI {comparison.similarity['normalized_mutual_information']:.3f}"
+        )
+    for note in comparison.notes:
+        err.print(f"  note: {note}")
+
+
 @sna_app.command("guide")
 def sna_guide() -> None:
     """Print the method-selection rules: which network, which method, which centrality."""
     from graphrag.sna.guide import render_guide
 
     console.print(render_guide(), markup=False, highlight=False)
+
+
+# ----------------------------------------------------------------------------- aliases
+
+
+aliases_app = typer.Typer(
+    help="Fold the spellings a corpus uses into one canonical entity per thing.",
+    no_args_is_help=True,
+)
+app.add_typer(aliases_app, name="aliases")
+
+
+def _alias_table(ctx: AppContext, persona_id: str) -> Any:
+    """The persona's alias table, or an empty one. Absence is normal, not a warning."""
+    from graphrag.extract.aliases import load_persona_aliases
+
+    return load_persona_aliases(ctx.registry.directory, persona_id)
+
+
+def _facet_table(ctx: AppContext, persona_id: str) -> Any:
+    """The persona's facet vocabulary, or ``None`` when it declares none and anything goes."""
+    from graphrag.extract.annotations import load_persona_facets
+
+    return load_persona_facets(ctx.registry.directory, persona_id)
+
+
+@aliases_app.command("apply")
+def aliases_apply(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what would move; write nothing.")
+    ] = False,
+    export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
+) -> None:
+    """Fold alias spellings of an entity into one node, from `personas/<id>/aliases.yaml`.
+
+    Extraction keeps the spelling each passage uses, so one thing arrives as several nodes and
+    every count over it is low. This re-points that persona's mentions and relations onto the
+    canonical node, records the spellings on it and deletes the nodes nothing holds any more.
+    """
+    from graphrag.extract.aliases import (
+        ALIAS_FILE,
+        AliasError,
+        alias_lines,
+        apply_alias_table,
+        preview_alias_table,
+    )
+
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        try:
+            table = _alias_table(ctx, spec.id)
+        except AliasError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
+        if not table:
+            path = ctx.registry.directory / spec.id / ALIAS_FILE
+            err.print(f"[yellow]{spec.id} has no alias table at {path}[/yellow]")
+            return
+        report = (
+            preview_alias_table(ctx.store, spec.id, table)
+            if dry_run
+            else apply_alias_table(ctx.store, spec.id, table)
+        )
+        for line in alias_lines(report):
+            console.print(line, markup=False, highlight=False)
+        if export and not dry_run and report.mentions_moved:
+            snap.export_snapshot(
+                ctx.store,
+                spec,
+                ctx.snapshots_dir,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
+            )
+            console.print("snapshot re-exported")
+    finally:
+        ctx.close()
+
+
+# ----------------------------------------------------------------------------- annotations
+
+
+@app.command("annotations-import")
+def annotations_import(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    files: Annotated[list[Path], typer.Argument(help="JSON files: {doc_id, annotations}.")],
+    export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Validate and report only; write nothing.")
+    ] = False,
+) -> None:
+    """Record what a passage says about an entity, and which functions it is about.
+
+    Each annotation quotes a verbatim anchor, which is looked for in the document's passages the
+    way attribution looks for a post. The stance goes on the mention and the facets go on the
+    passage. When the passage does not mention the entity yet but the persona has it and one of
+    its spellings is in the passage, the mention is created; an entity the persona does not have
+    is left alone, because creating entities is the extraction pass's job.
+
+    Skipped annotations are counted by reason -- anchor not found, entity unknown to the persona,
+    entity not in the passage -- so a reviewer knows whether to fix the anchors, extend the alias
+    file or extend the extraction. Facets outside `personas/<id>/facets.yaml`, when the persona
+    keeps one, are reported and dropped.
+    """
+    from graphrag.extract.annotations import (
+        AnnotationResult,
+        EntityIndex,
+        FacetError,
+        import_annotation_file,
+        loose_summary,
+        loose_totals,
+    )
+
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        try:
+            table = _alias_table(ctx, spec.id)
+            vocabulary = _facet_table(ctx, spec.id)
+        except (FacetError, ValueError) as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
+        # Built once: the annotation pass never creates an entity, so this cannot go stale.
+        known = EntityIndex.build(ctx.store, spec.id)
+        results: list[AnnotationResult] = []
+        problems = 0
+        for file in files:
+            result = import_annotation_file(
+                ctx.store,
+                file,
+                dry_run=dry_run,
+                aliases=table,
+                facets=vocabulary,
+                entities=known,
+            )
+            if not result.ok:
+                err.print(f"[red]{file}: {result.error}[/red]")
+                problems += 1
+                continue
+            results.append(result)
+            console.print(
+                f"{result.doc_id}: {result.applied}/{result.annotations} annotations, "
+                f"{result.stances} stances, {result.facets} facets"
+                + (f", {result.created} mentions created" if result.created else "")
+                + (f"; [yellow]{len(result.loose)} loose[/yellow]" if result.loose else "")
+                + (
+                    f"; [yellow]{len(result.unknown_facets)} unknown facets[/yellow]"
+                    if result.unknown_facets
+                    else ""
+                )
+            )
+            for item in result.loose:
+                err.print(f"  loose: {item}", markup=False, highlight=False)
+            for facet in result.unknown_facets:
+                err.print(f"  unknown facet: {facet}", markup=False, highlight=False)
+        verb = "validated" if dry_run else "imported"
+        totals = loose_totals(results)
+        loose = sum(totals.values())
+        console.print(
+            f"[green]{verb}[/green] {len(files) - problems} files: "
+            f"{sum(r.applied for r in results)} annotations, "
+            f"{sum(r.stances for r in results)} stances, {sum(r.facets for r in results)} facets, "
+            f"{sum(r.created for r in results)} mentions created, {loose} loose"
+            + (f" ({loose_summary(totals)})" if loose else "")
+        )
+        if problems:
+            raise typer.Exit(2)
+        if export and not dry_run:
+            snap.export_snapshot(
+                ctx.store,
+                spec,
+                ctx.snapshots_dir,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
+            )
+            console.print("snapshot re-exported")
+    finally:
+        ctx.close()
+
+
+# ----------------------------------------------------------------------------- layers
+
+
+layers_app = typer.Typer(
+    help="Check that captured documents carry every layer: entities, speakers, annotations.",
+    no_args_is_help=True,
+)
+app.add_typer(layers_app, name="layers")
+
+
+@layers_app.command("check")
+def layers_check(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    doc_id: Annotated[
+        list[str] | None, typer.Option("--doc-id", help="Check this document id (repeatable).")
+    ] = None,
+    file: Annotated[
+        list[Path] | None,
+        typer.Option("--file", help="Check the document this raw file becomes (repeatable)."),
+    ] = None,
+    all_documents: Annotated[
+        bool, typer.Option("--all", help="Check every document of the persona.")
+    ] = False,
+    source: Annotated[
+        str | None, typer.Option("--source", "-s", help="Only this source id (with --all).")
+    ] = None,
+) -> None:
+    """Report which layers a captured document has on disk and in the graph, and what came loose.
+
+    Writing a document is the first of four passes: the text is ingested, an extraction file
+    names its entities, an attribution file names the voices in it, an annotation file records
+    what its passages say. Each can be skipped silently, so this checks all four at once. Every
+    sidecar found is re-run through its own importer as a dry run, which writes nothing and
+    reports exactly what a real import would place and what it would leave loose.
+
+    Exits 1 when a listed document has no extraction JSON, when a sidecar fails to import, or
+    when anything came loose; 0 when every layer is complete.
+    """
+    from graphrag.extract.layers import (
+        LAYERS,
+        SourceNotFoundError,
+        check_documents,
+        doc_id_for_file,
+        summary_lines,
+    )
+
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        raw_root = ctx.settings.raw_dir / spec.id
+        wanted = list(doc_id or [])
+        for path in file or []:
+            try:
+                wanted.append(doc_id_for_file(spec, raw_root, path)[0])
+            except SourceNotFoundError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(2) from exc
+        if not wanted and not all_documents and source is None:
+            err.print(
+                "[red]name documents with --doc-id or --file, or pass --all "
+                "(optionally with --source)[/red]"
+            )
+            raise typer.Exit(2)
+        report = check_documents(
+            ctx.store,
+            spec,
+            enrichment_root=ctx.settings.enrichment_dir,
+            attribution_root=ctx.settings.attribution_dir,
+            annotation_root=ctx.settings.annotations_dir,
+            doc_ids=wanted or None,
+            source_id=None if wanted else source,
+            aliases=_alias_table(ctx, spec.id),
+            facets=_facet_table(ctx, spec.id),
+        )
+        table = Table(title=f"layers: {spec.id}")
+        # Folded rather than truncated: a document id a reader cannot finish reading is the one
+        # column this table exists for, and it is longer than a default 80-column terminal.
+        table.add_column("document", overflow="fold")
+        table.add_column("source", overflow="fold")
+        for col in ("graph", *LAYERS, "loose"):
+            table.add_column(col)
+        for document in report.documents:
+            table.add_row(
+                document.doc_id,
+                document.source_id,
+                "yes" if document.in_graph else "[red]no[/red]",
+                *(_layer_cell(document.state(layer)) for layer in LAYERS),
+                str(len(document.loose)) if document.loose else "",
+            )
+        console.print(table)
+        for line in summary_lines(report):
+            console.print(line, markup=False, highlight=False)
+        if not report.ok:
+            raise typer.Exit(1)
+    finally:
+        ctx.close()
+
+
+def _layer_cell(state: str) -> str:
+    """Colour one layer cell: on disk and in the graph, one of the two, or neither."""
+    return {
+        "ok": "[green]ok[/green]",
+        "file": "[yellow]file[/yellow]",
+        "graph": "[yellow]graph[/yellow]",
+    }.get(state, "[red]-[/red]")
 
 
 if __name__ == "__main__":

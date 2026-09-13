@@ -95,6 +95,20 @@ class Document(BaseModel):
     word_count: int = 0
 
 
+class SpeakerPost(BaseModel):
+    """What one speaker's turn in one passage carries besides their name.
+
+    The graph holds these as properties on the ``SPOKE`` edge. They are kept on the passage as
+    well so a snapshot round-trips them: the edge is rebuilt from the passage on load.
+    """
+
+    speaker: str
+    #: ISO ``YYYY-MM-DD``. A plain string, so it sorts and compares the same everywhere.
+    posted_at: str | None = None
+    role: str | None = None
+    score: int | None = None
+
+
 class Chunk(BaseModel):
     id: str
     doc_id: str
@@ -103,6 +117,10 @@ class Chunk(BaseModel):
     text: str
     speaker: str | None = None
     speakers: list[str] = Field(default_factory=list)
+    #: One entry per speaker in ``speakers`` that an attribution pass dated or scored.
+    speaker_posts: list[SpeakerPost] = Field(default_factory=list)
+    #: Which functions of the subject this passage is about, from the annotation layer.
+    facets: list[str] = Field(default_factory=list)
     start_ts: str | None = None
     start_seconds: int | None = None
     url: str | None = None
@@ -122,12 +140,19 @@ EntityType = Literal[
     "person", "company", "product", "framework", "concept", "book", "metric", "regulation", "other"
 ]
 
+#: What a passage says about the entity it mentions. ``neutral`` is a deliberate reading, not the
+#: absence of one: a mention with no annotation at all carries no stance.
+Stance = Literal["praise", "complaint", "substitution", "neutral"]
+
 
 class Entity(BaseModel):
     id: str
     name: str
     type: EntityType = "concept"
     description: str = ""
+    #: The other spellings folded into this node by ``graphrag aliases apply``. Kept so the
+    #: graph says why a count is what it is, and so a reader can find the surface form again.
+    aliases: list[str] = Field(default_factory=list)
 
     @staticmethod
     def make_id(name: str, entity_type: str) -> str:
@@ -137,6 +162,8 @@ class Entity(BaseModel):
 class Mention(BaseModel):
     chunk_id: str
     entity_id: str
+    #: Set by the annotation layer, never by extraction: what this passage says about the entity.
+    stance: Stance | None = None
 
 
 class Relation(BaseModel):
@@ -310,3 +337,45 @@ class TopicEdge(BaseModel):
     source: str
     target: str
     weight: int = 1
+
+
+class MentionStance(BaseModel):
+    """One annotated mention: what a passage says about an entity, and who wrote the passage.
+
+    The edge a signed entity network is built from. ``speakers`` are the people credited with
+    the passage, so a stance can be attributed without a second read.
+    """
+
+    entity_id: str
+    name: str
+    chunk_id: str
+    doc_id: str
+    stance: Stance
+    speakers: list[str] = Field(default_factory=list)
+
+
+class ChunkFacets(BaseModel):
+    """One passage and the facets the annotation layer put on it."""
+
+    chunk_id: str
+    doc_id: str
+    facets: list[str] = Field(default_factory=list)
+
+
+class EntityMention(BaseModel):
+    """One entity mentioned in one passage, with what the passage says and who wrote it.
+
+    :class:`EntityChunk` carries what extraction knows. This carries the two things the
+    annotation and attribution layers add on top: the ``stance`` on the mention, and the
+    speakers credited with the passage. A signed entity network and the speaker-entity
+    bipartite network are both built from it, which is why they are read together rather than
+    joined afterwards by the caller.
+    """
+
+    entity_id: str
+    name: str
+    type: str = "other"
+    chunk_id: str
+    doc_id: str
+    stance: Stance | None = None
+    speakers: list[str] = Field(default_factory=list)

@@ -666,3 +666,300 @@ def test_summary_lines_report_both_layers_when_both_did_something() -> None:
         "p: nothing to ingest, imported 2 extraction files for documents without entities, "
         "imported 3 attribution files for documents without speakers"
     )
+
+
+# ----------------------------------------------------------------------------- annotation
+
+
+@pytest.fixture
+def annotation_root(tmp_path: Path) -> Path:
+    path = tmp_path / "annotations"
+    path.mkdir()
+    return path
+
+
+def write_annotation(directory: Path, doc_id: str, facet: str = "handover") -> Path:
+    """One annotation file whose single anchor is the thread's opening sentence."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{doc_id.rsplit(':', 1)[-1]}.json"
+    payload = {
+        "doc_id": doc_id,
+        "annotations": [{"anchor": THREAD_POSTS[0][2][:60], "facets": [facet]}],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_an_up_to_date_source_imports_files_for_documents_with_no_annotations(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    """Ingest and annotation are separate steps, exactly as ingest and extraction are."""
+    write_annotation(annotation_root / PERSONA_ID / THREADS, threaded)
+
+    report = run(
+        memory_store, thread_persona, raw_root, enrichment_root, annotation_root=annotation_root
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.stale is False  # `no_embedder` proves nothing was re-ingested
+    assert (threads.annotation_files, threads.annotation_errors) == (1, ())
+    assert memory_store.chunk_facets(PERSONA_ID)[0].facets == ["handover"]
+    assert report.wrote is True
+    assert summary_lines(report)[0] == (
+        f"{THREADS}: up to date, imported 1 annotation files for documents without annotations"
+    )
+
+
+def test_a_document_that_already_has_annotations_is_not_imported_again(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    """Otherwise every run would re-annotate the whole corpus for nothing."""
+    write_annotation(annotation_root / PERSONA_ID / THREADS, threaded, facet="from-the-file")
+    memory_store.annotate_chunk(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, ["already-here"]
+    )
+
+    report = run(
+        memory_store, thread_persona, raw_root, enrichment_root, annotation_root=annotation_root
+    )
+
+    assert next(s for s in report.sources if s.source_id == THREADS).annotation_files == 0
+    assert memory_store.chunk_facets(PERSONA_ID)[0].facets == ["already-here"]
+    assert report.wrote is False
+
+
+def test_annotations_are_reimported_because_a_re_ingest_drops_them(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    """Facets sit on a passage and a stance on a mention, and a re-ingest deletes both."""
+    write_annotation(annotation_root / PERSONA_ID / THREADS, threaded)
+    run(memory_store, thread_persona, raw_root, enrichment_root, annotation_root=annotation_root)
+    memory_store.delete_documents([threaded])
+    assert memory_store.chunk_facets(PERSONA_ID) == []
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        embedder=lambda: hash_embedder,
+        annotation_root=annotation_root,
+    )
+
+    threads = next(s for s in report.sources if s.source_id == THREADS)
+    assert threads.stale is True and threads.annotation_files == 1
+    assert memory_store.chunk_facets(PERSONA_ID)[0].facets == ["handover"]
+
+
+def test_an_unimportable_annotation_file_is_reported_not_raised(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    folder = annotation_root / PERSONA_ID / THREADS
+    folder.mkdir(parents=True)
+    (folder / "bad.json").write_text(
+        json.dumps({"doc_id": threaded, "annotations": [{"anchor": "  "}]}), encoding="utf-8"
+    )
+
+    report = run(
+        memory_store, thread_persona, raw_root, enrichment_root, annotation_root=annotation_root
+    )
+
+    assert len(report.errors) == 1 and report.errors[0].startswith("bad.json: invalid")
+    assert "  bad.json: invalid" in summary_lines(report)[1]
+
+
+def test_a_dry_run_counts_annotation_files_without_importing_them(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    annotation_root: Path,
+) -> None:
+    write_annotation(annotation_root / PERSONA_ID / THREADS, threaded)
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        annotation_root=annotation_root,
+        dry_run=True,
+    )
+
+    assert report.backfilled_annotation_files == 1
+    assert report.wrote is False
+    assert memory_store.chunk_facets(PERSONA_ID) == []
+    assert summary_lines(report)[0].endswith(
+        "would import 1 annotation files for documents without annotations"
+    )
+
+
+def test_no_annotation_directory_is_not_a_finding(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """Most personas have none, and their sync output must read as it always did."""
+    report = run(memory_store, thread_persona, raw_root, enrichment_root)
+
+    assert report.backfilled_annotation_files == 0
+    assert summary_lines(report) == [f"{THREADS}: up to date", f"{PERSONA_ID}: nothing to sync"]
+
+
+# ----------------------------------------------------------------------------- aliases
+
+
+def test_aliases_are_applied_once_the_whole_graph_has_landed(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Two spellings that arrived in different files can only be folded together afterwards.
+
+    They are in the graph here because they were imported before anyone wrote the table, which
+    is the situation the pass exists for.
+    """
+    from graphrag.extract.aliases import load_aliases
+
+    doc_ids = sorted(memory_store.document_ids(PERSONA_ID, TRANSCRIPTS))
+    for doc_id, entity in zip(
+        doc_ids,
+        [
+            Entity(id="metric:retention", name="Retention", type="metric"),
+            Entity(id="metric:retention-rate", name="retention rate", type="metric"),
+        ],
+        strict=False,
+    ):
+        chunk = memory_store.document_chunks(doc_id, 0, 1)[0]
+        memory_store.upsert_enrichment(
+            Enrichment(
+                entities=[entity], mentions=[Mention(chunk_id=chunk.id, entity_id=entity.id)]
+            )
+        )
+    path = tmp_path / "aliases.yaml"
+    path.write_text("aliases:\n  Retention: [retention rate]\n", encoding="utf-8")
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root, aliases=load_aliases(path))
+
+    assert report.aliases is not None and report.aliases.mentions_moved == 1
+    assert "metric:retention-rate" not in memory_store.entities
+    assert memory_store.entities["metric:retention"].aliases == ["retention rate"]
+    assert report.wrote is True  # folding the graph is a change worth a new snapshot
+    assert "aliases: folded 1 mentions onto 1 canonical names" in summary_lines(report)
+
+
+def test_an_import_during_sync_writes_the_canonical_name_in_the_first_place(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    tmp_path: Path,
+) -> None:
+    """So the alias node the pass would clean up is never created by a synced import."""
+    from graphrag.extract.aliases import load_aliases
+
+    doc_id = sorted(memory_store.document_ids(PERSONA_ID, TRANSCRIPTS))[0]
+    write_extraction(enrichment_root / PERSONA_ID / TRANSCRIPTS, doc_id, name="retention rate")
+    path = tmp_path / "aliases.yaml"
+    path.write_text("aliases:\n  Retention: [retention rate]\n", encoding="utf-8")
+
+    run(memory_store, multi_persona, raw_root, enrichment_root, aliases=load_aliases(path))
+
+    assert list(memory_store.entities) == ["metric:retention"]
+    assert memory_store.entities["metric:retention"].aliases == ["retention rate"]
+
+
+def test_a_dry_run_never_folds_the_graph(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    tmp_path: Path,
+) -> None:
+    from graphrag.extract.aliases import load_aliases
+
+    path = tmp_path / "aliases.yaml"
+    path.write_text("aliases:\n  Retention: [retention rate]\n", encoding="utf-8")
+
+    report = run(
+        memory_store,
+        multi_persona,
+        raw_root,
+        enrichment_root,
+        aliases=load_aliases(path),
+        dry_run=True,
+    )
+
+    assert report.aliases is None
+    assert summary_lines(report)[-1] == f"{PERSONA_ID}: nothing to sync"
+
+
+def test_summary_lines_report_all_three_layers_when_all_three_did_something() -> None:
+    report = SyncReport(
+        persona_id="p",
+        sources=(
+            SourceReport(
+                source_id="a", enrichment_files=2, attribution_files=3, annotation_files=4
+            ),
+        ),
+    )
+    assert summary_lines(report)[0] == (
+        "a: up to date, imported 2 extraction files for documents without entities, "
+        "imported 3 attribution files for documents without speakers, "
+        "imported 4 annotation files for documents without annotations"
+    )
+    assert summary_lines(report)[-1] == (
+        "p: nothing to ingest, imported 2 extraction files for documents without entities, "
+        "imported 3 attribution files for documents without speakers, "
+        "imported 4 annotation files for documents without annotations"
+    )
+
+
+def test_a_stale_source_line_names_every_layer_it_re_imported() -> None:
+    report = SyncReport(
+        persona_id="p",
+        sources=(
+            SourceReport(
+                source_id="a",
+                missing=("p:a:one",),
+                ingested_documents=1,
+                ingested_chunks=2,
+                enrichment_files=1,
+                attribution_files=1,
+                annotation_files=1,
+            ),
+        ),
+    )
+    assert summary_lines(report)[0] == (
+        "a: 1 missing -> ingested 1 documents / 2 chunks, re-imported 1 extraction files "
+        "and 1 attribution files and 1 annotation files"
+    )
