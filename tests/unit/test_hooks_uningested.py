@@ -33,10 +33,20 @@ sources:
 
 
 class FakeClient:
-    """A stand-in for ``McpClient``: answers the ``cypher`` tool from a canned id table."""
+    """A stand-in for ``McpClient``: answers the ``cypher`` tool from canned id tables.
 
-    def __init__(self, doc_ids_by_prefix: dict[str, list[str]] | None = None) -> None:
+    ``doc_ids_by_prefix`` is what the graph holds; ``enriched`` is the subset that has entity
+    mentions (the query containing ``MENTIONS`` returns only those). By default every document
+    counts as enriched so the ingest-focused tests stay about ingest.
+    """
+
+    def __init__(
+        self,
+        doc_ids_by_prefix: dict[str, list[str]] | None = None,
+        enriched: set[str] | None = None,
+    ) -> None:
         self._doc_ids_by_prefix = doc_ids_by_prefix or {}
+        self._enriched = enriched
         self.calls: list[dict[str, Any]] = []
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -44,8 +54,10 @@ class FakeClient:
         self.calls.append(arguments)
         params = arguments["params"]
         prefix, skip = params["prefix"], params["skip"]
-        page = sorted(self._doc_ids_by_prefix.get(prefix, []))[skip : skip + 500]
-        return [{"d.id": doc_id} for doc_id in page]
+        ids = sorted(self._doc_ids_by_prefix.get(prefix, []))
+        if "MENTIONS" in arguments["query"] and self._enriched is not None:
+            ids = [i for i in ids if i in self._enriched]
+        return [{"d.id": doc_id} for doc_id in ids[skip : skip + 500]]
 
 
 class FailingClient:
@@ -149,6 +161,27 @@ def test_documents_in_the_graph_without_extraction_json_are_reported(root: Path)
     assert report.total_unenriched == 2
     assert report.unenriched_by_persona == {"demo-persona": 2}
     assert not report.is_clean
+
+
+def test_live_graph_counts_a_document_as_enriched_only_when_it_has_mentions(root: Path) -> None:
+    """JSON written to disk but never imported must still be reported while the server answers."""
+    _write_enrichment(root, ["demo-persona:notes:one", "demo-persona:notes:two"])
+    client = FakeClient(
+        {"demo-persona:notes:": ["demo-persona:notes:one", "demo-persona:notes:two"]},
+        enriched={"demo-persona:notes:one"},
+    )
+    report = uningested.find_uningested(root, client)  # type: ignore[arg-type]
+    assert report.source == "graph"
+    by_source = {(u.persona_id, u.source_id): u.doc_ids for u in report.unenriched}
+    assert by_source == {("demo-persona", "notes"): ("demo-persona:notes:two",)}
+    assert report.unenriched[0].json_on_disk == 1
+    assert report.unenriched_with_json == 1
+    assert any("MENTIONS" in c["query"] for c in client.calls)
+    message = uningested.render_message(report)
+    assert message is not None
+    assert message.endswith(
+        "their extraction JSON is on disk, run `make sync PERSONA=demo-persona`."
+    )
 
 
 def test_extraction_json_is_matched_by_its_doc_id_not_its_path(root: Path) -> None:
@@ -331,6 +364,19 @@ def test_render_message_names_the_enrich_skill_when_only_extraction_is_missing()
         "graphrag: 1 ingested document has no entity extraction (demo-persona: 1); "
         "run the graph-rag-enrich skill for demo-persona."
     )
+
+
+def test_render_message_distinguishes_json_waiting_from_json_missing() -> None:
+    partial = uningested.Report(
+        source="graph",
+        unenriched=(
+            uningested.Unenriched("demo-persona", "notes", ("a", "b", "c"), json_on_disk=2),
+        ),
+    )
+    message = uningested.render_message(partial)
+    assert message is not None
+    assert "2 have extraction JSON on disk (run `make sync PERSONA=demo-persona`)" in message
+    assert message.endswith("the rest need the graph-rag-enrich skill.")
 
 
 def test_render_message_combines_both_clauses_and_stays_under_budget() -> None:

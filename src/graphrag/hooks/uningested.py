@@ -13,9 +13,11 @@ Two kinds of comparison, matching how the loaders behave (see ``graphrag.ingest.
   above the graph's document count is normal, not a finding. Only a source with raw files
   but *zero* matching documents in the graph is reported.
 
-A third check covers the entity layer: a document that is in the graph but has no extraction
-JSON under ``data/enrichment`` is searchable yet invisible to entity and relation queries. That
-gap is agent work (the ``graph-rag-enrich`` skill), so the hook names it rather than fixing it.
+A third check covers the entity layer. When the server answers, a document counts as enriched
+only if the graph holds at least one entity mention for it; extraction JSON that was written but
+never imported does not count. When the server is down the check falls back to the JSON files
+under ``data/enrichment``. Writing the JSON is agent work (the ``graph-rag-enrich`` skill);
+importing it is ``make sync``.
 """
 
 from __future__ import annotations
@@ -68,11 +70,17 @@ class Finding:
 
 @dataclass(frozen=True)
 class Unenriched:
-    """Documents in the graph for one persona/source that have no extraction JSON yet."""
+    """Documents in the graph for one persona/source that have no entity mentions yet.
+
+    ``json_on_disk`` counts how many of them already have extraction JSON under
+    ``data/enrichment`` that was simply never imported; those need ``make sync``, the rest need
+    the enrich skill.
+    """
 
     persona_id: str
     source_id: str
     doc_ids: tuple[str, ...] = ()
+    json_on_disk: int = 0
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,11 @@ class Report:
         return counts
 
     @property
+    def unenriched_with_json(self) -> int:
+        """How many un-enriched documents already have extraction JSON waiting to be imported."""
+        return sum(u.json_on_disk for u in self.unenriched)
+
+    @property
     def is_clean(self) -> bool:
         """True when there is nothing to report at all."""
         return self.total_files == 0 and self.total_unenriched == 0
@@ -126,7 +139,7 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
     personas = project.load_personas(root)
     source_kind = "graph" if client is not None else "snapshot"
     snapshot_cache: dict[str, set[str]] = {}
-    enriched = project.enriched_doc_ids(root)
+    disk_enriched = project.enriched_doc_ids(root)
     findings: list[Finding] = []
     unenriched: list[Unenriched] = []
 
@@ -141,9 +154,14 @@ def find_uningested(root: Path, client: McpClient | None) -> Report:
             except McpUnavailable:
                 continue
 
+            try:
+                enriched = _enriched_ids(client, persona, source, disk_enriched)
+            except McpUnavailable:
+                continue
             gap = tuple(sorted(existing - enriched))
             if gap:
-                unenriched.append(Unenriched(pid, source.id, gap))
+                on_disk = sum(1 for doc_id in gap if doc_id in disk_enriched)
+                unenriched.append(Unenriched(pid, source.id, gap, json_on_disk=on_disk))
 
             if source.loader == "transcripts":
                 if not existing:
@@ -178,14 +196,39 @@ def _existing_ids(
     return {doc_id for doc_id in snapshot_cache[persona.id] if doc_id.startswith(prefix)}
 
 
-def _graph_doc_ids(client: McpClient, prefix: str) -> set[str]:
-    """Every ``Document.id`` under ``prefix``, paged 500 rows at a time."""
+def _enriched_ids(
+    client: McpClient | None,
+    persona: project.PersonaInfo,
+    source: project.SourceInfo,
+    disk_enriched: set[str],
+) -> set[str]:
+    """Documents with entity mentions in the graph; JSON on disk only when the server is down."""
+    prefix = f"{persona.id}:{source.id}:"
+    if client is not None:
+        return _graph_doc_ids(client, prefix, enriched_only=True)
+    return {doc_id for doc_id in disk_enriched if doc_id.startswith(prefix)}
+
+
+_DOC_IDS_QUERY = (
+    "MATCH (d:Document) WHERE d.id STARTS WITH $prefix "
+    "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
+)
+_ENRICHED_IDS_QUERY = (
+    "MATCH (d:Document) WHERE d.id STARTS WITH $prefix "
+    "AND EXISTS { (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity) } "
+    "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
+)
+
+
+def _graph_doc_ids(client: McpClient, prefix: str, *, enriched_only: bool = False) -> set[str]:
+    """Every ``Document.id`` under ``prefix``, paged 500 rows at a time.
+
+    With ``enriched_only`` the query keeps only documents that have at least one entity
+    mention, which is what "enriched" means once the server can be asked.
+    """
     ids: set[str] = set()
     skip = 0
-    query = (
-        "MATCH (d:Document) WHERE d.id STARTS WITH $prefix "
-        "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
-    )
+    query = _ENRICHED_IDS_QUERY if enriched_only else _DOC_IDS_QUERY
     for _ in range(_MAX_PAGES):
         params = {"prefix": prefix, "skip": skip}
         rows = client.call_tool("cypher", {"query": query, "params": params})
@@ -286,11 +329,18 @@ def _enrich_clause(report: Report) -> str:
     by_persona = report.unenriched_by_persona
     parts = _counts(by_persona)
     verb = "document has" if missing == 1 else "documents have"
-    persona = min(by_persona, key=lambda pid: (-by_persona[pid], pid))
-    return (
-        f" {missing} ingested {verb} no entity extraction ({parts}); "
-        f"run the graph-rag-enrich skill for {_persona(persona)}."
-    )
+    persona = _persona(min(by_persona, key=lambda pid: (-by_persona[pid], pid)))
+    waiting = report.unenriched_with_json
+    if waiting >= missing:
+        action = f"their extraction JSON is on disk, run `make sync PERSONA={persona}`."
+    elif waiting > 0:
+        action = (
+            f"{waiting} have extraction JSON on disk (run `make sync PERSONA={persona}`), "
+            f"the rest need the graph-rag-enrich skill."
+        )
+    else:
+        action = f"run the graph-rag-enrich skill for {persona}."
+    return f" {missing} ingested {verb} no entity extraction ({parts}); {action}"
 
 
 def _entries(report: Report) -> list[str]:
