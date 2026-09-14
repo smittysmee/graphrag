@@ -347,6 +347,8 @@ def sync_persona(
             say(f"{source.id}: {len(missing)} documents missing, re-ingesting")
             ingested = pipeline.ingest(raw_root, persona, source)
             documents, chunks = ingested.documents, ingested.chunks
+            if ingested.orphans_removed:
+                say(f"{source.id}: removed {ingested.orphans_removed} orphaned entities")
         # After the re-ingest, so the documents it replaced count as needing their entities back.
         pending = _pending(store, persona, source, files, reingested=bool(missing))
         imported, errors = _reimport(store, pending, say, aliases, reingested=bool(missing))

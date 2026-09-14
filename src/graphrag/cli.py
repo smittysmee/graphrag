@@ -346,9 +346,14 @@ def ingest(
             ctx.store.delete_persona(spec.id)
         pipeline = IngestPipeline(ctx.store, ctx.require_embedder(), progress=_progress)
         report = pipeline.ingest(path, spec, src)
+        orphans = (
+            f", removed {report.orphans_removed} orphaned entities"
+            if report.orphans_removed
+            else ""
+        )
         console.print(
             f"[green]ingested[/green] {report.documents} documents / {report.chunks} chunks "
-            f"in {report.seconds:.0f}s with {report.embedding_model}"
+            f"in {report.seconds:.0f}s with {report.embedding_model}{orphans}"
         )
         if report.skipped:
             err.print(f"[yellow]skipped (empty): {len(report.skipped)} files[/yellow]")
@@ -1641,6 +1646,48 @@ def annotations_import(
         if problems:
             raise typer.Exit(2)
         if export and not dry_run:
+            snap.export_snapshot(
+                ctx.store,
+                spec,
+                ctx.snapshots_dir,
+                embedding_model=ctx.settings.embedding.model,
+                embedding_dim=ctx.settings.embedding.dim,
+            )
+            console.print("snapshot re-exported")
+    finally:
+        ctx.close()
+
+
+# ----------------------------------------------------------------------------- entities
+
+
+entities_app = typer.Typer(help="Maintain the entity layer.", no_args_is_help=True)
+app.add_typer(entities_app, name="entities")
+
+
+@entities_app.command("prune")
+def entities_prune(
+    persona: Annotated[str, typer.Argument(help="Persona id.")],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what would go; write nothing.")
+    ] = False,
+    export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
+) -> None:
+    """Delete the entity nodes no passage mentions any more, with their relations.
+
+    A re-ingest replaces a source's documents and deletes the mentions on their passages. An
+    entity those mentions were the only evidence for is left holding its id and nothing else,
+    and the next extraction pass lands on the stale node instead of creating its own. Ingest
+    prunes as it goes; this runs the same sweep over a graph that was loaded from a snapshot or
+    edited by hand. A node another persona's passage still relates to is left alone.
+    """
+    ctx = State.context()
+    try:
+        spec = ctx.registry.get(persona)
+        removed = ctx.store.delete_orphan_entities(spec.id, dry_run=dry_run)
+        verb = "would remove" if dry_run else "removed"
+        console.print(f"[green]{verb}[/green] {removed} orphaned entities")
+        if export and not dry_run and removed:
             snap.export_snapshot(
                 ctx.store,
                 spec,

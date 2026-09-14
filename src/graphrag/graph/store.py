@@ -43,6 +43,9 @@ class GraphStore(Protocol):
     # recorded `aliases`) never renames it: the node stands, its mentions and relations still
     # attach, and the incoming name comes back as an `EntityCollision` for the caller to report.
     # Saying two spellings are one thing is the alias table's job, not a writer's.
+    # The exception is a stale node -- no mention and no recorded alias, all that is left of an
+    # entity whose passages a re-ingest deleted. It holds nothing but its id, so the incoming
+    # name takes it over instead of a spelling nobody stands behind outliving its evidence.
     def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]: ...
     # Fold the alias spellings of one entity into a single canonical node: re-point this
     # persona's MENTIONS and RELATED_TO edges, merge the mentions, record `aliases` on the
@@ -50,6 +53,14 @@ class GraphStore(Protocol):
     def merge_entities(self, persona_id: str, canonical: str, aliases: Sequence[str]) -> int: ...
     def delete_persona(self, persona_id: str) -> None: ...
     def delete_documents(self, doc_ids: Sequence[str]) -> None: ...
+    # Delete this persona's Entity nodes that no passage mentions any more, taking their
+    # RELATED_TO edges with them, and return how many went. `dry_run` counts the same nodes and
+    # writes nothing. A re-ingest replaces a source's documents, which deletes the mentions on
+    # their passages; without this the entity nodes those mentions were the only evidence for
+    # stand for ever, holding their ids against the next extraction pass.
+    # Entity nodes are shared between personas, so a node another persona's passage still
+    # relates to is left alone even when nothing mentions it.
+    def delete_orphan_entities(self, persona_id: str, *, dry_run: bool = False) -> int: ...
 
     # search
     def vector_search(

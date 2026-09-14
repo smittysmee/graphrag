@@ -185,7 +185,9 @@ class EntityCollision(BaseModel):
         return f"{self.incoming} kept as {self.existing}"
 
 
-def merge_entity(held: Entity | None, incoming: Entity) -> tuple[Entity, EntityCollision | None]:
+def merge_entity(
+    held: Entity | None, incoming: Entity, *, held_mentions: int | None = None
+) -> tuple[Entity, EntityCollision | None]:
     """The node an incoming entity should leave behind, and the collision to report.
 
     The store contract behind :meth:`GraphStore.upsert_enrichment`, shared so the Neo4j store
@@ -195,9 +197,15 @@ def merge_entity(held: Entity | None, incoming: Entity) -> tuple[Entity, EntityC
     * the two names fold together (case and whitespace), or the incoming one is already
       recorded among the node's ``aliases``: an ordinary upsert, and the node keeps the name a
       person gave it rather than taking the alias spelling;
+    * the node is stale -- no passage mentions it and no alias was ever recorded on it -- so it
+      holds nothing but its own id, and the incoming name takes it over;
     * otherwise: the node stands exactly as it is and the incoming name comes back as an
       :class:`EntityCollision`. The mentions and relations still attach -- they are keyed on the
       id -- so the reviewer gets a report to act on, not a half-written import.
+
+    ``held_mentions`` is how many passages mention the node the store found, or ``None`` when
+    the caller did not count. Only ``0`` makes a node stale: a caller that does not know is
+    treated as if the node were still mentioned, so an uncounted import never renames anything.
     """
     # A node with no name at all cannot be said to hold a different one, so it is simply
     # written over; nothing this package creates leaves an entity unnamed.
@@ -208,6 +216,11 @@ def merge_entity(held: Entity | None, incoming: Entity) -> tuple[Entity, EntityC
         name = incoming.name
     elif folded in {fold_name(alias) for alias in held.aliases}:
         name = held.name
+    elif held_mentions == 0 and not held.aliases:
+        # Left over from a re-ingest that deleted the passages it was extracted from. It carries
+        # no evidence and no human decision, only the id, so keeping its name would let a
+        # spelling nobody stands behind outlive every document that ever used it.
+        return incoming, None
     else:
         return held, EntityCollision(entity_id=held.id, incoming=incoming.name, existing=held.name)
     return incoming.model_copy(

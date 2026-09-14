@@ -108,8 +108,12 @@ class InMemoryGraphStore:
 
     def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]:
         collisions: list[EntityCollision] = []
+        counts = Counter(m.entity_id for m in self.mentions)
         for entity in enrichment.entities:
-            resolved, collision = merge_entity(self.entities.get(entity.id), entity)
+            held = self.entities.get(entity.id)
+            resolved, collision = merge_entity(
+                held, entity, held_mentions=None if held is None else counts[entity.id]
+            )
             self.entities[entity.id] = resolved
             if collision is not None:
                 collisions.append(collision)
@@ -209,6 +213,30 @@ class InMemoryGraphStore:
             self.entities.pop(entity_id, None)
         return moved
 
+    def delete_orphan_entities(self, persona_id: str, *, dry_run: bool = False) -> int:
+        """Drop the entity nodes nothing mentions any more. Returns how many went.
+
+        Scoped the way ``merge_entities`` is: entity nodes are shared, so a node another
+        persona's passage still relates to survives even with no mention on it. A relation whose
+        passage is gone holds nothing, so it does not keep its endpoints alive.
+        """
+        mentioned = {m.entity_id for m in self.mentions}
+        foreign = {
+            entity_id
+            for r in self.relations
+            if (chunk := self.chunks.get(r.chunk_id)) is not None and chunk.persona_id != persona_id
+            for entity_id in (r.source_id, r.target_id)
+        }
+        orphans = set(self.entities) - mentioned - foreign
+        if dry_run or not orphans:
+            return len(orphans)
+        for entity_id in orphans:
+            del self.entities[entity_id]
+        self.relations = [
+            r for r in self.relations if r.source_id not in orphans and r.target_id not in orphans
+        ]
+        return len(orphans)
+
     def delete_documents(self, doc_ids: Sequence[str]) -> None:
         wanted = set(doc_ids)
         chunk_ids = {c for c, ch in self.chunks.items() if ch.doc_id in wanted}
@@ -231,6 +259,7 @@ class InMemoryGraphStore:
         self.mentions = [m for m in self.mentions if m.chunk_id not in chunk_ids]
         self.relations = [r for r in self.relations if r.chunk_id not in chunk_ids]
         self.personas.pop(persona_id, None)
+        self.delete_orphan_entities(persona_id)
 
     # ------------------------------------------------------------- search
     def _persona_chunk_ids(self, persona_id: str | None) -> list[str]:

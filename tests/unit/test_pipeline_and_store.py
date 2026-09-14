@@ -5,7 +5,7 @@ import pytest
 
 from graphrag.embed.hashing import HashEmbedder
 from graphrag.graph.memory_store import InMemoryGraphStore
-from graphrag.models import Enrichment, Entity, Mention, PersonaSpec, SourceSpec
+from graphrag.models import Enrichment, Entity, Mention, PersonaSpec, Relation, SourceSpec
 from graphrag.pipeline import IngestPipeline, IngestReport
 
 
@@ -517,3 +517,189 @@ def test_two_punctuated_names_in_one_extraction_stay_two_nodes(
 
     assert memory_store.upsert_enrichment(Enrichment(entities=[plain, plus])) == []
     assert sorted(memory_store.entities) == ["product:lumenta", "product:lumenta-plus"]
+
+
+# ------------------------------------------------------- orphaned entities
+
+
+def test_orphan_prune_removes_only_the_entities_nothing_mentions(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """The store contract behind `graphrag entities prune`.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="product:orrery", name="Orrery", type="product"),
+            ],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="product:lumenta")],
+        )
+    )
+
+    # A dry run counts the unmentioned node and writes nothing.
+    assert memory_store.delete_orphan_entities("test-pm", dry_run=True) == 1
+    assert sorted(memory_store.entities) == ["product:lumenta", "product:orrery"]
+
+    assert memory_store.delete_orphan_entities("test-pm") == 1
+    assert sorted(memory_store.entities) == ["product:lumenta"]
+    assert memory_store.delete_orphan_entities("test-pm") == 0  # nothing left to sweep
+
+
+def test_orphan_prune_takes_the_relations_of_a_node_it_removes(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """A relation anchored to a passage that is gone holds nothing, so it does not save a node."""
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="company:orrery-labs", name="Orrery Labs", type="company"),
+            ],
+            mentions=[
+                Mention(chunk_id=chunk_id, entity_id="product:lumenta"),
+                Mention(chunk_id=chunk_id, entity_id="company:orrery-labs"),
+            ],
+            relations=[
+                Relation(
+                    source_id="company:orrery-labs",
+                    target_id="product:lumenta",
+                    type="BUILDS",
+                    chunk_id=chunk_id,
+                )
+            ],
+        )
+    )
+    memory_store.delete_documents([doc_id])
+
+    assert memory_store.delete_orphan_entities("test-pm") == 2
+    assert memory_store.entities == {}
+    assert memory_store.relations == []
+
+
+def test_orphan_prune_leaves_a_node_another_personas_passage_relates_to(
+    ingested: IngestReport,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    sample_corpus: Path,
+    docs_persona: PersonaSpec,
+    documents_source: SourceSpec,
+) -> None:
+    """Entity nodes are shared, so pruning one persona never empties another persona's graph."""
+    IngestPipeline(memory_store, hash_embedder).ingest(
+        sample_corpus, docs_persona, documents_source
+    )
+    other_doc = sorted(memory_store.document_ids("test-docs"))[0]
+    other_chunk = memory_store.document_chunks(other_doc, 0, 1)[0].id
+    mine = sorted(memory_store.document_ids("test-pm"))[0]
+    my_chunk = memory_store.document_chunks(mine, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="company:orrery-labs", name="Orrery Labs", type="company"),
+            ],
+            mentions=[Mention(chunk_id=my_chunk, entity_id="company:orrery-labs")],
+            relations=[
+                Relation(
+                    source_id="company:orrery-labs",
+                    target_id="product:lumenta",
+                    type="BUILDS",
+                    chunk_id=other_chunk,  # the other persona's passage carries the evidence
+                )
+            ],
+        )
+    )
+
+    assert memory_store.delete_orphan_entities("test-pm") == 0
+    assert sorted(memory_store.entities) == ["company:orrery-labs", "product:lumenta"]
+
+
+def test_a_re_ingest_removes_an_entity_only_the_old_documents_mentioned(
+    pipeline: IngestPipeline,
+    sample_corpus: Path,
+    persona: PersonaSpec,
+    transcript_source: SourceSpec,
+    ingested: IngestReport,
+    memory_store: InMemoryGraphStore,
+) -> None:
+    """The defect this closes: a stale node used to survive a full re-ingest and keep its name.
+
+    An extraction pass names an entity, the source is re-ingested, and the passages that
+    mentioned it are replaced. The node is now evidence for nothing, so it goes -- and the next
+    import of the corrected name gets the id rather than colliding with the stale spelling.
+    """
+    assert ingested.orphans_removed == 0  # nothing to sweep on a first ingest
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="person:ethan-malik", name="Ethan Malik", type="person")],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="person:ethan-malik")],
+        )
+    )
+
+    again = pipeline.ingest(sample_corpus, persona, transcript_source)
+
+    assert again.orphans_removed == 1
+    assert memory_store.entities == {}
+    # and the corrected spelling now takes the id instead of colliding with the stale one
+    assert (
+        memory_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id="person:ethan-malik", name="Ethan Mollick")])
+        )
+        == []
+    )
+    assert memory_store.entities["person:ethan-malik"].name == "Ethan Mollick"
+
+
+def test_a_stale_node_adopts_the_incoming_name_but_a_mentioned_one_does_not(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """Both branches of the collision rule, side by side.
+
+    A node with a mention or a recorded alias stands for something a person or a passage put
+    there, so the incoming name is reported and refused. A node with neither is left over from
+    a re-ingest and holds nothing but its id, so the incoming name takes it.
+    """
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="product:orrery", name="Orrery", type="product"),
+                Entity(id="product:halcyon", name="Halcyon", type="product", aliases=["Halcyon+"]),
+            ],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="product:lumenta")],
+        )
+    )
+
+    # Mentioned: the node stands and the incoming name is reported.
+    held = memory_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="product:lumenta", name="Lumenta!", type="product")])
+    )
+    assert [c.line() for c in held] == ["Lumenta! kept as Lumenta"]
+    assert memory_store.entities["product:lumenta"].name == "Lumenta"
+
+    # Unmentioned but aliased: a person said those spellings are one thing, so it still stands.
+    aliased = memory_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="product:halcyon", name="Halcyon!", type="product")])
+    )
+    assert [c.line() for c in aliased] == ["Halcyon! kept as Halcyon"]
+    assert memory_store.entities["product:halcyon"].name == "Halcyon"
+
+    # Unmentioned and unaliased: stale, so the incoming name takes the id.
+    assert (
+        memory_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id="product:orrery", name="Orrery!", type="product")])
+        )
+        == []
+    )
+    assert memory_store.entities["product:orrery"].name == "Orrery!"

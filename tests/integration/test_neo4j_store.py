@@ -455,3 +455,138 @@ def test_an_id_collision_never_renames_an_entity_on_neo4j(
         "MATCH (e:Entity {id: $id}) RETURN e.name AS name", {"id": plain}
     )
     assert kept == [{"name": "Lumenta"}]  # the canonical name, not the alias spelling
+
+
+def test_orphaned_entities_are_pruned_on_neo4j(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """The Neo4j half of the orphan contract.
+
+    The in-memory store is held to the same assertions in
+    ``tests/unit/test_pipeline_and_store.py``. A node no passage mentions goes, with its
+    relations; a node another persona's passage relates to stays; a re-ingest sweeps as it goes
+    and the stale id is free for the corrected name.
+    """
+    persona = PersonaSpec(id="it-orphans", name="IT Orphans", sources=[thread_source])
+    other = PersonaSpec(id="it-orphans-other", name="IT Orphans Other", sources=[thread_source])
+    pipeline = IngestPipeline(clean_store, hash_embedder)
+    report = pipeline.ingest(sample_corpus, persona, thread_source)
+    assert report.orphans_removed == 0
+    pipeline.ingest(sample_corpus, other, thread_source)
+    chunks = clean_store.document_chunks(
+        next(iter(clean_store.document_ids("it-orphans", "threads"))), 0, 100
+    )
+    theirs = clean_store.document_chunks(
+        next(iter(clean_store.document_ids("it-orphans-other", "threads"))), 0, 1
+    )[0]
+
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="person:ethan-malik", name="Ethan Malik", type="person"),
+                Entity(id="product:orrery", name="Orrery", type="product"),
+                Entity(id="company:orrery-labs", name="Orrery Labs", type="company"),
+            ],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="person:ethan-malik")],
+            relations=[
+                Relation(
+                    source_id="company:orrery-labs",
+                    target_id="product:orrery",
+                    type="BUILDS",
+                    chunk_id=theirs.id,  # the other persona's passage carries this evidence
+                )
+            ],
+        )
+    )
+
+    # The two nodes the other persona's relation holds are left alone, mentioned or not.
+    assert clean_store.delete_orphan_entities("it-orphans", dry_run=True) == 0
+    assert clean_store.delete_orphan_entities("it-orphans") == 0
+
+    # Once that persona goes, its relation holds nothing and both nodes are sweepable -- which
+    # `delete_persona` does itself, at the end.
+    clean_store.delete_persona("it-orphans-other")
+    assert clean_store.run_readonly_cypher(
+        "MATCH (e:Entity) WHERE e.id STARTS WITH 'company:' OR e.id STARTS WITH 'product:' "
+        "RETURN count(e) AS n"
+    ) == [{"n": 0}]
+    assert clean_store.delete_orphan_entities("it-orphans") == 0  # the mentioned node stays
+
+    # A re-ingest replaces the passages, so the entity they mentioned is now evidence for
+    # nothing and goes with them.
+    again = pipeline.ingest(sample_corpus, persona, thread_source)
+
+    assert again.orphans_removed == 1
+    assert clean_store.run_readonly_cypher(
+        "MATCH (e:Entity {id: 'person:ethan-malik'}) RETURN count(e) AS n"
+    ) == [{"n": 0}]
+    # and the corrected spelling now takes the id instead of colliding with the stale one
+    assert (
+        clean_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id="person:ethan-malik", name="Ethan Mollick")])
+        )
+        == []
+    )
+    assert clean_store.run_readonly_cypher(
+        "MATCH (e:Entity {id: 'person:ethan-malik'}) RETURN e.name AS name"
+    ) == [{"name": "Ethan Mollick"}]
+
+
+def test_a_stale_node_adopts_the_incoming_name_on_neo4j(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """The other half of the collision contract: what makes a node stale rather than held.
+
+    Held in the in-memory store by the test of the same name in
+    ``tests/unit/test_pipeline_and_store.py``.
+    """
+    persona = PersonaSpec(id="it-stale", name="IT Stale", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
+    chunk_id = clean_store.document_chunks(
+        next(iter(clean_store.document_ids("it-stale", "threads"))), 0, 1
+    )[0].id
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="product:orrery", name="Orrery", type="product"),
+                Entity(id="product:halcyon", name="Halcyon", type="product", aliases=["Halcyon+"]),
+            ],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="product:lumenta")],
+        )
+    )
+
+    # Mentioned: the node stands and the incoming name is reported.
+    held = clean_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="product:lumenta", name="Lumenta!", type="product")])
+    )
+    assert [c.line() for c in held] == ["Lumenta! kept as Lumenta"]
+
+    # Unmentioned but aliased: a person said those spellings are one thing, so it still stands.
+    aliased = clean_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="product:halcyon", name="Halcyon!", type="product")])
+    )
+    assert [c.line() for c in aliased] == ["Halcyon! kept as Halcyon"]
+
+    # Unmentioned and unaliased: stale, so the incoming name takes the id.
+    assert (
+        clean_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id="product:orrery", name="Orrery!", type="product")])
+        )
+        == []
+    )
+    assert clean_store.run_readonly_cypher(
+        "MATCH (e:Entity) WHERE e.id IN $ids RETURN e.id AS id, e.name AS name ORDER BY id",
+        {"ids": ["product:halcyon", "product:lumenta", "product:orrery"]},
+    ) == [
+        {"id": "product:halcyon", "name": "Halcyon"},
+        {"id": "product:lumenta", "name": "Lumenta"},
+        {"id": "product:orrery", "name": "Orrery!"},
+    ]
+    clean_store.delete_orphan_entities("it-stale")

@@ -330,3 +330,62 @@ def test_ingest_refuses_an_invalid_documents_source(
     )
     assert allowed.exit_code == 0, allowed.output
     assert cli_context.store.stats().documents == 2
+
+
+def test_entities_prune_reports_what_it_removed_and_a_dry_run_writes_nothing(
+    cli_context: AppContext, ingested: IngestReport
+) -> None:
+    """`graphrag entities prune` over a graph loaded from a snapshot, where ingest never ran."""
+    from graphrag.models import Enrichment, Entity, Mention
+
+    doc = cli_context.store.list_documents("test-pm", speaker="Ada North")[0]
+    chunk_id = cli_context.store.document_chunks(doc.id, 0, 1)[0].id
+    cli_context.store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id="product:lumenta", name="Lumenta", type="product"),
+                Entity(id="product:orrery", name="Orrery", type="product"),
+            ],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="product:lumenta")],
+        )
+    )
+
+    dry = runner.invoke(app, ["entities", "prune", "test-pm", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "would remove 1 orphaned entities" in dry.stdout
+    assert cli_context.store.stats().entities == 2  # a dry run wrote nothing
+
+    result = runner.invoke(app, ["entities", "prune", "test-pm", "--no-export"])
+
+    assert result.exit_code == 0, result.output
+    assert "removed 1 orphaned entities" in result.stdout
+    assert cli_context.store.stats().entities == 1
+
+
+def test_ingest_says_how_many_orphaned_entities_a_re_ingest_removed(
+    cli_context: AppContext, sample_corpus: Path
+) -> None:
+    """The summary line a re-ingest prints once the passages an entity hung off are replaced."""
+    from graphrag.models import Enrichment, Entity, Mention
+
+    first = runner.invoke(app, ["ingest", str(sample_corpus), "--persona", "test-pm"])
+    assert first.exit_code == 0, first.output
+    assert "orphaned entities" not in first.stdout  # nothing to sweep on a first ingest
+    doc = cli_context.store.list_documents("test-pm", speaker="Ada North")[0]
+    cli_context.store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="person:ethan-malik", name="Ethan Malik", type="person")],
+            mentions=[
+                Mention(
+                    chunk_id=cli_context.store.document_chunks(doc.id, 0, 1)[0].id,
+                    entity_id="person:ethan-malik",
+                )
+            ],
+        )
+    )
+
+    again = runner.invoke(app, ["ingest", str(sample_corpus), "--persona", "test-pm"])
+
+    assert again.exit_code == 0, again.output
+    assert "removed 1 orphaned entities" in again.stdout
+    assert cli_context.store.stats().entities == 0

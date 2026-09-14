@@ -306,19 +306,25 @@ class Neo4jGraphStore:
                 rows=rows[i : i + BATCH],
             )
 
-    def _entities_by_id(self, ids: set[str]) -> list[Entity]:
-        """The entity nodes these ids name, as models. Ids nobody holds are simply absent.
+    def _entities_by_id(self, ids: set[str]) -> dict[str, tuple[Entity, int]]:
+        """The entity nodes these ids name and how many passages mention each, as models.
 
-        ``type`` is guarded rather than trusted: a node edited by hand in the browser can carry
-        anything, and an import of hundreds of files should not stop on one bad property.
+        Ids nobody holds are simply absent. The mention count rides along because
+        ``merge_entity`` needs it to tell a node that stands for something from one a re-ingest
+        emptied out. ``type`` is guarded rather than trusted: a node edited by hand in the
+        browser can carry anything, and an import of hundreds of files should not stop on one
+        bad property.
         """
-        return [
-            Entity(
-                id=row["id"],
-                name=row["name"],
-                type=row["type"] if row["type"] in ENTITY_TYPES else "other",
-                description=row["description"],
-                aliases=row["aliases"],
+        return {
+            row["id"]: (
+                Entity(
+                    id=row["id"],
+                    name=row["name"],
+                    type=row["type"] if row["type"] in ENTITY_TYPES else "other",
+                    description=row["description"],
+                    aliases=row["aliases"],
+                ),
+                int(row["mentions"]),
             )
             for row in self._read(
                 """
@@ -326,11 +332,12 @@ class Neo4jGraphStore:
                 RETURN e.id AS id, coalesce(e.name, '') AS name,
                        coalesce(e.type, 'other') AS type,
                        coalesce(e.description, '') AS description,
-                       coalesce(e.aliases, []) AS aliases
+                       coalesce(e.aliases, []) AS aliases,
+                       count { (e)<-[:MENTIONS]-() } AS mentions
                 """,
                 ids=sorted(ids),
             )
-        ]
+        }
 
     def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]:
         collisions: list[EntityCollision] = []
@@ -339,13 +346,17 @@ class Neo4jGraphStore:
             # is called something else is a slug collision, and the node keeps its name. The
             # merge itself is done in Python by ``merge_entity`` so both stores decide alike,
             # which is why the write below sets the resolved values outright.
-            held = {
-                row.id: row for row in self._entities_by_id({e.id for e in enrichment.entities})
-            }
+            held = self._entities_by_id({e.id for e in enrichment.entities})
             rows: list[dict[str, Any]] = []
             for entity in enrichment.entities:
-                resolved, collision = merge_entity(held.get(entity.id), entity)
-                held[entity.id] = resolved  # so a second row for this id sees the resolved node
+                found = held.get(entity.id)
+                resolved, collision = merge_entity(
+                    None if found is None else found[0],
+                    entity,
+                    held_mentions=None if found is None else found[1],
+                )
+                # so a second row for this id sees the resolved node, still with its own count
+                held[entity.id] = (resolved, 0 if found is None else found[1])
                 if collision is not None:
                     collisions.append(collision)
                     continue
@@ -520,9 +531,36 @@ class Neo4jGraphStore:
             "DETACH DELETE p, s",
             pid=persona_id,
         )
-        self._run("MATCH (e:Entity) WHERE NOT (e)<-[:MENTIONS]-() DETACH DELETE e")
+        self.delete_orphan_entities(persona_id)
         self._run("MATCH (s:Speaker) WHERE NOT (s)--() DELETE s")
         self._run("MATCH (t:Topic) WHERE NOT (t)<-[:ABOUT]-() DETACH DELETE t")
+
+    def delete_orphan_entities(self, persona_id: str, *, dry_run: bool = False) -> int:
+        """Drop the entity nodes nothing mentions any more. Returns how many went.
+
+        Scoped the way ``merge_entities`` is: entity nodes are shared, so a node another
+        persona's passage still relates to survives even with no mention on it. A relation whose
+        passage is gone holds nothing, so it does not keep its endpoints alive; the RELATED_TO
+        edges of a node that goes are detached with it.
+        """
+        match = """
+            MATCH (e:Entity)
+            WHERE NOT (e)<-[:MENTIONS]-()
+              AND NOT EXISTS {
+                MATCH (e)-[r:RELATED_TO]-()
+                MATCH (c:Chunk {id: r.chunk_id}) WHERE c.persona_id <> $pid
+              }
+        """
+        if dry_run:
+            rows = self._read(match + "RETURN count(e) AS removed", pid=persona_id)
+        else:
+            rows = self._run(
+                match + "WITH collect(e) AS doomed "
+                "FOREACH (e IN doomed | DETACH DELETE e) "
+                "RETURN size(doomed) AS removed",
+                pid=persona_id,
+            )
+        return int(rows[0]["removed"]) if rows else 0
 
     # ------------------------------------------------------------- search
     def vector_search(

@@ -28,6 +28,8 @@ class IngestReport:
     chunks: int = 0
     seconds: float = 0.0
     embedding_model: str = ""
+    orphans_removed: int = 0
+    """Entity nodes deleted because the re-ingest left nothing mentioning them."""
     skipped: list[str] = field(default_factory=list)
     flagged: list[tuple[str, str]] = field(default_factory=list)
     """``(document path, one-line reason)`` for files whose raw text looks like an injection
@@ -77,6 +79,10 @@ class IngestPipeline:
 
         all_docs = list(self._store.iter_documents(persona.id))
         self._store.upsert_topic_cooccurrence(topic_cooccurrence(all_docs))
+        # Replacing a document deleted the mentions on its passages. An entity those mentions
+        # were the only evidence for is left holding its id and nothing else, so the next
+        # extraction pass would land on the stale node instead of creating its own.
+        report.orphans_removed = self._store.delete_orphan_entities(persona.id)
         report.seconds = time.perf_counter() - started
         return report
 
