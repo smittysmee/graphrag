@@ -11,6 +11,7 @@ from graphrag.models import (
     Enrichment,
     Entity,
     EntityChunk,
+    EntityCollision,
     EntityMention,
     GraphStats,
     MentionStance,
@@ -37,7 +38,12 @@ class GraphStore(Protocol):
     def upsert_documents(self, documents: Sequence[Document]) -> None: ...
     def upsert_chunks(self, chunks: Sequence[Chunk], embeddings: Matrix) -> None: ...
     def upsert_topic_cooccurrence(self, pairs: Sequence[tuple[str, str, int]]) -> None: ...
-    def upsert_enrichment(self, enrichment: Enrichment) -> None: ...
+    # Write entities, mentions and relations. An incoming entity whose id already names a node
+    # under a different spelling (compared case- and whitespace-folded, and against the node's
+    # recorded `aliases`) never renames it: the node stands, its mentions and relations still
+    # attach, and the incoming name comes back as an `EntityCollision` for the caller to report.
+    # Saying two spellings are one thing is the alias table's job, not a writer's.
+    def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]: ...
     # Fold the alias spellings of one entity into a single canonical node: re-point this
     # persona's MENTIONS and RELATED_TO edges, merge the mentions, record `aliases` on the
     # canonical node and delete the alias nodes nothing else holds. Returns mentions moved.

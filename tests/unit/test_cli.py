@@ -204,6 +204,33 @@ def test_enrich_import_from_agent_json(
     assert cli_context.store.stats().entities == 2  # dry run wrote nothing
 
 
+def test_enrich_import_says_when_a_name_lands_on_another_entitys_id(
+    cli_context: AppContext, ingested: IngestReport, tmp_path: Path
+) -> None:
+    """The line a reviewer acts on. The import succeeds; the graph is not renamed behind them."""
+    doc = cli_context.store.list_documents("test-pm", speaker="Ada North")[0]
+
+    def write(name: str) -> Path:
+        file = tmp_path / f"{name.strip('!')}.json"
+        file.write_text(
+            json.dumps(
+                {
+                    "doc_id": doc.id,
+                    "entities": [{"name": name, "type": "product"}],
+                    "relations": [],
+                }
+            )
+        )
+        return file
+
+    assert runner.invoke(app, ["enrich-import", "test-pm", str(write("Lumenta"))]).exit_code == 0
+    result = runner.invoke(app, ["enrich-import", "test-pm", str(write("Lumenta!"))])
+
+    assert result.exit_code == 0, result.output
+    assert "1 id collisions" in result.stdout
+    assert "collision: Lumenta! kept as Lumenta" in result.output
+
+
 def test_ingest_reports_flagged_files_after_the_summary(
     cli_context: AppContext, sample_corpus: Path
 ) -> None:

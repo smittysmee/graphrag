@@ -18,6 +18,7 @@ from graphrag.models import (
     Enrichment,
     Entity,
     EntityChunk,
+    EntityCollision,
     EntityMention,
     GraphStats,
     Mention,
@@ -32,6 +33,7 @@ from graphrag.models import (
     Stance,
     TopicCount,
     TopicEdge,
+    merge_entity,
 )
 
 TOKEN = re.compile(r"[a-z0-9]+")
@@ -104,19 +106,13 @@ class InMemoryGraphStore:
             key = (a, b) if a <= b else (b, a)
             self.cooccurrence[key] = weight
 
-    def upsert_enrichment(self, enrichment: Enrichment) -> None:
+    def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]:
+        collisions: list[EntityCollision] = []
         for entity in enrichment.entities:
-            held = self.entities.get(entity.id)
-            self.entities[entity.id] = (
-                entity
-                if held is None
-                else entity.model_copy(
-                    update={
-                        "description": entity.description or held.description,
-                        "aliases": entity.aliases or held.aliases,
-                    }
-                )
-            )
+            resolved, collision = merge_entity(self.entities.get(entity.id), entity)
+            self.entities[entity.id] = resolved
+            if collision is not None:
+                collisions.append(collision)
         existing = {(m.chunk_id, m.entity_id): i for i, m in enumerate(self.mentions)}
         for mention in enrichment.mentions:
             key = (mention.chunk_id, mention.entity_id)
@@ -133,6 +129,7 @@ class InMemoryGraphStore:
         for rel in enrichment.relations:
             if (rel.source_id, rel.target_id, rel.type, rel.chunk_id) not in seen:
                 self.relations.append(rel)
+        return collisions
 
     def merge_entities(self, persona_id: str, canonical: str, aliases: Sequence[str]) -> int:
         """Fold every alias spelling of ``canonical`` into one node. Returns mentions moved.

@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from graphrag.extract.llm import (
     ExtractedEntity,
     ExtractedRelation,
@@ -7,7 +10,7 @@ from graphrag.extract.llm import (
     windows,
 )
 from graphrag.graph.memory_store import InMemoryGraphStore
-from graphrag.models import Chunk, PersonaSpec
+from graphrag.models import Chunk, Enrichment, Entity, PersonaSpec
 from graphrag.pipeline import IngestReport
 from graphrag.retrieve.search import Retriever
 
@@ -99,3 +102,59 @@ def test_match_chunks_tiers() -> None:
     assert match_chunks("Retention", window) == (["d#1"], "exact")
     assert match_chunks("Lenny Rachitsky", window) == (["d#0"], "loose")
     assert match_chunks("Growth loops", window) == (["d#0"], "none")
+
+
+def test_import_reports_a_name_whose_id_another_entity_already_holds(
+    ingested: IngestReport, memory_store: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    """One `collision:` line per name the graph declined to rename, per file.
+
+    The import still succeeds: the mentions are keyed on the id and they landed. What the line
+    says is that a reviewer now has to choose -- a name whose id differs, or an entry in the
+    persona's ``aliases.yaml`` declaring the two spellings one thing.
+    """
+    from graphrag.extract.importer import import_extraction_file
+
+    doc = memory_store.list_documents("test-pm", speaker="Ada North")[0]
+    memory_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="product:lumenta", name="Lumenta", type="product")])
+    )
+    file = tmp_path / "ada.json"
+    file.write_text(
+        json.dumps(
+            {
+                "doc_id": doc.id,
+                "entities": [
+                    {"name": "Lumenta", "type": "product"},
+                    # An older file that spelled the name without the punctuation carrying it.
+                    {"name": "lumenta ", "type": "product"},
+                ],
+                "relations": [],
+            }
+        )
+    )
+
+    clean = import_extraction_file(memory_store, file)
+    assert clean.ok and clean.collisions == ()
+
+    # Punctuation the id rule does not spell out still folds away, which is exactly the case
+    # the store's guard is the second line of defence for.
+    rival = tmp_path / "rival.json"
+    rival.write_text(
+        json.dumps(
+            {
+                "doc_id": doc.id,
+                "entities": [{"name": "Lumenta!", "type": "product"}],
+                "relations": [],
+            }
+        )
+    )
+    assert Entity.make_id("Lumenta!", "product") == "product:lumenta"
+
+    dry = import_extraction_file(memory_store, rival, dry_run=True)
+    assert dry.ok and dry.collisions == ()  # a dry run writes nothing, so nothing collided
+
+    written = import_extraction_file(memory_store, rival)
+    assert written.ok
+    assert written.collisions == ("Lumenta! kept as Lumenta",)
+    assert memory_store.entities["product:lumenta"].name == "Lumenta"

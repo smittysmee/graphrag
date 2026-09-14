@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator
 
-from graphrag.textutil import slugify
+from graphrag.textutil import entity_slug, fold_name
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
@@ -139,6 +139,8 @@ class LoadedDocument(BaseModel):
 EntityType = Literal[
     "person", "company", "product", "framework", "concept", "book", "metric", "regulation", "other"
 ]
+#: The same values as a tuple, for a reader that has to check a string from outside the models.
+ENTITY_TYPES: tuple[str, ...] = get_args(EntityType)
 
 #: What a passage says about the entity it mentions. ``neutral`` is a deliberate reading, not the
 #: absence of one: a mention with no annotation at all carries no stance.
@@ -156,7 +158,65 @@ class Entity(BaseModel):
 
     @staticmethod
     def make_id(name: str, entity_type: str) -> str:
-        return f"{entity_type}:{slugify(name)}"
+        """``<type>:<slug>``, where the slug keeps the punctuation that tells two names apart.
+
+        See :func:`graphrag.textutil.entity_slug`: ``Acme+`` and ``Acme`` are two entities and
+        get two ids. Deterministic, so re-running extraction over the same corpus re-creates
+        the same ids.
+        """
+        return f"{entity_type}:{entity_slug(name)}"
+
+
+class EntityCollision(BaseModel):
+    """An incoming entity whose id already belongs to a node under a different name.
+
+    Reported rather than resolved. Two spellings are one thing only when a person says so in
+    the persona's ``aliases.yaml``; a writer that quietly renamed the node on the way past would
+    be making that claim on its own, and the mentions of both would end up under whichever name
+    was imported last.
+    """
+
+    entity_id: str
+    incoming: str
+    existing: str
+
+    def line(self) -> str:
+        """How the importer reports it: ``<incoming> kept as <existing>``."""
+        return f"{self.incoming} kept as {self.existing}"
+
+
+def merge_entity(held: Entity | None, incoming: Entity) -> tuple[Entity, EntityCollision | None]:
+    """The node an incoming entity should leave behind, and the collision to report.
+
+    The store contract behind :meth:`GraphStore.upsert_enrichment`, shared so the Neo4j store
+    and the in-memory one decide identically:
+
+    * nothing held that id yet: the incoming entity becomes the node;
+    * the two names fold together (case and whitespace), or the incoming one is already
+      recorded among the node's ``aliases``: an ordinary upsert, and the node keeps the name a
+      person gave it rather than taking the alias spelling;
+    * otherwise: the node stands exactly as it is and the incoming name comes back as an
+      :class:`EntityCollision`. The mentions and relations still attach -- they are keyed on the
+      id -- so the reviewer gets a report to act on, not a half-written import.
+    """
+    # A node with no name at all cannot be said to hold a different one, so it is simply
+    # written over; nothing this package creates leaves an entity unnamed.
+    if held is None or not held.name.strip():
+        return incoming, None
+    folded = fold_name(incoming.name)
+    if folded == fold_name(held.name):
+        name = incoming.name
+    elif folded in {fold_name(alias) for alias in held.aliases}:
+        name = held.name
+    else:
+        return held, EntityCollision(entity_id=held.id, incoming=incoming.name, existing=held.name)
+    return incoming.model_copy(
+        update={
+            "name": name,
+            "description": incoming.description or held.description,
+            "aliases": incoming.aliases or held.aliases,
+        }
+    ), None
 
 
 class Mention(BaseModel):

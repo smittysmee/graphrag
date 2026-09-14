@@ -279,6 +279,45 @@ There is also an unattended path that calls the API directly, `make enrich PERSO
 which needs `ANTHROPIC_API_KEY` in `.env`. The agent path needs no key and was used for the
 existing corpus.
 
+#### Entity ids, and what an `id collision` line means
+
+An entity's id is `<type>:<slug of the name>`, and the slug now spells out the three characters
+that tell two names apart rather than dropping them: `+` becomes `plus`, `&` becomes `and`, `#`
+becomes `sharp`, each as a word of its own.
+
+| Name       | Id                       |
+| ---------- | ------------------------ |
+| `Lumenta`  | `product:lumenta`        |
+| `Lumenta+` | `product:lumenta-plus`   |
+| `K++`      | `product:k-plus-plus`    |
+| `Verro&Hale` | `company:verro-and-hale` |
+
+Before this, `Lumenta+` and `Lumenta` shared one id, and importing the second renamed the first
+one's node and swallowed its mentions. **Ids changed for names holding those three characters,
+and there is no migration.** A snapshot exported before the change keeps the old ids, and nothing
+re-derives them on load; a full re-ingest and re-import of the persona re-creates them. Every
+other name keeps the id it already has. Re-ingest with:
+
+```bash
+make ingest PERSONA=<id> SRC=data/raw/<id>
+docker compose run --rm graphrag graphrag enrich-import <id> /app/data/enrichment/<id>/**/*.json
+```
+
+Punctuation outside that list still folds away, so `Lumenta!` and `Lumenta` still share an id.
+The import no longer resolves that quietly. When an incoming name lands on an id a node already
+holds under a different name, the node keeps its name, the mentions still attach, and the import
+prints one line per name:
+
+```
+collision: Lumenta! kept as Lumenta
+```
+
+Names are compared ignoring case and how the whitespace fell, and against the spellings already
+recorded on the node as `aliases`, so re-importing a known alias spelling is not a collision.
+Act on the line one of two ways: give the entity a name whose id differs, or -- if the two
+spellings really are one thing -- say so in the persona's `aliases.yaml` (below), which is the
+only sanctioned way to merge them. `make sync` prints the same line while it works.
+
 ### Add the speaker layer
 
 Transcripts arrive with speakers, because their loader parses `Name (00:00:00):` turns. Prose

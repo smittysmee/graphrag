@@ -461,7 +461,12 @@ def _pending(
 def _reimport(
     store: GraphStore, files: list[Path], say: Progress, aliases: AliasTable, *, reingested: bool
 ) -> tuple[int, tuple[str, ...]]:
-    """Put a source's pending extraction files back into the graph."""
+    """Put a source's pending extraction files back into the graph.
+
+    An id collision is said out loud rather than counted as an error: the file was imported and
+    its mentions landed, but one name is now hanging off a node called something else, and a
+    sync that swallowed that would be the silence this reporting exists to break.
+    """
     if files:
         what = "re-importing" if reingested else "importing"
         say(f"{what} {len(files)} extraction files")
@@ -471,6 +476,8 @@ def _reimport(
         result = import_extraction_file(store, path, aliases=aliases)
         if result.ok:
             imported += 1
+            for collision in result.collisions:
+                say(f"{path.name}: collision: {collision}")
         else:
             errors.append(f"{path.name}: {result.error}")
     return imported, tuple(errors)

@@ -404,3 +404,116 @@ def test_entity_mention_rows_carry_the_stance_and_the_passage_speakers(
     ]
     assert layered.entity_mention_rows("test-layers", "absent") == []
     assert layered.entity_mention_rows("other-persona") == []
+
+
+# ------------------------------------------------------- entity ids and name collisions
+
+
+def test_upsert_keeps_the_name_a_node_already_has_and_reports_the_collision(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """The store contract behind the `collision:` line, and the bug it closes.
+
+    Two names that a slug cannot tell apart used to land on one id, and the second import
+    silently renamed the first one's node. Now the node stands, the mentions still attach, and
+    the incoming name comes back for the importer to report. Only `aliases.yaml` may say that
+    two spellings are one thing.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    docs = sorted(memory_store.document_ids("test-pm"))
+    first, second = (memory_store.document_chunks(d, 0, 1)[0].id for d in docs[:2])
+    assert (
+        memory_store.upsert_enrichment(
+            Enrichment(
+                entities=[Entity(id="product:lumenta", name="Lumenta", type="product")],
+                mentions=[Mention(chunk_id=first, entity_id="product:lumenta")],
+            )
+        )
+        == []
+    )
+
+    # A different product whose id was hand-written onto the first one's, as an old file holds it.
+    collisions = memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(
+                    id="product:lumenta",
+                    name="Lumenta Pro",
+                    type="product",
+                    description="A different product entirely.",
+                )
+            ],
+            mentions=[Mention(chunk_id=second, entity_id="product:lumenta")],
+        )
+    )
+
+    assert [(c.entity_id, c.incoming, c.existing) for c in collisions] == [
+        ("product:lumenta", "Lumenta Pro", "Lumenta")
+    ]
+    assert collisions[0].line() == "Lumenta Pro kept as Lumenta"
+    held = memory_store.entities["product:lumenta"]
+    assert held.name == "Lumenta"  # the node was not renamed
+    assert held.description == ""  # nor described by the other entity
+    # The mentions still landed, which is what makes the report worth acting on.
+    assert {m.chunk_id for m in memory_store.mentions} == {first, second}
+
+
+def test_upsert_does_not_call_a_known_alias_spelling_a_collision(
+    ingested: IngestReport, memory_store: InMemoryGraphStore
+) -> None:
+    """A node that records a spelling has already been told the two are one thing.
+
+    Re-importing a file that uses the alias spelling is an ordinary upsert, and the node keeps
+    the canonical name a person chose rather than taking the alias.
+    """
+    doc_id = sorted(memory_store.document_ids("test-pm"))[0]
+    chunk_id = memory_store.document_chunks(doc_id, 0, 1)[0].id
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(
+                    id="product:northwind-ledger",
+                    name="Northwind Ledger",
+                    type="product",
+                    aliases=["Northwind"],
+                )
+            ]
+        )
+    )
+
+    collisions = memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="product:northwind-ledger", name="northwind", type="product")],
+            mentions=[Mention(chunk_id=chunk_id, entity_id="product:northwind-ledger")],
+        )
+    )
+
+    assert collisions == []
+    assert memory_store.entities["product:northwind-ledger"].name == "Northwind Ledger"
+
+
+def test_upsert_treats_a_case_or_spacing_difference_as_the_same_name(
+    memory_store: InMemoryGraphStore,
+) -> None:
+    memory_store.upsert_enrichment(
+        Enrichment(entities=[Entity(id="metric:retention", name="Retention", type="metric")])
+    )
+
+    assert (
+        memory_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id="metric:retention", name="  RETENTION ", type="metric")])
+        )
+        == []
+    )
+
+
+def test_two_punctuated_names_in_one_extraction_stay_two_nodes(
+    memory_store: InMemoryGraphStore,
+) -> None:
+    """End to end over the id rule: the product and its "+" variant are two entities."""
+    plain = Entity(id=Entity.make_id("Lumenta", "product"), name="Lumenta", type="product")
+    plus = Entity(id=Entity.make_id("Lumenta+", "product"), name="Lumenta+", type="product")
+
+    assert memory_store.upsert_enrichment(Enrichment(entities=[plain, plus])) == []
+    assert sorted(memory_store.entities) == ["product:lumenta", "product:lumenta-plus"]

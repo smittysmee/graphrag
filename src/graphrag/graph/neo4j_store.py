@@ -19,12 +19,14 @@ from graphrag.embed.base import Matrix, Vector
 from graphrag.graph.schema import FULLTEXT_INDEX, VECTOR_INDEX, lucene_escape, schema_statements
 from graphrag.graph.vectors import stack_means
 from graphrag.models import (
+    ENTITY_TYPES,
     Chunk,
     ChunkFacets,
     Document,
     Enrichment,
     Entity,
     EntityChunk,
+    EntityCollision,
     EntityMention,
     GraphStats,
     Mention,
@@ -39,6 +41,7 @@ from graphrag.models import (
     Stance,
     TopicCount,
     TopicEdge,
+    merge_entity,
 )
 
 BATCH = 500
@@ -303,20 +306,60 @@ class Neo4jGraphStore:
                 rows=rows[i : i + BATCH],
             )
 
-    def upsert_enrichment(self, enrichment: Enrichment) -> None:
-        if enrichment.entities:
-            self._run(
-                """
-                UNWIND $rows AS row
-                MERGE (e:Entity {id: row.id})
-                SET e.name = row.name, e.type = row.type,
-                    e.description = CASE WHEN row.description <> '' THEN row.description
-                                         ELSE coalesce(e.description, '') END,
-                    e.aliases = CASE WHEN size(row.aliases) > 0 THEN row.aliases
-                                     ELSE coalesce(e.aliases, []) END
-                """,
-                rows=[e.model_dump() for e in enrichment.entities],
+    def _entities_by_id(self, ids: set[str]) -> list[Entity]:
+        """The entity nodes these ids name, as models. Ids nobody holds are simply absent.
+
+        ``type`` is guarded rather than trusted: a node edited by hand in the browser can carry
+        anything, and an import of hundreds of files should not stop on one bad property.
+        """
+        return [
+            Entity(
+                id=row["id"],
+                name=row["name"],
+                type=row["type"] if row["type"] in ENTITY_TYPES else "other",
+                description=row["description"],
+                aliases=row["aliases"],
             )
+            for row in self._read(
+                """
+                MATCH (e:Entity) WHERE e.id IN $ids
+                RETURN e.id AS id, coalesce(e.name, '') AS name,
+                       coalesce(e.type, 'other') AS type,
+                       coalesce(e.description, '') AS description,
+                       coalesce(e.aliases, []) AS aliases
+                """,
+                ids=sorted(ids),
+            )
+        ]
+
+    def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]:
+        collisions: list[EntityCollision] = []
+        if enrichment.entities:
+            # Read the nodes these ids already name before writing any of them: an id whose node
+            # is called something else is a slug collision, and the node keeps its name. The
+            # merge itself is done in Python by ``merge_entity`` so both stores decide alike,
+            # which is why the write below sets the resolved values outright.
+            held = {
+                row.id: row for row in self._entities_by_id({e.id for e in enrichment.entities})
+            }
+            rows: list[dict[str, Any]] = []
+            for entity in enrichment.entities:
+                resolved, collision = merge_entity(held.get(entity.id), entity)
+                held[entity.id] = resolved  # so a second row for this id sees the resolved node
+                if collision is not None:
+                    collisions.append(collision)
+                    continue
+                rows.append(resolved.model_dump())
+            if rows:
+                self._run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (e:Entity {id: row.id})
+                    SET e.name = row.name, e.type = row.type,
+                        e.description = row.description, e.aliases = row.aliases
+                    """,
+                    rows=rows,
+                )
         if enrichment.mentions:
             self._run(
                 """
@@ -337,6 +380,7 @@ class Neo4jGraphStore:
                 """,
                 rows=[r.model_dump() for r in enrichment.relations],
             )
+        return collisions
 
     def merge_entities(self, persona_id: str, canonical: str, aliases: Sequence[str]) -> int:
         """Fold every alias spelling of ``canonical`` into one node. Returns mentions moved.

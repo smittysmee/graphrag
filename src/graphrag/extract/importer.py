@@ -31,6 +31,11 @@ class ImportResult:
     passage at all (their mention falls back to the first chunk), and ``dangling`` relations
     point at an entity the file never declared. ``renamed`` names were folded onto a canonical
     spelling by the persona's alias table.
+
+    ``collisions`` are the names whose id already belonged to a node called something else --
+    ``<incoming> kept as <existing>``. The graph was not renamed and the mentions still landed,
+    so the fix is a human one: give the entity a name whose id differs, or say in the persona's
+    ``aliases.yaml`` that the two spellings are one thing.
     """
 
     path: Path
@@ -43,6 +48,7 @@ class ImportResult:
     unmatched: tuple[str, ...] = ()
     dangling: tuple[str, ...] = ()
     renamed: tuple[str, ...] = ()
+    collisions: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -79,8 +85,7 @@ def import_extraction_file(
     tiers = {e.name: match_chunks(e.name.strip(), chunks)[1] for e in payload.entities}
     names = {e.name.strip().lower() for e in payload.entities}
     enrichment = apply_aliases(result_to_enrichment(payload, chunks), aliases)
-    if not dry_run:
-        store.upsert_enrichment(enrichment)
+    collisions = () if dry_run else tuple(c.line() for c in store.upsert_enrichment(enrichment))
     return ImportResult(
         path=path,
         doc_id=payload.doc_id,
@@ -99,6 +104,7 @@ def import_extraction_file(
             for e in payload.entities
             if fold_name(aliases.canonical(e.name)) != fold_name(e.name)
         ),
+        collisions=collisions,
     )
 
 

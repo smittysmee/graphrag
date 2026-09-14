@@ -147,3 +147,52 @@ def test_speaker_dates_stances_and_facets_ride_the_snapshot(
     stance = fresh.mention_stances("test-docs")[0]
     assert (stance.name, stance.stance) == ("Handbook", "complaint")
     assert fresh.entities["concept:handbook"].aliases == ["hand book"]
+
+
+def test_punctuated_entity_ids_survive_the_round_trip(
+    tmp_path: Path,
+    ingested: IngestReport,
+    memory_store: InMemoryGraphStore,
+    persona: PersonaSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """A product and its "+" variant are two nodes in the snapshot as well as in the graph.
+
+    Ids are carried verbatim, not re-derived on load, so a teammate who loads the snapshot gets
+    the same two nodes rather than whichever one the slug would have collapsed them onto.
+    """
+    from graphrag.models import Enrichment, Entity, Mention
+
+    docs = sorted(memory_store.document_ids(persona.id))
+    first, second = (memory_store.document_chunks(d, 0, 1)[0].id for d in docs[:2])
+    ids = [Entity.make_id("Lumenta", "product"), Entity.make_id("Lumenta+", "product")]
+    assert ids == ["product:lumenta", "product:lumenta-plus"]
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id=ids[0], name="Lumenta", type="product"),
+                Entity(id=ids[1], name="Lumenta+", type="product"),
+            ],
+            mentions=[
+                Mention(chunk_id=first, entity_id=ids[0]),
+                Mention(chunk_id=second, entity_id=ids[1]),
+            ],
+        )
+    )
+
+    root = tmp_path / "snapshots"
+    snap.export_snapshot(
+        memory_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+    fresh = InMemoryGraphStore()
+    snap.load_snapshot(
+        fresh, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+
+    loaded = fresh.enrichment_for_persona(persona.id)
+    assert sorted(e.id for e in loaded.entities) == ids
+    assert {(e.id, e.name) for e in loaded.entities} == {
+        ("product:lumenta", "Lumenta"),
+        ("product:lumenta-plus", "Lumenta+"),
+    }
+    assert len(loaded.mentions) == 2

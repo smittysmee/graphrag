@@ -560,6 +560,11 @@ def enrich_import(
                     if result.dangling
                     else ""
                 )
+                + (
+                    f"; [yellow]{len(result.collisions)} id collisions[/yellow]"
+                    if result.collisions
+                    else ""
+                )
             )
             for name in result.loose:
                 err.print(f"  loose: {name}")
@@ -569,6 +574,8 @@ def enrich_import(
                 err.print(f"  dangling: {rel}")
             for renamed in result.renamed:
                 err.print(f"  alias: {renamed}")
+            for collision in result.collisions:
+                err.print(f"  collision: {collision}")
         verb = "validated" if dry_run else "imported"
         console.print(
             f"[green]{verb}[/green] {len(files) - problems} files: {total_entities} entities, "

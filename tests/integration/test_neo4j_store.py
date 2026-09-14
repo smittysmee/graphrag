@@ -372,3 +372,86 @@ def test_dated_speaker_edges_annotations_and_aliases_on_neo4j(
     ] == ["ledger-ann", "quill-maker"]
     assert clean_store.mention_stances("it-layers")[0].stance == "complaint"
     assert clean_store.entities_for_chunks([chunks[0].id])[0].aliases == ["hand book"]
+
+
+def test_an_id_collision_never_renames_an_entity_on_neo4j(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """The Neo4j half of the collision contract.
+
+    The in-memory store is held to the same assertions in
+    ``tests/unit/test_pipeline_and_store.py``. Two names a slug cannot tell apart land on one
+    id; the node keeps the name it has, the mentions still attach, and the incoming name comes
+    back for the importer to report.
+    """
+    persona = PersonaSpec(id="it-ids", name="IT Ids", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
+    doc_id = next(iter(clean_store.document_ids("it-ids", "threads")))
+    chunks = clean_store.document_chunks(doc_id, 0, 100)
+
+    # The id rule keeps the product and its "+" variant apart in the first place.
+    plain = Entity.make_id("Lumenta", "product")
+    plus = Entity.make_id("Lumenta+", "product")
+    assert (plain, plus) == ("product:lumenta", "product:lumenta-plus")
+    assert (
+        clean_store.upsert_enrichment(
+            Enrichment(
+                entities=[
+                    Entity(id=plain, name="Lumenta", type="product"),
+                    Entity(id=plus, name="Lumenta+", type="product"),
+                ],
+                mentions=[
+                    Mention(chunk_id=chunks[0].id, entity_id=plain),
+                    Mention(chunk_id=chunks[0].id, entity_id=plus),
+                ],
+            )
+        )
+        == []
+    )
+    assert {e.id for e in clean_store.entities_for_chunks([chunks[0].id])} == {plain, plus}
+
+    # Punctuation the rule does not spell out still folds, and the guard catches it.
+    collisions = clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(
+                    id=Entity.make_id("Lumenta!", "product"),
+                    name="Lumenta!",
+                    type="product",
+                    description="Something else.",
+                )
+            ],
+            mentions=[Mention(chunk_id=chunks[-1].id, entity_id=plain)],
+        )
+    )
+
+    assert [(c.entity_id, c.incoming, c.existing) for c in collisions] == [
+        (plain, "Lumenta!", "Lumenta")
+    ]
+    assert collisions[0].line() == "Lumenta! kept as Lumenta"
+    held = clean_store.run_readonly_cypher(
+        "MATCH (e:Entity {id: $id}) RETURN e.name AS name, coalesce(e.description, '') AS about",
+        {"id": plain},
+    )
+    assert held == [{"name": "Lumenta", "about": ""}]
+    assert plain in {e.id for e in clean_store.entities_for_chunks([chunks[-1].id])}
+
+    # A spelling the node already records is an ordinary upsert, not a collision.
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id=plain, name="Lumenta", type="product", aliases=["lumenta co"])]
+        )
+    )
+    assert (
+        clean_store.upsert_enrichment(
+            Enrichment(entities=[Entity(id=plain, name="Lumenta Co", type="product")])
+        )
+        == []
+    )
+    kept = clean_store.run_readonly_cypher(
+        "MATCH (e:Entity {id: $id}) RETURN e.name AS name", {"id": plain}
+    )
+    assert kept == [{"name": "Lumenta"}]  # the canonical name, not the alias spelling
