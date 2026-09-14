@@ -76,6 +76,12 @@ name or drop the entity) and **dangling relations** (endpoint not in `entities`:
 the relation). Fix the JSON and re-run; import is idempotent (MERGE by entity id).
 Re-importing everything is safe and takes seconds.
 
+It also lists **id collisions** (`collision: <incoming> kept as <existing>`): the name landed on
+an id another entity already holds, so the graph kept the name it had and did not merge the two.
+Ids keep `+`, `&` and `#` apart (`Lumenta+` is `product:lumenta-plus`), but other punctuation
+still folds, so either give the entity a name whose id differs or, if they really are one thing,
+add the spelling to `personas/<persona>/aliases.yaml`.
+
 ## 5. The three passes that go on top of entities
 
 Extraction records *that* a passage names something. Three further passes record who wrote the
