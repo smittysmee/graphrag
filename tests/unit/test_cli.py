@@ -5,8 +5,10 @@ from typer.testing import CliRunner
 
 from graphrag.app import AppContext
 from graphrag.cli import app
+from graphrag.ingest.validate import MAX_BODY_WORDS
 from graphrag.pipeline import IngestReport
 from tests.conftest import THREAD_POSTS, write_sample_corpus
+from tests.unit.test_validate import GOOD_META, write_capture
 
 runner = CliRunner()
 
@@ -242,3 +244,42 @@ def test_attribution_import_from_agent_json(
     missing = tmp_path / "missing.json"
     missing.write_text(json.dumps({"doc_id": "nope", "posts": []}))
     assert runner.invoke(app, ["attribution-import", "test-docs", str(missing)]).exit_code == 2
+
+
+def test_validate_command_reports_and_merges(cli_context: AppContext, tmp_path: Path) -> None:
+    corpus = tmp_path / "captured"
+    write_capture(corpus, "threads/good.md", meta=GOOD_META)
+    write_capture(corpus, "threads/long.md", meta=GOOD_META, words=MAX_BODY_WORDS + 1)
+    manifest = corpus / "provenance" / "researcher-1.jsonl"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"file": "threads/good.md"}) + "\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["validate", str(corpus), "--merge"])
+    assert result.exit_code == 1, result.output
+    assert "TOO LONG" in result.stdout and "threads/long.md" in result.stdout
+    assert "provenance records: 1; problems: 1" in result.stdout
+    assert (corpus / "provenance" / "provenance.jsonl").exists()
+
+    assert runner.invoke(app, ["validate", str(tmp_path / "nope")]).exit_code == 2
+
+
+def test_ingest_refuses_an_invalid_documents_source(
+    cli_context: AppContext, tmp_path: Path
+) -> None:
+    """A bad capture is invisible once it is a chunk, so `documents` sources are gated here."""
+    corpus = tmp_path / "captured"
+    write_capture(corpus, "docs/good.md", meta=GOOD_META)
+    write_capture(corpus, "docs/long.md", meta=GOOD_META, words=MAX_BODY_WORDS + 1)
+
+    refused = runner.invoke(app, ["ingest", str(corpus), "--persona", "test-docs"])
+    assert refused.exit_code == 2, refused.output
+    assert "1 problem(s) in 2 captured file(s)" in refused.output
+    assert f"TOO LONG ({MAX_BODY_WORDS + 1} words): long.md" in refused.output
+    assert "--allow-invalid" in refused.output
+    assert cli_context.store.stats().documents == 0
+
+    allowed = runner.invoke(
+        app, ["ingest", str(corpus), "--persona", "test-docs", "--allow-invalid"]
+    )
+    assert allowed.exit_code == 0, allowed.output
+    assert cli_context.store.stats().documents == 2

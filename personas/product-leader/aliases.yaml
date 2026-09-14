@@ -1,0 +1,190 @@
+# Alias map for the product-leader persona.
+#
+# Extraction keeps the spelling each passage uses, so one real thing arrives as several Entity
+# nodes and every count over it is low by however many spellings nobody looked for. This table
+# names the canonical spelling and the variants that fold into it.
+#
+# Built from the live graph, not from guesswork:
+#
+#   MATCH (e:Entity)<-[:MENTIONS]-(c:Chunk {persona_id:'product-leader'})
+#   RETURN e.name, e.type, count(c) AS n ORDER BY n DESC
+#
+# then a mechanical sweep for names that collide once case, spacing, hyphens and punctuation are
+# removed, a sweep for `The <title>` against `<title>`, and a sweep for singular against plural.
+# Every group below was checked against those counts before it was written down.
+#
+# Rules this file follows:
+#   - Same-thing only. A group is one company, one product, one person or one book.
+#   - A product is kept apart from the company that makes it, even where the corpus uses one
+#     word for both (Snap/Snapchat, OpenAI/ChatGPT, Anthropic/Claude, Vercel/v0).
+#   - Matching is case-insensitive and whitespace-folded, so case-only and spacing-only variants
+#     fold on their own; they are listed anyway only where the file reads better for it.
+#   - Canonical spelling is the most-mentioned variant, except where a house spelling is
+#     obviously right (37signals, monday.com, Tobi Lütke).
+#   - Anything a reader could argue with goes in the `# review` block at the bottom, unmerged.
+#
+# What this table cannot do: two nodes with the *same* name and different types (Slack the
+# company and Slack the product, Figma the company and Figma the product) are not spelling
+# variants, and folding names cannot touch them. Leave them be, or fix the extraction.
+
+aliases:
+  # ---- companies: spacing, punctuation and house spelling ----
+  37signals:
+    - 37 Signals
+  AngelList:
+    - Angel List
+  Athenahealth:
+    - Athena Health
+  DeepSeek:
+    - deep seek
+  DoubleClick:
+    - Double Click
+  JPMorgan Chase:
+    - JP Morgan Chase
+  Midjourney:
+    - Mid Journey
+    - MidJourney
+  monday.com:
+    - Monday
+  Robinhood:
+    - Robin Hood
+  Y Combinator:
+    - YCombinator
+    - YC
+
+  # ---- products and models ----
+  Amazon Web Services:
+    - AWS
+  ChatGPT:
+    - Chat GPT
+  GPT-3:
+    - GPT3
+  GPT-5:
+    - GPT5
+  GoFood:
+    - go-food
+  Learn Prompting:
+    - LearnPrompting
+  News Feed:
+    - Newsfeed
+  Uber Pool:
+    - uberPOOL
+  VS Code:
+    - VSCode
+
+  # ---- people: short forms, surnames and misspellings ----
+  # Only where the corpus holds exactly one person that form can mean. First names that several
+  # guests share (Tim, Chris, Jason, Patrick, Steve) are in the review block instead.
+  A.G. Lafley:
+    - AG Lafley
+  Andrej Karpathy:
+    - Karpathy
+  Chamath Palihapitiya:
+    - Chamath
+  Dario Amodei:
+    - Dario
+  Des Traynor:
+    - Des
+  Dylan Field:
+    - Dylan
+  Elon Musk:
+    - Elon
+  Jeff Bezos:
+    - Bezos
+  Jensen Huang:
+    - Jensen
+  Marc Benioff:
+    - Benioff
+  Mark Zuckerberg:
+    - Zuck
+  MrBeast:
+    - Mr. Beast
+  Naval Ravikant:
+    - Naval
+  Satya Nadella:
+    - Satya
+  Shishir Mehrotra:
+    - Shishir
+  Sho Kuwamoto:
+    - Sho
+  Sundar Pichai:
+    - Sundar
+  Tim Ferriss:
+    - Tim Ferris
+  # "Reuben" is how one transcript spells Rubin; the surface form is kept as an alias so the
+  # mention still anchors to the passage that uses it.
+  Rick Rubin:
+    - Rick Reuben
+  Tobi Lütke:
+    - Tobias Lütke
+    - Toby Lutke
+    - Tobi
+    - Toby
+
+  # ---- books: the article is dropped as often as it is written ----
+  The Art of War:
+    - Art of War
+  The Challenger Sale:
+    - Challenger Sale
+  The Culture Code:
+    - Culture Code
+  The Design of Everyday Things:
+    - Design of Everyday Things
+  The Hard Thing About Hard Things:
+    - Hard Thing About Hard Things
+  The Innovator's Dilemma:
+    - Innovator's Dilemma
+  The Timeless Way of Building:
+    - Timeless Way of Building
+  The Untethered Soul:
+    - Untethered Soul
+  The White Lotus:
+    - White Lotus
+
+  # ---- concepts, frameworks and metrics ----
+  A/B testing:
+    - AB testing
+    - A-B tests
+    - AB tests
+  account-based marketing:
+    - account based marketing
+  altMBA:
+    - Alt-MBA
+  DAU:
+    - DAUs
+  network effect:
+    - network effects
+  OKRs:
+    - OKR
+  PRD:
+    - PRDs
+  product-led growth:
+    - product led growth
+    - PLG
+  StrengthsFinder:
+    - Strengths Finder
+  two-pizza teams:
+    - two pizza teams
+
+# ---- review -------------------------------------------------------------------------------
+# Candidates the sweeps surfaced that a person still has to rule on. Each one is a real pair in
+# the graph; none is obvious enough to merge unasked. Move a line up into `aliases:` once it is
+# settled, or delete it once it is settled the other way.
+#
+#   Meta / Facebook              — one company renamed, but the corpus also says "Facebook" for
+#                                  the product and for the pre-2021 era. Merging loses that.
+#   Square / Block               — same rename problem, and Square is also a product name.
+#   Snap / Snapchat              — company and product, usually; sometimes used interchangeably.
+#   Bard / Gemini                — renamed model. Passages about Bard are about the old one.
+#   Codeium / Windsurf           — renamed company. Same question as Bard.
+#   Copilot / GitHub Copilot     — "Copilot" is also Microsoft Copilot in some passages.
+#   GPT / GPTs                   — the model family against the custom-GPT feature. Not one thing.
+#   Lean Startup / The Lean Startup — the method (33 mentions) against the book (1).
+#   crux / The Crux              — the concept against Rumelt's book of the same name.
+#   messy middle / The Messy Middle — same shape as above.
+#   Rick, Cal, Tal, Tim, Chris,  — first names shared by several people in the corpus. "Rick"
+#     Patrick, Jason, Steve,       alone can be Rick Rubin, Rick Dalzell or Rick Song.
+#     David, Brian, Eric
+#   Boz / Bos                    — two spellings of one nickname, but no full-name node exists
+#                                  to make canonical yet.
+#   Dara, Eren, Travis           — short forms whose full-name node is missing from the graph.

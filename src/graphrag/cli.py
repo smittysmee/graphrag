@@ -18,7 +18,7 @@ from graphrag import __version__
 from graphrag.app import AppContext
 from graphrag.config import Settings, load_settings
 from graphrag.graph import snapshot as snap
-from graphrag.models import SearchMode
+from graphrag.models import SearchMode, SourceSpec
 from graphrag.personas.brief import build_brief
 from graphrag.personas.registry import SDLC_STAGES
 from graphrag.personas.skill_export import export_persona_skill
@@ -245,6 +245,65 @@ def stats() -> None:
 
 
 @app.command()
+def validate(
+    path: Annotated[Path, typer.Argument(help="Root folder of a captured corpus.")],
+    merge: Annotated[
+        bool,
+        typer.Option("--merge", help="Write provenance/provenance.jsonl from the manifests."),
+    ] = False,
+) -> None:
+    """Check a captured corpus against the front-matter, body-length and provenance contract.
+
+    Every captured document must open with parsable YAML front-matter carrying `title`,
+    `fetched_at`, `fetched_by`, `retrieval`, `content_fidelity`, `document_type` and `category`,
+    plus a `source_url` unless it is a research note or internal context, and a body of 40 to
+    6,000 words. Every provenance line must be valid JSON, and one that claims a successful
+    capture must name a file that exists.
+
+    Exits 1 when anything is wrong, 2 when the path does not exist.
+    """
+    from graphrag.ingest.validate import merge_provenance, validate_corpus
+
+    if not path.is_dir():
+        err.print(f"[red]not a directory: {path}[/red]")
+        raise typer.Exit(2)
+    report = validate_corpus(path)
+    for line in report.problem_lines():
+        console.print(line, markup=False, highlight=False)
+    if merge:
+        out = merge_provenance(path, report.provenance)
+        console.print(f"merged {len(report.provenance)} provenance records -> {out}")
+    for line in report.summary_lines():
+        console.print(line, markup=False, highlight=False)
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+def _validate_or_exit(path: Path, source: SourceSpec) -> None:
+    """Refuse to ingest a `documents` source whose captured files break the corpus contract.
+
+    A bad capture is invisible once it is in the graph: it becomes a weak chunk that dilutes
+    every answer rather than an error anyone sees. Catching it here is the only cheap moment.
+    """
+    from graphrag.ingest.loaders import iter_source_files
+    from graphrag.ingest.validate import DOCUMENT_SUFFIXES, validate_files
+
+    base = path / source.path if source.path else path
+    files = [p for p in iter_source_files(path, source) if p.suffix.lower() in DOCUMENT_SUFFIXES]
+    report = validate_files(files, root=base)
+    if report.ok:
+        return
+    err.print(
+        f"[red]{len(report.problems)} problem(s) in {len(files)} captured file(s) of source "
+        f"{source.id!r}[/red]"
+    )
+    for line in report.problem_lines():
+        err.print(f"  {line}", markup=False, highlight=False)
+    err.print("[red]refusing to ingest; fix the files or pass --allow-invalid[/red]")
+    raise typer.Exit(2)
+
+
+@app.command()
 def ingest(
     path: Annotated[Path, typer.Argument(help="Root folder that contains the source files.")],
     persona: Annotated[str, typer.Option("--persona", "-p", help="Persona id to ground.")],
@@ -253,8 +312,17 @@ def ingest(
     ] = None,
     export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = False,
     replace: Annotated[bool, typer.Option(help="Delete the persona's graph first.")] = False,
+    allow_invalid: Annotated[
+        bool,
+        typer.Option("--allow-invalid", help="Ingest a `documents` source without validating it."),
+    ] = False,
 ) -> None:
-    """Load, chunk, embed and write one persona source into the graph."""
+    """Load, chunk, embed and write one persona source into the graph.
+
+    A `documents` source is validated first and the ingest is refused with exit 2 if any captured
+    file breaks the contract; `--allow-invalid` skips that check. `transcripts` sources are not
+    validated, because the archive that produced them owns their front-matter.
+    """
     ctx = State.context()
     try:
         spec = ctx.registry.get(persona)
@@ -272,6 +340,8 @@ def ingest(
                 err.print(f"[red]unknown source {source!r} for persona {persona}[/red]")
                 raise typer.Exit(2)
             src = matches[0]
+        if src.loader == "documents" and not allow_invalid:
+            _validate_or_exit(path, src)
         if replace:
             ctx.store.delete_persona(spec.id)
         pipeline = IngestPipeline(ctx.store, ctx.require_embedder(), progress=_progress)

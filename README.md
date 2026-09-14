@@ -109,6 +109,7 @@ make lsp                # python-lsp-server over stdio for your editor
 | [SDLC.md](docs/SDLC.md) | Which persona applies at which stage |
 | [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Testing conventions, LSP setup |
 | [SNA.md](docs/SNA.md) | Network analysis: centrality, communities, clustering |
+| [MARKET_INVESTIGATION.md](docs/MARKET_INVESTIGATION.md) | A repeatable method for investigating an adoption problem with the graph |
 | [NOTICE.md](NOTICE.md) | Attribution, third-party licenses, what you may redistribute |
 
 ## License

@@ -175,6 +175,9 @@ make search Q="roadmap review" PERSONA=product-leader K=5
 docker compose run --rm graphrag graphrag search "pricing" -p product-leader -k 5 --json
 docker compose run --rm graphrag graphrag context "retention" -p product-leader --json
 
+# check a captured corpus before ingesting it
+make validate CORPUS=data/raw/<persona>
+
 # personas
 docker compose run --rm graphrag graphrag persona list
 docker compose run --rm graphrag graphrag persona brief product-leader
@@ -209,6 +212,51 @@ That scaffolds `personas/<id>/persona.yaml` and a README with the runbook. Then:
 
 Fill in the persona's `role_prompt`, `voice` and `sdlc_stages` by hand. Those are what make the
 persona sound like someone rather than like a search engine.
+
+If the corpus is one you are researching and capturing yourself rather than one you already have,
+[MARKET_INVESTIGATION.md](MARKET_INVESTIGATION.md) describes the method that produces it, and
+`docs/templates/` holds fill-in briefs for the research waves and for a grounded-profiles skill.
+
+### Validate a captured corpus
+
+```bash
+make validate CORPUS=data/raw/<persona>            # check
+make validate CORPUS=data/raw/<persona> MERGE=1    # check, then merge the provenance manifests
+```
+
+A hand-captured document can be wrong in ways nothing downstream notices. Front-matter that does
+not parse loses the file's metadata; a missing `fetched_at` or `retrieval` means nobody can later
+say where the text came from or how faithful it is; a nine-word body becomes a chunk that matches
+every query weakly and answers none of them; a twelve-thousand-word body is a whole page captured
+instead of the passage that mattered. None of that raises anything at ingest time, so it is
+checked once, up front:
+
+| Check | Rule |
+| --- | --- |
+| Front-matter | Opens with a `---` fence and parses as a YAML mapping |
+| Required keys | `title`, `fetched_at`, `fetched_by`, `retrieval`, `content_fidelity`, `document_type`, `category` |
+| Source | A `source_url` unless `document_type` is `research_note` or `internal_context` |
+| Body length | Between 40 and 6,000 words |
+| Provenance | Every line of `provenance/*.jsonl` is JSON, and a line claiming a successful capture names a file that exists |
+
+It exits 1 when anything is wrong and prints one line per problem, naming the file. `--merge`
+writes `provenance/provenance.jsonl` from the per-researcher manifests, which is how several
+researchers working in parallel end up with one manifest for the corpus.
+
+`graphrag ingest` runs the same check first for any source whose loader is `documents`, and
+refuses with exit 2 rather than putting a bad capture into the graph:
+
+```
+2 problem(s) in 3 captured file(s) of source 'docs'
+  TOO LONG (6001 words): long.md
+  NEAR-EMPTY (12 words): stub.md
+refusing to ingest; fix the files or pass --allow-invalid
+```
+
+Pass `--allow-invalid` to ingest anyway. `transcripts` sources are never validated, because the
+archive that produced them owns their front-matter. The same logic is also a standalone script,
+`python scripts/validate_corpus.py <corpus-root> [--merge]`, for checking a corpus without the
+CLI or a container.
 
 ### Add the entity layer
 

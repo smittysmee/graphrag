@@ -11,8 +11,8 @@ Q           ?= how do I find product market fit
 K           ?= 5
 
 .PHONY: help build up down logs setup doctor hooks check check-local fmt lint type test \
-        test-integration test-integration-local ingest sync snapshot-export snapshot-load search \
-        context stats shell lsp embed-up enrich clean
+        test-integration test-integration-local validate ingest sync snapshot-export \
+        snapshot-load search context stats shell lsp embed-up enrich clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -110,6 +110,10 @@ test-integration-local:
 	pytest -q -m "integration"
 
 # ------------------------------------------------------------------ data
+validate: ## Check a captured corpus (CORPUS=repo-relative path [MERGE=1])
+	$(COMPOSE) run --rm -T graphrag graphrag validate /app/$(or $(CORPUS),data/raw/$(PERSONA)) \
+		$(if $(MERGE),--merge,)
+
 ingest: ## Ingest SRC into PERSONA (SRC=repo-relative path PERSONA=id [SOURCE=id]) and export
 	$(COMPOSE) run --rm -T graphrag graphrag ingest /app/$(SRC) --persona $(PERSONA) \
 		$(if $(SOURCE),--source $(SOURCE)) --export
