@@ -24,6 +24,13 @@ def test_split_frontmatter_absent() -> None:
     assert split_frontmatter("plain") == ({}, "plain")
 
 
+def test_split_frontmatter_malformed_yaml_falls_back_instead_of_raising() -> None:
+    """A loader has to keep working on a file nobody has validated yet; the explicit corpus
+    check (`graphrag.ingest.validate`) is what reports a bad fence by name."""
+    text = "---\ntitle: [unterminated\n---\n\nbody text\n"
+    assert split_frontmatter(text) == ({}, text)
+
+
 def test_timestamp_and_deep_link() -> None:
     assert timestamp_to_seconds("01:02:03") == 3723
     assert (

@@ -138,6 +138,26 @@ def test_sync_refreshes_attribution_when_asked(cli_context: AppContext) -> None:
     assert "ada-north-handle" in cli_context.store.documents[doc_id].speakers
 
 
+def test_sync_refuses_an_invalid_documents_source(cli_context: AppContext) -> None:
+    """`sync` gates a `documents` source on the same corpus contract `ingest` does."""
+    bad = cli_context.settings.raw_dir / "test-docs" / "docs" / "bad-note.md"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("---\ntitle: Bad Note\n---\n\nToo short.\n", encoding="utf-8")
+
+    refused = runner.invoke(app, ["sync", "test-docs"])
+    assert refused.exit_code == 2, refused.output
+    assert "refused -- 3 problem(s) in 1 captured file(s), 1 document(s) not ingested" in (
+        refused.output
+    )
+    assert "bad-note.md" in refused.output
+    assert "--allow-invalid" in refused.output
+    assert cli_context.store.stats().documents == 0
+
+    allowed = runner.invoke(app, ["sync", "test-docs", "--allow-invalid"])
+    assert allowed.exit_code == 0, allowed.output
+    assert cli_context.store.stats().documents == 1
+
+
 def test_enrich_import_from_agent_json(
     cli_context: AppContext, ingested: IngestReport, tmp_path: Path
 ) -> None:

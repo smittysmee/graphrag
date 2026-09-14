@@ -388,6 +388,12 @@ def sync(
             help="Re-import every annotation file, not only those filling a gap.",
         ),
     ] = False,
+    allow_invalid: Annotated[
+        bool,
+        typer.Option(
+            "--allow-invalid", help="Re-ingest a `documents` source without validating it."
+        ),
+    ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Report what is missing; write nothing.")
     ] = False,
@@ -400,6 +406,11 @@ def sync(
     are behind, then re-imports their extraction files, since a re-ingest drops entity mentions.
     Sources that were already complete are still checked for documents the graph holds without
     any entity, and the extraction files for those are imported too.
+
+    A `documents` source behind on documents is validated first, exactly as `ingest` validates
+    one, and refused with exit 2 if any captured file breaks the contract; `--allow-invalid`
+    skips that check. A refused source is reported and left alone; every other source, and this
+    source's own backfill of documents already in the graph, still runs.
 
     That check asks whether a layer is missing, so a rewritten sidecar is invisible to it: an
     attribution file that gained posted dates names a document that already has speakers.
@@ -425,6 +436,7 @@ def sync(
                 source_id=source,
                 refresh_attribution=refresh_attribution,
                 refresh_annotations=refresh_annotations,
+                allow_invalid=allow_invalid,
                 dry_run=dry_run,
                 progress=_progress,
             )
@@ -432,9 +444,14 @@ def sync(
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(2) from exc
         for line in summary_lines(report):
-            console.print(line)
+            console.print(line, markup=False, highlight=False)
         if report.errors:
             err.print(f"[yellow]{len(report.errors)} files failed to import[/yellow]")
+        if report.invalid_sources:
+            err.print(
+                f"[red]{len(report.invalid_sources)} source(s) refused; fix the files or pass "
+                "--allow-invalid[/red]"
+            )
         if export and report.wrote:
             snap.export_snapshot(
                 ctx.store,
@@ -444,7 +461,7 @@ def sync(
                 embedding_dim=ctx.settings.embedding.dim,
             )
             console.print(f"snapshot exported to {snap.snapshot_dir(ctx.snapshots_dir, spec.id)}")
-        if report.errors:
+        if report.errors or report.invalid_sources:
             raise typer.Exit(2)
     finally:
         ctx.close()

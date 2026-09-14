@@ -32,6 +32,13 @@ has, whatever the graph already holds, and each source's line says so.
 The persona's alias table is applied once at the end, after every file has landed. An import can
 only canonicalise the names inside the file it is reading; folding two spellings that arrived in
 different files into one node is a whole-graph operation, so it runs when the graph is whole.
+
+A `documents` source behind on documents is checked against the corpus contract
+(:func:`graphrag.ingest.validate.validate_files`) before it is re-ingested, exactly as
+``graphrag ingest`` checks one -- a bad capture is invisible once it is a chunk. A source that
+fails is refused rather than re-ingested, and reported that way, while every other source keeps
+going, including this one's own backfill of documents already in the graph. ``allow_invalid``
+skips the check, as it does for ``ingest``.
 """
 
 from __future__ import annotations
@@ -46,7 +53,8 @@ from graphrag.extract.annotations import EntityIndex, FacetTable, import_annotat
 from graphrag.extract.attribution import import_attribution_file
 from graphrag.extract.importer import import_extraction_file, read_doc_id
 from graphrag.graph.store import GraphStore
-from graphrag.ingest.loaders import load_source
+from graphrag.ingest.loaders import iter_source_files, load_source
+from graphrag.ingest.validate import DOCUMENT_SUFFIXES, ValidationReport, validate_files
 from graphrag.models import PersonaSpec, SourceSpec
 from graphrag.pipeline import IngestPipeline
 
@@ -86,6 +94,11 @@ class SourceReport:
     annotation_errors: tuple[str, ...] = ()
     attribution_refreshed: bool = False  # every attribution file was re-imported, not only gaps
     annotation_refreshed: bool = False  # every annotation file was re-imported, not only gaps
+    invalid: bool = False  # a `documents` source with missing docs whose captures broke the
+    # corpus contract, so the re-ingest that would have filled `missing` was refused
+    invalid_files: int = 0  # captured files checked when refusing
+    invalid_documents: int = 0  # documents the refusal left un-ingested
+    problems: tuple[str, ...] = ()  # validate_corpus-style problem lines, for a refused source
 
     @property
     def stale(self) -> bool:
@@ -104,6 +117,10 @@ class SyncReport:
     @property
     def stale_sources(self) -> tuple[SourceReport, ...]:
         return tuple(s for s in self.sources if s.stale)
+
+    @property
+    def invalid_sources(self) -> tuple[SourceReport, ...]:
+        return tuple(s for s in self.sources if s.invalid)
 
     @property
     def missing_total(self) -> int:
@@ -233,6 +250,7 @@ def sync_persona(
     source_id: str | None = None,
     refresh_attribution: bool = False,
     refresh_annotations: bool = False,
+    allow_invalid: bool = False,
     dry_run: bool = False,
     progress: Progress | None = None,
 ) -> SyncReport:
@@ -244,6 +262,14 @@ def sync_persona(
     ``refresh_attribution`` and ``refresh_annotations`` re-import every sidecar of that kind
     rather than only the ones filling a gap, which is what a rewritten file needs: it names a
     document that already has the layer, so nothing else would pick the new fields up.
+
+    A `documents` source that is missing documents is checked against the corpus contract
+    (:func:`graphrag.ingest.validate.validate_files`) before it is re-ingested, exactly as
+    ``graphrag ingest`` checks one -- a bad capture is invisible once it is a chunk. A source that
+    fails is refused rather than re-ingested (reported on its :class:`SourceReport` as
+    ``invalid``), while every other source, and this source's own backfill of already-ingested
+    documents missing an entity, speaker or annotation layer, still runs. ``allow_invalid`` skips
+    the check, as it does for ``ingest``.
     """
     say = progress or (lambda _msg: None)
     extractions = index_extractions(enrichment_root)
@@ -253,7 +279,29 @@ def sync_persona(
     reports: list[SourceReport] = []
 
     for source in _select(persona, source_id):
-        missing = missing_document_ids(store, raw_root, persona, source)
+        found_missing = missing_document_ids(store, raw_root, persona, source)
+        # Checked before anything is re-ingested, and only when there is something to re-ingest:
+        # an already-complete source is left alone, exactly as `ingest` never revalidates one.
+        invalid_report = (
+            _validate_documents_source(raw_root, source)
+            if found_missing and not allow_invalid
+            else None
+        )
+        invalid = invalid_report is not None and not invalid_report.ok
+        problems: tuple[str, ...] = ()
+        invalid_files = 0
+        if invalid_report is not None and invalid:
+            problems = tuple(invalid_report.problem_lines())
+            invalid_files = sum(invalid_report.documents_per_source.values())
+        # A refused source is treated as though nothing were missing: no re-ingest happens, so
+        # none of the layers a re-ingest would have dropped need re-importing either. Its already-
+        # ingested documents still get whatever backfill they are due, below.
+        missing = [] if invalid else found_missing
+        if invalid:
+            say(
+                f"{source.id}: refusing to ingest -- {len(problems)} problem(s) in "
+                f"{invalid_files} captured file(s); fix the files or pass --allow-invalid"
+            )
         key = f"{persona.id}:{source.id}:"
         files = extractions.get(key, [])
         voices = attributions.get(key, [])
@@ -285,6 +333,10 @@ def sync_persona(
                     annotation_files=len(unread),
                     attribution_refreshed=refresh_attribution,
                     annotation_refreshed=refresh_annotations,
+                    invalid=invalid,
+                    invalid_files=invalid_files,
+                    invalid_documents=len(found_missing) if invalid else 0,
+                    problems=problems,
                 )
             )
             continue
@@ -332,6 +384,10 @@ def sync_persona(
                 annotation_errors=reading_errors,
                 attribution_refreshed=refresh_attribution,
                 annotation_refreshed=refresh_annotations,
+                invalid=invalid,
+                invalid_files=invalid_files,
+                invalid_documents=len(found_missing) if invalid else 0,
+                problems=problems,
             )
         )
     # Last, and over the whole persona: one file can only canonicalise its own names, so two
@@ -347,6 +403,21 @@ def sync_persona(
     return SyncReport(
         persona_id=persona.id, sources=tuple(reports), dry_run=dry_run, aliases=alias_report
     )
+
+
+def _validate_documents_source(raw_root: Path, source: SourceSpec) -> ValidationReport | None:
+    """The corpus contract check ``ingest`` applies to a `documents` source, run here too.
+
+    ``None`` for any other loader: a `transcripts` source's front matter belongs to the archive
+    that produced it, exactly as ``ingest`` leaves it unchecked.
+    """
+    if source.loader != "documents":
+        return None
+    base = raw_root / source.path if source.path else raw_root
+    files = [
+        p for p in iter_source_files(raw_root, source) if p.suffix.lower() in DOCUMENT_SUFFIXES
+    ]
+    return validate_files(files, root=base)
 
 
 def _select(persona: PersonaSpec, source_id: str | None) -> list[SourceSpec]:
@@ -638,7 +709,17 @@ def summary_lines(report: SyncReport) -> list[str]:
     """One line per source, plus a closing line. Pure, so it is what the tests assert on."""
     lines: list[str] = []
     for src in report.sources:
-        if not src.stale:
+        if src.invalid:
+            lines.append(
+                f"{src.source_id}: refused -- {len(src.problems)} problem(s) in "
+                f"{src.invalid_files} captured file(s), {src.invalid_documents} document(s) "
+                "not ingested; fix the files or pass --allow-invalid"
+                f"{_backfill_clause(src, report.dry_run)}"
+                f"{_attribution_clause(src, report.dry_run)}"
+                f"{_annotation_clause(src, report.dry_run)}"
+            )
+            lines.extend(f"  {problem}" for problem in src.problems)
+        elif not src.stale:
             lines.append(
                 f"{src.source_id}: up to date{_backfill_clause(src, report.dry_run)}"
                 f"{_attribution_clause(src, report.dry_run)}"

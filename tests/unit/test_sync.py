@@ -38,6 +38,30 @@ def no_embedder() -> Embedder:
     raise AssertionError(msg)
 
 
+CAPTURE_FRONT_MATTER = (
+    "fetched_at: '2025-01-01T00:00:00Z'\n"
+    "fetched_by: test-harness\n"
+    "retrieval: manual\n"
+    "content_fidelity: verbatim\n"
+    "document_type: research_note\n"
+    "category: test\n"
+)
+
+
+def make_capture_compliant(path: Path, *, filler_words: int = 0) -> None:
+    """Give a `documents` source file the front-matter keys the corpus contract requires.
+
+    This corpus fixture predates that contract (it is illustrative content, not a real capture),
+    and sync now validates a `documents` source before re-ingesting it, exactly as `ingest`
+    already did. `filler_words` tops up a short body past the contract's minimum word count.
+    """
+    text = path.read_text(encoding="utf-8")
+    text = text.replace("---\n", f"---\n{CAPTURE_FRONT_MATTER}", 1)
+    if filler_words:
+        text += "\n" + " ".join(["filler"] * filler_words) + "\n"
+    path.write_text(text, encoding="utf-8")
+
+
 @pytest.fixture
 def multi_persona(transcript_source: SourceSpec, documents_source: SourceSpec) -> PersonaSpec:
     """A persona with two sources, which is where `graphrag ingest` alone stops being enough."""
@@ -50,7 +74,12 @@ def multi_persona(transcript_source: SourceSpec, documents_source: SourceSpec) -
 
 @pytest.fixture
 def raw_root(tmp_path: Path) -> Path:
-    return write_sample_corpus(tmp_path / "raw" / PERSONA_ID)
+    root = write_sample_corpus(tmp_path / "raw" / PERSONA_ID)
+    # `docs` and `threads` are `documents`-loader sources, so sync now validates them (like
+    # `ingest`) before re-ingesting; give the fixture's illustrative files a compliant capture.
+    make_capture_compliant(root / "docs" / "plan-guide.md", filler_words=12)
+    make_capture_compliant(root / "threads" / "onboarding-thread.md")
+    return root
 
 
 @pytest.fixture
@@ -147,10 +176,12 @@ def test_a_new_file_re_ingests_only_its_own_source(
     raw_root: Path,
     enrichment_root: Path,
 ) -> None:
-    (raw_root / "docs" / "new-note.md").write_text(
+    note = raw_root / "docs" / "new-note.md"
+    note.write_text(
         "---\ntitle: New Note\n---\n\n# New Note\n\nA note written after the last ingest.\n",
         encoding="utf-8",
     )
+    make_capture_compliant(note, filler_words=32)
     # A mention on the untouched source: re-ingesting would delete its chunk and so this too.
     transcript_chunk = next(
         c for c in memory_store.chunks.values() if f":{TRANSCRIPTS}:" in c.doc_id
@@ -169,6 +200,126 @@ def test_a_new_file_re_ingests_only_its_own_source(
     assert by_source[DOCS].ingested_documents == 3  # the whole source, not just the new file
     assert f"{PERSONA_ID}:{DOCS}:new-note" in memory_store.document_ids(PERSONA_ID, DOCS)
     assert any(m.entity_id == "metric:untouched" for m in memory_store.mentions)
+
+
+# ----------------------------------------------------------------------------- corpus contract
+
+
+def test_an_invalid_documents_source_is_refused_while_the_other_still_syncs(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """A bad capture is invisible once it is a chunk, so sync gates a `documents` source on the
+    same corpus contract `ingest` does -- without stopping a source that has nothing wrong."""
+    (raw_root / "docs" / "bad-note.md").write_text(
+        "---\ntitle: Bad Note\n---\n\nToo short.\n", encoding="utf-8"
+    )
+    new_episode = raw_root / "episodes" / "extra-guest"
+    new_episode.mkdir()
+    (new_episode / "transcript.md").write_text(
+        "---\nguest: Extra Guest\ntitle: Extra Guest\n---\n\n"
+        "## Transcript\n\nExtra Guest (00:00:00):\nWe measure everything twice.\n",
+        encoding="utf-8",
+    )
+
+    report = run(
+        memory_store, multi_persona, raw_root, enrichment_root, embedder=lambda: hash_embedder
+    )
+
+    by_source = {s.source_id: s for s in report.sources}
+    docs = by_source[DOCS]
+    assert docs.invalid is True
+    assert docs.missing == ()  # refused, not counted as something that would be re-ingested
+    assert docs.invalid_documents == 1
+    assert any("bad-note.md" in p for p in docs.problems)
+    assert f"{PERSONA_ID}:{DOCS}:bad-note" not in memory_store.document_ids(PERSONA_ID, DOCS)
+    transcripts = by_source[TRANSCRIPTS]
+    assert transcripts.invalid is False
+    assert transcripts.ingested_documents == 4  # the untouched source still synced
+    assert f"{PERSONA_ID}:{TRANSCRIPTS}:extra-guest" in memory_store.document_ids(
+        PERSONA_ID, TRANSCRIPTS
+    )
+    assert report.errors == ()
+    lines = summary_lines(report)
+    docs_line = next(line for line in lines if line.startswith(f"{DOCS}: "))
+    assert docs_line == (
+        f"{DOCS}: refused -- 3 problem(s) in 2 captured file(s), 1 document(s) not ingested; "
+        "fix the files or pass --allow-invalid"
+    )
+    assert any("bad-note.md" in line for line in lines)
+
+
+def test_allow_invalid_re_ingests_despite_a_bad_capture(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    (raw_root / "docs" / "bad-note.md").write_text(
+        "---\ntitle: Bad Note\n---\n\nToo short.\n", encoding="utf-8"
+    )
+
+    report = run(
+        memory_store,
+        multi_persona,
+        raw_root,
+        enrichment_root,
+        embedder=lambda: hash_embedder,
+        allow_invalid=True,
+    )
+
+    docs = next(s for s in report.sources if s.source_id == DOCS)
+    assert docs.invalid is False
+    assert f"{PERSONA_ID}:{DOCS}:bad-note" in memory_store.document_ids(PERSONA_ID, DOCS)
+
+
+def test_malformed_front_matter_is_reported_not_raised(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """A YAML parse failure used to crash while sync was only working out what is missing, before
+    it ever validated anything. The loader now tolerates it; the explicit check names the file."""
+    (raw_root / "docs" / "broken.md").write_text(
+        "---\ntitle: [unterminated\n---\n\nToo short.\n", encoding="utf-8"
+    )
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root, dry_run=True)
+
+    docs = next(s for s in report.sources if s.source_id == DOCS)
+    assert docs.invalid is True
+    assert any("broken.md" in p and "front-matter" in p for p in docs.problems)
+
+
+def test_summary_lines_report_a_refused_source() -> None:
+    report = SyncReport(
+        persona_id="p",
+        sources=(
+            SourceReport(
+                source_id="a",
+                invalid=True,
+                invalid_files=2,
+                invalid_documents=1,
+                problems=("NEAR-EMPTY (2 words): bad.md",),
+            ),
+            SourceReport(source_id="b"),
+        ),
+    )
+    lines = summary_lines(report)
+    assert lines[0] == (
+        "a: refused -- 1 problem(s) in 2 captured file(s), 1 document(s) not ingested; "
+        "fix the files or pass --allow-invalid"
+    )
+    assert lines[1] == "  NEAR-EMPTY (2 words): bad.md"
+    assert lines[2] == "b: up to date"
 
 
 def test_enrichment_is_reimported_because_a_re_ingest_drops_mentions(
