@@ -32,6 +32,10 @@ import yaml
 from graphrag.graph.store import GraphStore
 from graphrag.models import Enrichment, Entity, Mention, Relation
 
+# One definition of how two spellings are compared, shared with the stores, which apply it
+# to the name on a node whose id an incoming entity has landed on.
+from graphrag.textutil import fold_name
+
 __all__ = [
     "ALIAS_FILE",
     "EMPTY_ALIASES",
@@ -54,11 +58,6 @@ ALIAS_FILE = "aliases.yaml"
 
 class AliasError(ValueError):
     """The alias file is unreadable, malformed, or claims one alias for two canonicals."""
-
-
-def fold_name(name: str) -> str:
-    """The form two spellings are compared in: lower case, with runs of whitespace collapsed."""
-    return " ".join(name.split()).casefold()
 
 
 @dataclass(frozen=True)
