@@ -192,6 +192,15 @@ def run_analysis(
     if graph.number_of_nodes() == 0:
         notes.append("The network is empty: no nodes matched this persona and these filters.")
         return analysis
+    if graph.number_of_nodes() < 2 or graph.number_of_edges() == 0:
+        notes.append(
+            f"The network has {graph.number_of_nodes()} node(s) and no edges, so there is "
+            f"nothing to group into {analysis.group_plural}: community detection, its "
+            "stability check across seeds, and the null model all need at least one edge, and "
+            "none of them ran. The centrality table above is what a network this size can "
+            "support."
+        )
+        return analysis
 
     if method == "louvain":
         result = louvain(graph, resolution=resolution, seed=seed, runs=runs)

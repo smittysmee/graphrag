@@ -310,6 +310,37 @@ def test_an_empty_network_reports_itself_instead_of_crashing(
     assert "The network is empty" in report.read_text()
 
 
+def test_a_network_with_no_edges_reports_itself_instead_of_crashing(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    """bo and cy are both attributed to the south but never appear in the same document, so
+    filtering the speaker network down to the south leaves two nodes and no edges -- exactly
+    what used to raise a ``ZeroDivisionError`` inside networkx's modularity."""
+    report = tmp_path / "no-edges.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "analyze",
+            "test-layers",
+            "--network",
+            "speakers",
+            "--where",
+            "region=south",
+            "--seed",
+            "1",
+            "--out",
+            str(report),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    text = report.read_text()
+    assert "2 node(s) and no edges" in text
+    assert "none of them ran" in text
+    assert "## Communities" not in text
+    assert "### Null model" not in text
+
+
 # ------------------------------------------------------- the stance, facet and window options
 
 

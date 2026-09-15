@@ -29,7 +29,10 @@ sentence to the frame rather than quietly shrinking the graph:
     annotation pass recorded about the document the passage belongs to. A node with no value
     for a filtered key is out of the network entirely, the same rule a window applies to an
     undated post: a missing tag is not a value, and treating it as one would put every untagged
-    node in whichever group was asked for.
+    node in whichever group was asked for. The two-mode network holds both kinds of node at
+    once, so each key is routed to whichever side ever carries it -- a speaker attribute filters
+    the speakers, everything else filters the passages, and therefore the entities and the
+    edges -- rather than asked of both sides for every key.
 
 Every node also carries the attributes themselves, as ``attr_<key>``, so ``sna analyze --by``
 can partition the network by one of them without rebuilding it. A speaker's value is its own; an
@@ -103,6 +106,15 @@ WHERE_FRAME = (
     "Restricted to nodes attributed {where}: a speaker by what an attribution pass recorded "
     "about them, everything else by the attributes of the document its passage belongs to. A "
     "node nobody gave a value for that key is outside the network, not in some other group."
+)
+#: The two-mode network holds both kinds of node in one graph, so each ``--where`` key is
+#: routed to whichever side actually carries it rather than asked of both at once -- see
+#: ``_split_bipartite_where``.
+BIPARTITE_WHERE_FRAME = (
+    "Restricted to nodes attributed {where}. Each key is answered by the side that carries it, "
+    "never by both: {detail}. A node missing a value for its own key is outside the network "
+    "entirely, and the side a key never applies to keeps only the nodes that stay connected "
+    "once the other side is filtered."
 )
 
 #: How a node's attributes are named in ``graph.nodes``: the value, and how many distinct values
@@ -249,8 +261,14 @@ def _frame(
     since: str | None = None,
     until: str | None = None,
     where: Mapping[str, str] | None = None,
+    where_detail: str = "",
 ) -> str:
-    """The sampling frame, plus a sentence for every filter that changed the question."""
+    """The sampling frame, plus a sentence for every filter that changed the question.
+
+    ``where_detail``, when given, names which side of a two-mode network answered each
+    ``--where`` key and replaces the generic :data:`WHERE_FRAME` sentence with
+    :data:`BIPARTITE_WHERE_FRAME`; every other network keeps the generic sentence.
+    """
     parts = [FRAMES[network]]
     if stances:
         parts.append(STANCE_FRAME.format(stances=" or ".join(stances)))
@@ -259,7 +277,9 @@ def _frame(
     window = _window_text(since, until)
     if window:
         parts.append(WINDOW_FRAME.format(window=window))
-    if where:
+    if where and where_detail:
+        parts.append(BIPARTITE_WHERE_FRAME.format(where=where_text(where), detail=where_detail))
+    elif where:
         parts.append(WHERE_FRAME.format(where=where_text(where)))
     return " ".join(parts)
 
@@ -283,6 +303,7 @@ def _meta(
     since: str | None = None,
     until: str | None = None,
     where: Mapping[str, str] | None = None,
+    where_detail: str = "",
     project: str = "",
 ) -> None:
     """Record the provenance every report prints next to the numbers."""
@@ -299,7 +320,13 @@ def _meta(
         where=where_text(where),
         project=project,
         frame=_frame(
-            network, stances=stances, facets=facets, since=since, until=until, where=where
+            network,
+            stances=stances,
+            facets=facets,
+            since=since,
+            until=until,
+            where=where,
+            where_detail=where_detail,
         ),
         unit=unit,
     )
@@ -622,10 +649,16 @@ def speaker_entity_bipartite(
     Every node keeps ``partners`` and ``partner_weights``: its heaviest opposite-mode
     neighbours, which survive the projection and are what the report's cross-mode section reads.
 
-    ``where`` has two sides to satisfy here, because the edge has two: the speaker is matched on
-    their own attributes and the entity on the document the passage belongs to, and an edge
-    survives only when both match. Anything looser would leave an edge in the network with an
-    endpoint the filter excluded.
+    ``where`` has two sides here because the graph does: a key is answered by whichever side
+    actually carries it, never by both at once. A key any speaker was ever given a value for
+    filters the speakers -- an edge whose speaker does not match is dropped, and an entity left
+    with no matching speaker drops with it. Every other key filters the passages by the document
+    each belongs to, which is therefore also what filters the entity side and the edges: an
+    entity's mentions are cut down to the ones in matching documents, and a speaker who wrote
+    only outside those documents drops the same way. Asking both sides for the same key -- the
+    older, broken behaviour -- would zero out whichever side never recorded it: a document-only
+    key has no value for any speaker, and "no value" never matches, so every speaker would drop
+    for a key that was never about them.
     """
     rows = store.entity_mention_rows(persona_id, source_id, types)
     if stances:
@@ -638,8 +671,9 @@ def speaker_entity_bipartite(
         docs = _window_doc_ids(store, persona_id, source_id, since, until)
         rows = [r for r in rows if r.doc_id in docs]
     speaker_attrs = store.speaker_attributes(persona_id)
-    if where:
-        rows = [r for r in rows if matches(r.document_attributes, where)]
+    speaker_where, doc_where = _split_bipartite_where(where, speaker_attrs)
+    if doc_where:
+        rows = [r for r in rows if matches(r.document_attributes, doc_where)]
 
     shared: dict[tuple[str, str], set[str]] = defaultdict(set)
     labels: dict[str, str] = {}
@@ -649,7 +683,7 @@ def speaker_entity_bipartite(
         labels[row.entity_id] = row.name
         kinds[row.entity_id] = row.type
         for speaker in row.speakers:
-            if not matches(speaker_attrs.get(speaker, {}), where):
+            if not matches(speaker_attrs.get(speaker, {}), speaker_where):
                 continue
             shared[(speaker, row.entity_id)].add(row.doc_id)
             _seen(seen, speaker, speaker_attrs.get(speaker, {}))
@@ -684,9 +718,39 @@ def speaker_entity_bipartite(
         since=since,
         until=until,
         where=where,
+        where_detail=_bipartite_where_detail(speaker_where, doc_where),
         project=project or "",
     )
     return graph
+
+
+def _split_bipartite_where(
+    where: Mapping[str, str] | None, speaker_attrs: Mapping[str, Mapping[str, str]]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Route each ``--where`` clause to the side of the two-mode network that carries it.
+
+    A key is a speaker attribute if any speaker was ever given a value for it, whatever this
+    particular query asks -- that is what makes it a thing speakers *have*, as opposed to a
+    thing this document happens to be tagged with under the same name. Everything else is
+    answered as a document attribute, the same rule the single-mode networks already use for
+    "everything that is not a speaker".
+    """
+    if not where:
+        return {}, {}
+    speaker_keys = {key for attrs in speaker_attrs.values() for key in attrs}
+    speaker_where = {k: v for k, v in where.items() if k in speaker_keys}
+    doc_where = {k: v for k, v in where.items() if k not in speaker_keys}
+    return speaker_where, doc_where
+
+
+def _bipartite_where_detail(speaker_where: Mapping[str, str], doc_where: Mapping[str, str]) -> str:
+    """Which side answered each clause, for the frame line ``_meta`` prints."""
+    parts = []
+    if speaker_where:
+        parts.append(f"{where_text(speaker_where)} by the speakers' own attribute")
+    if doc_where:
+        parts.append(f"{where_text(doc_where)} by the document each passage belongs to")
+    return "; ".join(parts)
 
 
 def _label_bipartite(

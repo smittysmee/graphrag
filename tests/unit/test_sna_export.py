@@ -321,6 +321,33 @@ def test_the_bipartite_network_takes_the_same_filters_as_the_others(
     assert set(quoting.nodes) == {"ana"}
 
 
+def test_where_on_the_two_mode_network_answers_each_key_by_the_side_that_carries_it(
+    layered: InMemoryGraphStore,
+) -> None:
+    """A key that is only ever a document attribute must not also be asked of the speakers, and
+    a key that is only ever a speaker attribute must not also be asked of the documents -- doing
+    both, as the old code did, zeroed out whichever side never recorded the key at all.
+    """
+    post = lambda slug: f"test-layers:posts:{slug}"  # noqa: E731
+    layered.set_document_attributes(post("post-1"), {"channel": "blog"})
+    layered.set_document_attributes(post("post-2"), {"channel": "blog"})
+    layered.set_speaker_attributes("test-layers", "ana", {"tier": "gold"})
+
+    by_document = speaker_entity_bipartite(layered, "test-layers", where={"channel": "blog"})
+    assert set(by_document.nodes) == {
+        "ana",
+        "bo",
+        "product:alpha",
+        "product:beta",
+        "product:gamma",
+    }
+    assert "channel=blog by the document each passage belongs to" in by_document.graph["frame"]
+
+    by_speaker = speaker_entity_bipartite(layered, "test-layers", where={"tier": "gold"})
+    assert set(by_speaker.nodes) == {"ana", "product:alpha", "product:beta", "product:gamma"}
+    assert "tier=gold by the speakers' own attribute" in by_speaker.graph["frame"]
+
+
 def test_build_network_rejects_filters_the_chosen_network_cannot_answer(
     layered: InMemoryGraphStore,
 ) -> None:
