@@ -6,7 +6,8 @@ from pathlib import Path
 
 import yaml
 
-from graphrag.models import PersonaSpec, slugify
+from graphrag.models import PersonaSpec
+from graphrag.textutil import slugify
 
 PERSONA_FILE = "persona.yaml"
 

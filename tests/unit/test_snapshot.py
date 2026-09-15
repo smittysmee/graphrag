@@ -87,3 +87,120 @@ def test_export_preserves_source_commit(
         memory_store, persona, root, embedding_model="hash-test", embedding_dim=64
     )
     assert again.source_commit == "abc"
+
+
+def test_speaker_dates_stances_facets_and_attributes_ride_the_snapshot(
+    tmp_path: Path,
+    thread_document: str,
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """The layers a teammate would otherwise have to rebuild after loading a snapshot.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    from graphrag.models import Enrichment, Entity, Mention
+
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(
+                    id="concept:handbook",
+                    name="Handbook",
+                    type="concept",
+                    aliases=["hand book"],
+                )
+            ],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+    memory_store.attach_speaker(
+        thread_document, chunks[0].id, "quill-maker", posted_at="2025-02-03", role="op", score=12
+    )
+    memory_store.annotate_mention(thread_document, chunks[0].id, "Handbook", "complaint")
+    memory_store.annotate_chunk(thread_document, chunks[0].id, ["handover"])
+    memory_store.set_document_attributes(thread_document, {"region": "north"})
+    memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "south"})
+
+    root = tmp_path / "snapshots"
+    snap.export_snapshot(
+        memory_store,
+        docs_persona,
+        root,
+        embedding_model="hash-test",
+        embedding_dim=hash_embedder.dim,
+    )
+    fresh = InMemoryGraphStore()
+    snap.load_snapshot(
+        fresh, docs_persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+
+    loaded = fresh.document_chunks(thread_document, 0, 1)[0]
+    assert loaded.facets == ["handover"]
+    assert loaded.speakers == ["quill-maker"]
+    assert [(p.posted_at, p.role, p.score) for p in loaded.speaker_posts] == [
+        ("2025-02-03", "op", 12)
+    ]
+    assert [p.speaker for p in fresh.speaker_document_pairs("test-docs", since="2025-02-01")] == [
+        "quill-maker"
+    ]
+    stance = fresh.mention_stances("test-docs")[0]
+    assert (stance.name, stance.stance) == ("Handbook", "complaint")
+    assert fresh.entities["concept:handbook"].aliases == ["hand book"]
+    # Node attributes ride too: the document's on the document, the speaker's in its own file.
+    assert fresh.document_attributes("test-docs") == {thread_document: {"region": "north"}}
+    assert fresh.speaker_attributes("test-docs") == {"quill-maker": {"region": "south"}}
+    row = next(r for r in fresh.speaker_document_pairs("test-docs"))
+    assert row.speaker_attributes == {"region": "south"}
+    assert row.document_attributes == {"region": "north"}
+
+
+def test_punctuated_entity_ids_survive_the_round_trip(
+    tmp_path: Path,
+    ingested: IngestReport,
+    memory_store: InMemoryGraphStore,
+    persona: PersonaSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """A product and its "+" variant are two nodes in the snapshot as well as in the graph.
+
+    Ids are carried verbatim, not re-derived on load, so a teammate who loads the snapshot gets
+    the same two nodes rather than whichever one the slug would have collapsed them onto.
+    """
+    from graphrag.models import Enrichment, Entity, Mention
+
+    docs = sorted(memory_store.document_ids(persona.id))
+    first, second = (memory_store.document_chunks(d, 0, 1)[0].id for d in docs[:2])
+    ids = [Entity.make_id("Lumenta", "product"), Entity.make_id("Lumenta+", "product")]
+    assert ids == ["product:lumenta", "product:lumenta-plus"]
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id=ids[0], name="Lumenta", type="product"),
+                Entity(id=ids[1], name="Lumenta+", type="product"),
+            ],
+            mentions=[
+                Mention(chunk_id=first, entity_id=ids[0]),
+                Mention(chunk_id=second, entity_id=ids[1]),
+            ],
+        )
+    )
+
+    root = tmp_path / "snapshots"
+    snap.export_snapshot(
+        memory_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+    fresh = InMemoryGraphStore()
+    snap.load_snapshot(
+        fresh, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+
+    loaded = fresh.enrichment_for_persona(persona.id)
+    assert sorted(e.id for e in loaded.entities) == ids
+    assert {(e.id, e.name) for e in loaded.entities} == {
+        ("product:lumenta", "Lumenta"),
+        ("product:lumenta-plus", "Lumenta+"),
+    }
+    assert len(loaded.mentions) == 2

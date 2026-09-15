@@ -1,0 +1,573 @@
+"""``graphrag layers check``: which layers a captured document has, and what came loose.
+
+Everything runs against the in-memory store and the synthetic corpus from ``tests/conftest.py``,
+so the ids here are invented ones and no real document is touched.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from graphrag.app import AppContext
+from graphrag.cli import app
+from graphrag.extract.layers import (
+    SourceNotFoundError,
+    check_documents,
+    doc_id_for_file,
+    index_sidecars,
+    summary_lines,
+)
+from graphrag.graph.memory_store import InMemoryGraphStore
+from graphrag.models import PersonaSpec, SourceSpec
+from graphrag.pipeline import IngestReport
+from tests.conftest import THREAD_POSTS
+
+runner = CliRunner()
+
+FIRST = THREAD_POSTS[0][2][:60]
+LAST = THREAD_POSTS[-1][2][:60]
+
+#: A name that occurs verbatim in the first episode, so its mention anchors exactly.
+VERBATIM = "Product-market fit"
+#: Not verbatim, but every token of it occurs: the importer places it loosely.
+TOKENS = "retention curve flattening"
+#: No token of it occurs anywhere, so the mention falls back to the first passage.
+ABSENT = "Zzyzx Protocol"
+
+
+def write_extraction(path: Path, doc_id: str, names: list[str]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "doc_id": doc_id,
+                "entities": [
+                    {"name": name, "type": "concept", "description": f"{name}, as discussed."}
+                    for name in names
+                ],
+                "relations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_attribution(path: Path, doc_id: str, posts: list[dict[str, object]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"doc_id": doc_id, "posts": posts}), encoding="utf-8")
+    return path
+
+
+def write_annotations(path: Path, doc_id: str, annotations: list[dict[str, object]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"doc_id": doc_id, "annotations": annotations}), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def episode_id(memory_store: InMemoryGraphStore, ingested: IngestReport) -> str:
+    """The id of the one episode whose text the extraction fixtures name."""
+    return "test-pm:test-podcast:ada-north"
+
+
+# ----------------------------------------------------------------------------- doc ids
+
+
+def test_a_documents_source_slugifies_the_path_under_it(docs_persona: PersonaSpec) -> None:
+    doc_id, source = doc_id_for_file(
+        docs_persona,
+        Path("/repo/data/raw/test-docs"),
+        Path("/repo/data/raw/test-docs/docs/faq.txt"),
+    )
+    assert (doc_id, source.id) == ("test-docs:docs:faq", "docs")
+
+
+def test_a_transcripts_source_slugifies_the_containing_folder(persona: PersonaSpec) -> None:
+    """One folder is one recording, so the file name inside it never reaches the id."""
+    doc_id, _source = doc_id_for_file(
+        persona,
+        Path("/repo/data/raw/test-pm"),
+        Path("/repo/data/raw/test-pm/episodes/ada-north/transcript.md"),
+    )
+    assert doc_id == "test-pm:test-podcast:ada-north"
+
+
+def test_a_nested_path_keeps_its_folders_in_the_slug(docs_persona: PersonaSpec) -> None:
+    doc_id, _source = doc_id_for_file(
+        docs_persona,
+        Path("/repo/data/raw/test-docs"),
+        Path("/repo/data/raw/test-docs/docs/notes/2026-01-02-a-note.md"),
+    )
+    assert doc_id == "test-docs:docs:notes-2026-01-02-a-note"
+
+
+def test_the_deeper_source_claims_a_path_two_sources_cover() -> None:
+    """A source rooted inside another one is the more specific answer, not an ambiguity."""
+    spec = PersonaSpec(
+        id="test-two",
+        name="Two Sources",
+        role_prompt="x",
+        sources=[
+            SourceSpec(id="outer", path="", loader="documents", glob="**/*.md"),
+            SourceSpec(id="inner", path="notes", loader="documents", glob="**/*.md"),
+        ],
+    )
+    doc_id, source = doc_id_for_file(
+        spec, Path("/repo/data/raw/test-two"), Path("/repo/data/raw/test-two/notes/one.md")
+    )
+    assert (doc_id, source.id) == ("test-two:inner:one", "inner")
+
+
+def test_a_path_no_source_covers_is_an_error(docs_persona: PersonaSpec) -> None:
+    with pytest.raises(SourceNotFoundError):
+        doc_id_for_file(docs_persona, Path("/repo/data/raw/test-docs"), Path("/elsewhere/stray.md"))
+
+
+def test_a_relative_raw_root_answers_an_absolute_file(
+    persona: PersonaSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings keep ``data/raw`` relative; a hook or an editor hands over an absolute path."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data/raw/test-pm/episodes/ada-north/transcript.md"
+
+    doc_id, _source = doc_id_for_file(persona, Path("data/raw/test-pm"), target)
+
+    assert doc_id == "test-pm:test-podcast:ada-north"
+
+
+def test_a_relative_raw_root_answers_a_relative_file(
+    persona: PersonaSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the form a person types, which is relative to the directory the command runs in."""
+    monkeypatch.chdir(tmp_path)
+
+    doc_id, _source = doc_id_for_file(
+        persona,
+        Path("data/raw/test-pm"),
+        Path("data/raw/test-pm/episodes/ada-north/transcript.md"),
+    )
+
+    assert doc_id == "test-pm:test-podcast:ada-north"
+
+
+# ----------------------------------------------------------------------------- disk index
+
+
+def test_sidecars_are_keyed_on_the_id_inside_them_not_the_directory(tmp_path: Path) -> None:
+    write_extraction(tmp_path / "flat.json", "test-pm:test-podcast:ada-north", [VERBATIM])
+    write_extraction(tmp_path / "deep" / "nested" / "x.json", "test-pm:test-podcast:ben-oduya", [])
+    write_extraction(tmp_path / "other.json", "other-persona:src:doc", [])
+
+    found = index_sidecars(tmp_path, "test-pm")
+
+    assert set(found) == {"test-pm:test-podcast:ada-north", "test-pm:test-podcast:ben-oduya"}
+
+
+def test_a_missing_sidecar_directory_is_not_a_finding(tmp_path: Path) -> None:
+    assert index_sidecars(tmp_path / "nothing-here", "test-pm") == {}
+    assert index_sidecars(None, "test-pm") == {}
+
+
+# ----------------------------------------------------------------------------- the check
+
+
+def test_a_clean_extraction_file_reports_every_layer_it_has(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, episode_id: str, tmp_path: Path
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "one.json", episode_id, [VERBATIM])
+
+    report = check_documents(
+        memory_store,
+        persona,
+        enrichment_root=tmp_path / "enrichment",
+        doc_ids=[episode_id],
+    )
+
+    document = report.documents[0]
+    assert document.in_graph and document.has_extraction
+    assert document.state("extraction") == "file"  # a dry run writes nothing
+    assert document.state("attribution") == "graph"  # the transcript loader parsed its turns
+    assert document.state("annotation") == "-"
+    assert report.total_loose == 0
+    assert report.ok
+
+
+def test_loose_and_unmatched_entity_names_are_counted_by_reason(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, episode_id: str, tmp_path: Path
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "one.json", episode_id, [TOKENS, ABSENT])
+
+    report = check_documents(
+        memory_store, persona, enrichment_root=tmp_path / "enrichment", doc_ids=[episode_id]
+    )
+
+    totals = report.loose_totals
+    assert totals["extraction/loose"] == 1
+    assert totals["extraction/unmatched"] == 1
+    assert not report.ok
+
+
+def test_a_document_with_no_extraction_json_fails_the_check(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, episode_id: str, tmp_path: Path
+) -> None:
+    report = check_documents(
+        memory_store, persona, enrichment_root=tmp_path / "enrichment", doc_ids=[episode_id]
+    )
+
+    assert report.without_extraction == (episode_id,)
+    assert not report.ok
+    assert "no extraction JSON: 1" in "\n".join(summary_lines(report))
+
+
+def test_a_sidecar_naming_a_document_the_graph_lacks_is_an_error(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, ingested: IngestReport, tmp_path: Path
+) -> None:
+    """The case that makes a capture look finished and be empty: JSON for a file never ingested."""
+    write_extraction(tmp_path / "enrichment" / "ghost.json", "test-pm:test-podcast:ghost", [])
+
+    report = check_documents(
+        memory_store, persona, enrichment_root=tmp_path / "enrichment", doc_ids=None
+    )
+
+    ghost = next(d for d in report.documents if d.doc_id.endswith(":ghost"))
+    assert not ghost.in_graph
+    assert ghost.errors and "unknown document" in ghost.errors[0]
+    assert not report.ok
+
+
+def test_attribution_and_annotation_sidecars_are_dry_run_too(
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    thread_document: str,
+    tmp_path: Path,
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "t.json", thread_document, ["Handbook"])
+    write_attribution(
+        tmp_path / "attribution" / "t.json",
+        thread_document,
+        [
+            {"speaker": "quill-maker", "anchor": FIRST, "role": "op"},
+            {"speaker": "nobody", "anchor": "words that appear in no passage at all here"},
+        ],
+    )
+    write_annotations(
+        tmp_path / "annotations" / "t.json",
+        thread_document,
+        [{"anchor": LAST, "facets": ["access"]}],
+    )
+
+    report = check_documents(
+        memory_store,
+        docs_persona,
+        enrichment_root=tmp_path / "enrichment",
+        attribution_root=tmp_path / "attribution",
+        annotation_root=tmp_path / "annotations",
+        doc_ids=[thread_document],
+    )
+
+    document = report.documents[0]
+    assert set(document.sidecars) == {"extraction", "attribution", "annotation"}
+    assert report.loose_totals["attribution/anchor"] == 1
+    assert not memory_store.documents[thread_document].speakers  # nothing was written
+    assert not report.ok
+
+
+def test_an_attribute_outside_the_vocabulary_is_loose_in_either_sidecar(
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    thread_document: str,
+    tmp_path: Path,
+) -> None:
+    """A tagging pass that invented a key or a value fails visibly rather than half-landing."""
+    from graphrag.extract.attributes import load_attributes
+
+    vocabulary = tmp_path / "facets.yaml"
+    vocabulary.write_text("attributes:\n  region:\n    values: [north, south]\n", encoding="utf-8")
+    write_extraction(tmp_path / "enrichment" / "t.json", thread_document, ["Handbook"])
+    write_attribution(
+        tmp_path / "attribution" / "t.json",
+        thread_document,
+        [{"speaker": "quill-maker", "anchor": FIRST, "attributes": {"region": "west"}}],
+    )
+    (tmp_path / "annotations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "annotations" / "t.json").write_text(
+        json.dumps({"doc_id": thread_document, "attributes": {"colour": "green"}}),
+        encoding="utf-8",
+    )
+
+    report = check_documents(
+        memory_store,
+        docs_persona,
+        enrichment_root=tmp_path / "enrichment",
+        attribution_root=tmp_path / "attribution",
+        annotation_root=tmp_path / "annotations",
+        doc_ids=[thread_document],
+        attributes=load_attributes(vocabulary),
+    )
+
+    assert report.loose_totals["attribution/attribute"] == 1
+    assert report.loose_totals["annotation/attribute"] == 1
+    lines = "\n".join(summary_lines(report))
+    assert "1 speaker attribute invalid" in lines
+    assert "1 document attribute invalid" in lines
+    assert not report.ok
+    assert memory_store.speaker_attributes("test-docs") == {}  # the dry run wrote nothing
+    assert memory_store.documents[thread_document].attributes == {}
+
+
+def test_a_valid_attribute_is_not_loose_and_is_counted_in_the_sidecars_summary(
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    thread_document: str,
+    tmp_path: Path,
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "t.json", thread_document, ["Handbook"])
+    write_attribution(
+        tmp_path / "attribution" / "t.json",
+        thread_document,
+        [{"speaker": "quill-maker", "anchor": FIRST, "attributes": {"region": "north"}}],
+    )
+
+    report = check_documents(
+        memory_store,
+        docs_persona,
+        enrichment_root=tmp_path / "enrichment",
+        attribution_root=tmp_path / "attribution",
+        doc_ids=[thread_document],
+    )
+
+    check = report.documents[0].sidecar("attribution")
+    assert check is not None and "1 attributes" in check.summary
+    assert report.loose_totals["attribution/attribute"] == 0
+
+
+def test_a_document_carrying_only_attributes_is_reported_as_annotated(
+    memory_store: InMemoryGraphStore,
+    persona: PersonaSpec,
+    ingested: IngestReport,
+    episode_id: str,
+    tmp_path: Path,
+) -> None:
+    """A document whose only annotation content is attributes is reported as annotated.
+
+    An annotation file can carry nothing but a top-level ``attributes`` block, with no
+    ``annotations`` entries: no chunk facet, no mention stance, just a document attribute. That
+    still has to count, or a check that only looks at facets and stances treats a real import as
+    one that never ran. The count itself rides in ``attribute_count``, for the table's benefit.
+    """
+    assert memory_store.annotated_document_ids("test-pm", "test-podcast") == set()
+
+    memory_store.set_document_attributes(episode_id, {"region": "north", "tier": "gold"})
+
+    report = check_documents(
+        memory_store,
+        persona,
+        enrichment_root=tmp_path / "enrichment",
+        doc_ids=[episode_id],
+    )
+
+    document = report.documents[0]
+    assert document.annotations is True
+    assert document.attribute_count == 2
+    assert document.state("annotation") == "graph"  # in the graph, no sidecar on disk
+
+
+def test_all_walks_the_persona_and_a_source_narrows_it(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, ingested: IngestReport, tmp_path: Path
+) -> None:
+    report = check_documents(
+        memory_store, persona, enrichment_root=tmp_path / "enrichment", doc_ids=None
+    )
+    assert len(report.documents) == 3
+
+    narrowed = check_documents(
+        memory_store,
+        persona,
+        enrichment_root=tmp_path / "enrichment",
+        doc_ids=None,
+        source_id="nothing-like-this",
+    )
+    assert narrowed.documents == ()
+
+
+def test_summary_lines_name_each_layer_and_the_loose_reasons(
+    memory_store: InMemoryGraphStore, persona: PersonaSpec, episode_id: str, tmp_path: Path
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "one.json", episode_id, [VERBATIM, ABSENT])
+
+    lines = summary_lines(
+        check_documents(
+            memory_store, persona, enrichment_root=tmp_path / "enrichment", doc_ids=[episode_id]
+        )
+    )
+
+    assert lines[0] == "test-pm: 1 documents checked"
+    assert any("extraction: 1 sidecars on disk" in line for line in lines)
+    assert any("entity name in no passage" in line for line in lines)
+    assert lines[-1] == "layers incomplete"
+
+
+# ----------------------------------------------------------------------------- the command
+
+
+def test_the_command_exits_1_when_a_document_has_no_extraction(
+    cli_context: AppContext, ingested: IngestReport
+) -> None:
+    result = runner.invoke(
+        app, ["layers", "check", "test-pm", "--doc-id", "test-pm:test-podcast:ada-north"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "no extraction JSON" in result.output
+
+
+def test_the_command_exits_0_when_every_layer_is_complete(
+    cli_context: AppContext, ingested: IngestReport
+) -> None:
+    write_extraction(
+        cli_context.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(
+        app, ["layers", "check", "test-pm", "--doc-id", "test-pm:test-podcast:ada-north"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "every layer complete" in result.output
+
+
+def test_the_command_prints_the_attribute_count_per_document(
+    cli_context: AppContext, ingested: IngestReport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table names how many document attributes the graph holds, one column of its own.
+
+    A wide terminal is forced so the long document id cannot wrap the row onto a second line,
+    which would otherwise put the count on a different line than the id it belongs to.
+    """
+    monkeypatch.setenv("COLUMNS", "300")
+    doc_id = "test-pm:test-podcast:ada-north"
+    cli_context.store.set_document_attributes(doc_id, {"region": "north", "tier": "gold"})
+
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--doc-id", doc_id])
+
+    assert "attributes" in result.output
+    rows = [line for line in result.output.splitlines() if doc_id in line]
+    assert rows and "2" in rows[0]
+
+
+def test_the_command_takes_a_raw_file_and_derives_the_id(
+    cli_context: AppContext, ingested: IngestReport
+) -> None:
+    raw = cli_context.settings.raw_dir / "test-pm" / "episodes" / "ada-north" / "transcript.md"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text("# a transcript\n", encoding="utf-8")
+    write_extraction(
+        cli_context.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--file", str(raw)])
+
+    # A derived id that missed would have found no extraction file and exited 1.
+    assert result.exit_code == 0, result.output
+    assert "test-pm: 1 documents checked" in result.output
+
+
+@pytest.fixture
+def relative_raw_dir(
+    cli_context: AppContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AppContext:
+    """The container's shape: ``raw_dir`` relative, resolved against the directory the CLI runs in.
+
+    The fixtures elsewhere make every path absolute, which hid the one comparison this command
+    depends on: a relative base against whatever form the caller typed.
+    """
+    from graphrag.cli import State
+
+    workdir = tmp_path / "workdir"
+    (workdir / "data" / "raw").mkdir(parents=True)
+    monkeypatch.chdir(workdir)
+    relative = cli_context.settings.model_copy(update={"raw_dir": Path("data/raw")})
+    ctx = AppContext(
+        settings=relative,
+        store=cli_context.store,
+        registry=cli_context.registry,
+        embedder=cli_context.embedder,
+    )
+    State.factory = lambda: ctx
+    return ctx
+
+
+def write_raw_episode(raw_dir: Path) -> Path:
+    """The raw file whose folder name the transcripts loader turns into the document id."""
+    path = raw_dir / "test-pm" / "episodes" / "ada-north" / "transcript.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# a transcript\n", encoding="utf-8")
+    return path
+
+
+def test_the_command_takes_a_relative_file_against_a_relative_raw_dir(
+    relative_raw_dir: AppContext, ingested: IngestReport
+) -> None:
+    """`--file data/raw/...`, the form a person types. It used to cover no source at all."""
+    write_raw_episode(relative_raw_dir.settings.raw_dir)
+    write_extraction(
+        relative_raw_dir.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "layers",
+            "check",
+            "test-pm",
+            "--file",
+            "data/raw/test-pm/episodes/ada-north/transcript.md",
+        ],
+    )
+
+    assert "no source" not in result.output
+    assert result.exit_code == 0, result.output
+    assert "test-pm: 1 documents checked" in result.output
+
+
+def test_the_command_takes_an_absolute_file_against_a_relative_raw_dir(
+    relative_raw_dir: AppContext, ingested: IngestReport
+) -> None:
+    """And the form a hook hands over, which is the same file spelled from the root."""
+    raw = write_raw_episode(relative_raw_dir.settings.raw_dir)
+    write_extraction(
+        relative_raw_dir.settings.enrichment_dir / "one.json",
+        "test-pm:test-podcast:ada-north",
+        [VERBATIM],
+    )
+
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--file", str(raw.resolve())])
+
+    assert "no source" not in result.output
+    assert result.exit_code == 0, result.output
+    assert "test-pm: 1 documents checked" in result.output
+
+
+def test_the_command_asks_for_a_scope_when_given_none(cli_context: AppContext) -> None:
+    result = runner.invoke(app, ["layers", "check", "test-pm"])
+
+    assert result.exit_code == 2
+    assert "--doc-id" in result.output
+
+
+def test_the_command_rejects_a_file_outside_the_personas_sources(cli_context: AppContext) -> None:
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--file", "/elsewhere/stray.md"])
+
+    assert result.exit_code == 2
+    assert "no source of test-pm" in result.output

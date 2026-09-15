@@ -76,8 +76,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GRAPHRAG_", env_file=_ENV_FILE, extra="ignore")
 
     personas_dir: Path = Path("personas")
+    raw_dir: Path = Path("data/raw")
     snapshots_dir: Path = Path("data/snapshots")
     enrichment_dir: Path = Path("data/enrichment")
+    attribution_dir: Path = Path("data/attribution")
+    annotations_dir: Path = Path("data/annotations")
     model_cache_dir: Path = Path("/models")
     skills_dir: Path = Path(".claude/skills")
 

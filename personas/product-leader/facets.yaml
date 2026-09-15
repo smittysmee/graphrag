@@ -1,0 +1,39 @@
+# Facet vocabulary for the product-leader persona.
+#
+# A facet says what a passage is *about*, independently of which entity it names or what stance
+# it takes. An annotation may carry several; anything outside this list is reported and dropped
+# at import, so the vocabulary stays small enough to filter and group by.
+#
+# Keep each slug to one idea and each definition to one sentence. Prefer adding a facet only
+# once several passages need it: a slug used twice is noise in every grouping that follows.
+
+facets:
+  discovery: Talking to users, interviewing, and deciding what problem is worth solving.
+  product_market_fit: Whether the product has found its market, and how anyone can tell.
+  positioning: How the product is framed, named and differentiated against the alternatives.
+  onboarding: "The first-run experience: what a new user is walked through before they get value."
+  activation: A new user reaching the moment the product first pays off for them.
+  retention: Users continuing to come back, cohort curves, churn and resurrection.
+  growth_loops: Mechanisms where using the product produces more users, including referral and virality.
+  pricing: What the product costs, how it is packaged, and how price is tested or changed.
+  monetisation: "Turning usage into revenue: conversion, upsell, free-to-paid and expansion."
+  metrics: Choosing, defining and arguing about numbers, including north-star and counter-metrics.
+  experimentation: A/B tests, holdouts, statistical calls and what an experiment can and cannot settle.
+  roadmap: What gets built next, in what order, and how the plan is written down and revised.
+  prioritisation: Choosing between bets and killing work, including the frameworks used to argue.
+  strategy: Where the company is going and why, including bets, moats and what it refuses to do.
+  execution: "Shipping: scoping, sequencing, deadlines, and what slows a team down."
+  research: Studies, usability work and analysis done to answer a question rather than to ship.
+  design: Craft, interaction and visual decisions, and how design work is reviewed.
+  engineering: How the product gets built, technical constraints, and working with engineers.
+  ai_tooling: Building with models, or using AI tools in the product work itself.
+  hiring: Recruiting, interviewing, levelling and deciding who joins the team.
+  management: "Running people: one-on-ones, feedback, performance and growing reports."
+  career: "An individual's own path: levels, moves, promotion, burnout and what to do next."
+  culture: Norms, values and how a company actually behaves as opposed to what it says.
+  organisation: Team shape, reporting lines, ownership boundaries and reorganisation.
+  stakeholders: "Working across functions and upward: executives, sales, support and the board."
+  communication: Writing, presenting and persuading, including documents and reviews.
+  customers: Specific accounts, segments and what a named kind of user needs.
+  competition: Rivals, category dynamics and responding to what someone else shipped.
+  fundraising: Investors, rounds, valuation and the reporting that comes with them.

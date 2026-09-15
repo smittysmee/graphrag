@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Iterator, Sequence
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import date
 from itertools import pairwise
 from typing import Any
@@ -16,19 +17,31 @@ from neo4j import GraphDatabase, RoutingControl
 from graphrag.config import Neo4jSettings
 from graphrag.embed.base import Matrix, Vector
 from graphrag.graph.schema import FULLTEXT_INDEX, VECTOR_INDEX, lucene_escape, schema_statements
+from graphrag.graph.vectors import stack_means
 from graphrag.models import (
+    ENTITY_TYPES,
     Chunk,
+    ChunkFacets,
     Document,
     Enrichment,
     Entity,
+    EntityChunk,
+    EntityCollision,
+    EntityMention,
     GraphStats,
     Mention,
+    MentionStance,
     PersonaSpec,
     RelatedTopic,
     Relation,
     ScoredChunk,
     SpeakerCount,
+    SpeakerDocument,
+    SpeakerPost,
+    Stance,
     TopicCount,
+    TopicEdge,
+    merge_entity,
 )
 
 BATCH = 500
@@ -42,6 +55,19 @@ WRITE_KEYWORDS = re.compile(
 )
 
 
+#: ``" ".join(name.split()).lower()`` written in Cypher, so two spellings of an entity are
+#: compared here exactly as :func:`graphrag.extract.aliases.fold_name` compares them in Python.
+FOLD_ENTITY_NAME = (
+    "reduce(s = '', w IN split(toLower(trim(e.name)), ' ') | "
+    "CASE WHEN w = '' THEN s WHEN s = '' THEN w ELSE s + ' ' + w END)"
+)
+
+
+def _fold_name(name: str) -> str:
+    """The Python half of :data:`FOLD_ENTITY_NAME`: lower case, whitespace collapsed."""
+    return " ".join(name.split()).casefold()
+
+
 def _chunk_props(chunk: Chunk) -> dict[str, Any]:
     return {
         "doc_id": chunk.doc_id,
@@ -50,6 +76,11 @@ def _chunk_props(chunk: Chunk) -> dict[str, Any]:
         "text": chunk.text,
         "speaker": chunk.speaker,
         "speakers": chunk.speakers,
+        # A list of maps cannot be a node property, and the SPOKE edges these rebuild are not
+        # in the snapshot, so the passage carries them as JSON the way a Document carries its
+        # metadata.
+        "speaker_posts_json": json.dumps([p.model_dump() for p in chunk.speaker_posts]),
+        "facets": chunk.facets,
         "start_ts": chunk.start_ts,
         "start_seconds": chunk.start_seconds,
         "url": chunk.url,
@@ -66,11 +97,38 @@ def _chunk_from_node(node: dict[str, Any]) -> Chunk:
         text=node["text"],
         speaker=node.get("speaker"),
         speakers=list(node.get("speakers") or []),
+        speaker_posts=[
+            SpeakerPost.model_validate(p)
+            for p in json.loads(node.get("speaker_posts_json") or "[]")
+        ],
+        facets=list(node.get("facets") or []),
         start_ts=node.get("start_ts"),
         start_seconds=node.get("start_seconds"),
         url=node.get("url"),
         word_count=int(node.get("word_count") or 0),
     )
+
+
+#: How a persona's speaker attributes are named on the shared ``Speaker`` node. The node is
+#: keyed on the name alone, so two personas can hold the same handle; a reading written for one
+#: corpus is not a fact about the other, and the prefix is what keeps them apart. Keys are
+#: slugs (:data:`graphrag.extract.attributes.KEY_RE`) and persona ids are slugs, so the double
+#: underscore never occurs inside either half and the split back is unambiguous.
+ATTR_PREFIX = "attr__"
+
+
+def _attr_prefix(persona_id: str) -> str:
+    return f"{ATTR_PREFIX}{persona_id}__"
+
+
+def _speaker_attributes(props: Mapping[str, Any], persona_id: str) -> dict[str, str]:
+    """This persona's attributes out of a ``Speaker`` node's properties."""
+    prefix = _attr_prefix(persona_id)
+    return {
+        key[len(prefix) :]: str(value)
+        for key, value in props.items()
+        if key.startswith(prefix) and value is not None
+    }
 
 
 def _doc_props(doc: Document) -> dict[str, Any]:
@@ -85,8 +143,20 @@ def _doc_props(doc: Document) -> dict[str, Any]:
         "speakers": doc.speakers,
         "topics": doc.topics,
         "metadata_json": json.dumps(doc.metadata, sort_keys=True),
+        # Carried as JSON for the reason `metadata_json` is: a map cannot be a node property.
+        # Written on every upsert, so a re-ingest drops what the annotation layer put here
+        # exactly as it drops the stances, and `sync --refresh-annotations` puts it back.
+        "attributes_json": json.dumps(doc.attributes, sort_keys=True),
         "word_count": doc.word_count,
     }
+
+
+def _attributes(raw: Any) -> dict[str, str]:
+    """A node's ``attributes_json`` as a plain mapping of strings."""
+    loaded = json.loads(raw or "{}")
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): str(value) for key, value in loaded.items() if value is not None}
 
 
 def _doc_from_node(node: dict[str, Any]) -> Document:
@@ -103,6 +173,7 @@ def _doc_from_node(node: dict[str, Any]) -> Document:
         speakers=list(node.get("speakers") or []),
         topics=list(node.get("topics") or []),
         metadata=json.loads(node.get("metadata_json") or "{}"),
+        attributes=_attributes(node.get("attributes_json")),
         word_count=int(node.get("word_count") or 0),
     )
 
@@ -201,7 +272,12 @@ class Neo4jGraphStore:
             batch = chunks[i : i + BATCH]
             vecs = embeddings[i : i + BATCH]
             rows = [
-                {"id": c.id, "props": _chunk_props(c), "embedding": [float(x) for x in v]}
+                {
+                    "id": c.id,
+                    "props": _chunk_props(c),
+                    "embedding": [float(x) for x in v],
+                    "posts": [p.model_dump() for p in c.speaker_posts],
+                }
                 for c, v in zip(batch, vecs, strict=True)
             ]
             self._run(
@@ -221,6 +297,21 @@ class Neo4jGraphStore:
                 """,
                 rows=rows,
             )
+            # The post's date, role and score live on the edge, so loading a snapshot has to put
+            # them back; the passage carried them across as JSON.
+            dated = [row for row in rows if row["posts"]]
+            if dated:
+                self._run(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (c:Chunk {id: row.id})
+                    UNWIND row.posts AS post
+                    MERGE (s:Speaker {name: post.speaker})
+                    MERGE (s)-[r:SPOKE]->(c)
+                    SET r.posted_at = post.posted_at, r.role = post.role, r.score = post.score
+                    """,
+                    rows=dated,
+                )
         pairs = [
             [a.id, b.id]
             for a, b in pairwise(chunks)
@@ -250,24 +341,78 @@ class Neo4jGraphStore:
                 rows=rows[i : i + BATCH],
             )
 
-    def upsert_enrichment(self, enrichment: Enrichment) -> None:
-        if enrichment.entities:
-            self._run(
-                """
-                UNWIND $rows AS row
-                MERGE (e:Entity {id: row.id})
-                SET e.name = row.name, e.type = row.type,
-                    e.description = CASE WHEN row.description <> '' THEN row.description
-                                         ELSE coalesce(e.description, '') END
-                """,
-                rows=[e.model_dump() for e in enrichment.entities],
+    def _entities_by_id(self, ids: set[str]) -> dict[str, tuple[Entity, int]]:
+        """The entity nodes these ids name and how many passages mention each, as models.
+
+        Ids nobody holds are simply absent. The mention count rides along because
+        ``merge_entity`` needs it to tell a node that stands for something from one a re-ingest
+        emptied out. ``type`` is guarded rather than trusted: a node edited by hand in the
+        browser can carry anything, and an import of hundreds of files should not stop on one
+        bad property.
+        """
+        return {
+            row["id"]: (
+                Entity(
+                    id=row["id"],
+                    name=row["name"],
+                    type=row["type"] if row["type"] in ENTITY_TYPES else "other",
+                    description=row["description"],
+                    aliases=row["aliases"],
+                ),
+                int(row["mentions"]),
             )
+            for row in self._read(
+                """
+                MATCH (e:Entity) WHERE e.id IN $ids
+                RETURN e.id AS id, coalesce(e.name, '') AS name,
+                       coalesce(e.type, 'other') AS type,
+                       coalesce(e.description, '') AS description,
+                       coalesce(e.aliases, []) AS aliases,
+                       count { (e)<-[:MENTIONS]-() } AS mentions
+                """,
+                ids=sorted(ids),
+            )
+        }
+
+    def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]:
+        collisions: list[EntityCollision] = []
+        if enrichment.entities:
+            # Read the nodes these ids already name before writing any of them: an id whose node
+            # is called something else is a slug collision, and the node keeps its name. The
+            # merge itself is done in Python by ``merge_entity`` so both stores decide alike,
+            # which is why the write below sets the resolved values outright.
+            held = self._entities_by_id({e.id for e in enrichment.entities})
+            rows: list[dict[str, Any]] = []
+            for entity in enrichment.entities:
+                found = held.get(entity.id)
+                resolved, collision = merge_entity(
+                    None if found is None else found[0],
+                    entity,
+                    held_mentions=None if found is None else found[1],
+                )
+                # so a second row for this id sees the resolved node, still with its own count
+                held[entity.id] = (resolved, 0 if found is None else found[1])
+                if collision is not None:
+                    collisions.append(collision)
+                    continue
+                rows.append(resolved.model_dump())
+            if rows:
+                self._run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (e:Entity {id: row.id})
+                    SET e.name = row.name, e.type = row.type,
+                        e.description = row.description, e.aliases = row.aliases
+                    """,
+                    rows=rows,
+                )
         if enrichment.mentions:
             self._run(
                 """
                 UNWIND $rows AS row
                 MATCH (c:Chunk {id: row.chunk_id}), (e:Entity {id: row.entity_id})
-                MERGE (c)-[:MENTIONS]->(e)
+                MERGE (c)-[m:MENTIONS]->(e)
+                SET m.stance = coalesce(row.stance, m.stance)
                 """,
                 rows=[m.model_dump() for m in enrichment.mentions],
             )
@@ -281,6 +426,120 @@ class Neo4jGraphStore:
                 """,
                 rows=[r.model_dump() for r in enrichment.relations],
             )
+        return collisions
+
+    def merge_entities(self, persona_id: str, canonical: str, aliases: Sequence[str]) -> int:
+        """Fold every alias spelling of ``canonical`` into one node. Returns mentions moved.
+
+        Scoped to one persona: entity nodes are shared, so another persona's mentions of an
+        alias spelling stay where they are and the alias node survives. Relations are scoped the
+        same way, through the passage each one is anchored to.
+        """
+        spellings = sorted({_fold_name(a) for a in aliases if a.strip()} | {_fold_name(canonical)})
+        found = self._read(
+            f"""
+            MATCH (e:Entity) WHERE {FOLD_ENTITY_NAME} IN $spellings
+            OPTIONAL MATCH (c:Chunk {{persona_id: $pid}})-[:MENTIONS]->(e)
+            RETURN e.id AS id, e.name AS name, coalesce(e.type, 'other') AS type,
+                   coalesce(e.description, '') AS description, coalesce(e.aliases, []) AS aliases,
+                   count(c) AS mentions
+            """,
+            spellings=spellings,
+            pid=persona_id,
+        )
+        if not found:
+            return 0
+        folded = _fold_name(canonical)
+        best = max(
+            found, key=lambda r: (_fold_name(r["name"]) == folded, int(r["mentions"]), r["id"])
+        )
+        target_id = Entity.make_id(canonical, best["type"])
+        recorded = sorted(
+            {a for row in found for a in row["aliases"]}
+            | {a.strip() for a in aliases if a.strip() and _fold_name(a) != folded}
+        )
+        self._run(
+            """
+            MERGE (e:Entity {id: $id})
+            SET e.name = $name, e.type = $type,
+                e.description = CASE WHEN coalesce(e.description, '') <> '' THEN e.description
+                                     ELSE $description END,
+                e.aliases = $aliases
+            """,
+            id=target_id,
+            name=canonical,
+            type=best["type"],
+            description=best["description"],
+            aliases=recorded,
+        )
+        stale = [row["id"] for row in found if row["id"] != target_id]
+        if not stale:
+            return 0
+        group = [*stale, target_id]
+
+        # A relation between two spellings of one thing says nothing once they are one node.
+        self._run(
+            """
+            MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+            WHERE a.id IN $group AND b.id IN $group
+            MATCH (:Chunk {id: r.chunk_id, persona_id: $pid})
+            DELETE r
+            """,
+            group=group,
+            pid=persona_id,
+        )
+        self._run(
+            """
+            MATCH (old:Entity)-[r:RELATED_TO]->(other:Entity)
+            WHERE old.id IN $stale AND NOT other.id IN $group
+            MATCH (:Chunk {id: r.chunk_id, persona_id: $pid})
+            MATCH (target:Entity {id: $target_id})
+            MERGE (target)-[n:RELATED_TO {type: r.type, chunk_id: r.chunk_id}]->(other)
+            SET n.evidence = CASE WHEN coalesce(n.evidence, '') <> '' THEN n.evidence
+                                  ELSE coalesce(r.evidence, '') END
+            DELETE r
+            """,
+            stale=stale,
+            group=group,
+            pid=persona_id,
+            target_id=target_id,
+        )
+        self._run(
+            """
+            MATCH (other:Entity)-[r:RELATED_TO]->(old:Entity)
+            WHERE old.id IN $stale AND NOT other.id IN $group
+            MATCH (:Chunk {id: r.chunk_id, persona_id: $pid})
+            MATCH (target:Entity {id: $target_id})
+            MERGE (other)-[n:RELATED_TO {type: r.type, chunk_id: r.chunk_id}]->(target)
+            SET n.evidence = CASE WHEN coalesce(n.evidence, '') <> '' THEN n.evidence
+                                  ELSE coalesce(r.evidence, '') END
+            DELETE r
+            """,
+            stale=stale,
+            group=group,
+            pid=persona_id,
+            target_id=target_id,
+        )
+        moved = self._run(
+            """
+            MATCH (c:Chunk {persona_id: $pid})-[m:MENTIONS]->(old:Entity)
+            WHERE old.id IN $stale
+            MATCH (target:Entity {id: $target_id})
+            MERGE (c)-[n:MENTIONS]->(target)
+            SET n.stance = coalesce(n.stance, m.stance)
+            DELETE m
+            RETURN count(*) AS moved
+            """,
+            stale=stale,
+            pid=persona_id,
+            target_id=target_id,
+        )
+        # Only a node nothing holds any more: another persona may still mention this spelling.
+        self._run(
+            "MATCH (e:Entity) WHERE e.id IN $stale AND NOT (e)--() DELETE e",
+            stale=stale,
+        )
+        return int(moved[0]["moved"]) if moved else 0
 
     def delete_documents(self, doc_ids: Sequence[str]) -> None:
         self._run(
@@ -307,9 +566,36 @@ class Neo4jGraphStore:
             "DETACH DELETE p, s",
             pid=persona_id,
         )
-        self._run("MATCH (e:Entity) WHERE NOT (e)<-[:MENTIONS]-() DETACH DELETE e")
+        self.delete_orphan_entities(persona_id)
         self._run("MATCH (s:Speaker) WHERE NOT (s)--() DELETE s")
         self._run("MATCH (t:Topic) WHERE NOT (t)<-[:ABOUT]-() DETACH DELETE t")
+
+    def delete_orphan_entities(self, persona_id: str, *, dry_run: bool = False) -> int:
+        """Drop the entity nodes nothing mentions any more. Returns how many went.
+
+        Scoped the way ``merge_entities`` is: entity nodes are shared, so a node another
+        persona's passage still relates to survives even with no mention on it. A relation whose
+        passage is gone holds nothing, so it does not keep its endpoints alive; the RELATED_TO
+        edges of a node that goes are detached with it.
+        """
+        match = """
+            MATCH (e:Entity)
+            WHERE NOT (e)<-[:MENTIONS]-()
+              AND NOT EXISTS {
+                MATCH (e)-[r:RELATED_TO]-()
+                MATCH (c:Chunk {id: r.chunk_id}) WHERE c.persona_id <> $pid
+              }
+        """
+        if dry_run:
+            rows = self._read(match + "RETURN count(e) AS removed", pid=persona_id)
+        else:
+            rows = self._run(
+                match + "WITH collect(e) AS doomed "
+                "FOREACH (e IN doomed | DETACH DELETE e) "
+                "RETURN size(doomed) AS removed",
+                pid=persona_id,
+            )
+        return int(rows[0]["removed"]) if rows else 0
 
     # ------------------------------------------------------------- search
     def vector_search(
@@ -405,6 +691,18 @@ class Neo4jGraphStore:
         )
         return [_doc_from_node(r["d"]) for r in rows]
 
+    def document_ids(self, persona_id: str, source_id: str | None = None) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE $source_id IS NULL OR d.source_id = $source_id
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
     def document_chunks(self, doc_id: str, start: int = 0, count: int = 5) -> list[Chunk]:
         rows = self._read(
             """
@@ -473,6 +771,17 @@ class Neo4jGraphStore:
         )
         return [Entity.model_validate(r["e"]) for r in rows]
 
+    def persona_entities(self, persona_id: str) -> list[Entity]:
+        rows = self._paged(
+            """
+            MATCH (c:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+            RETURN DISTINCT e {.*} AS e ORDER BY e.id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        return [Entity.model_validate(r["e"]) for r in rows]
+
     def enriched_doc_ids(self, persona_id: str) -> set[str]:
         rows = self._read(
             """
@@ -482,6 +791,19 @@ class Neo4jGraphStore:
             pid=persona_id,
         )
         return {r["doc_id"] for r in rows}
+
+    def enriched_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id
+              AND EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity) }
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
 
     # ------------------------------------------------------------- bulk
     def iter_documents(self, persona_id: str) -> Iterator[Document]:
@@ -515,11 +837,12 @@ class Neo4jGraphStore:
 
     def enrichment_for_persona(self, persona_id: str) -> Enrichment:
         mentions = [
-            Mention(chunk_id=r["chunk_id"], entity_id=r["entity_id"])
+            Mention(chunk_id=r["chunk_id"], entity_id=r["entity_id"], stance=r["stance"])
             for r in self._read(
                 """
-                MATCH (c:Chunk {persona_id: $pid})-[:MENTIONS]->(e:Entity)
-                RETURN c.id AS chunk_id, e.id AS entity_id ORDER BY chunk_id, entity_id
+                MATCH (c:Chunk {persona_id: $pid})-[m:MENTIONS]->(e:Entity)
+                RETURN c.id AS chunk_id, e.id AS entity_id, m.stance AS stance
+                ORDER BY chunk_id, entity_id
                 """,
                 pid=persona_id,
             )
@@ -587,3 +910,452 @@ class Neo4jGraphStore:
         with self._driver.session(database=self._db, default_access_mode="READ") as session:
             result = session.run(query, params or {})
             return [record.data() for record in result][:500]
+
+    # ------------------------------------------------------------- attribution
+    def attach_speaker(
+        self,
+        doc_id: str,
+        chunk_id: str,
+        speaker: str,
+        *,
+        posted_at: str | None = None,
+        role: str | None = None,
+        score: int | None = None,
+    ) -> None:
+        """Record that ``speaker`` wrote the passage ``chunk_id`` of document ``doc_id``.
+
+        Writes the same shape the transcripts path writes on upsert -- a ``Speaker`` node, a
+        ``SPOKE`` edge to the passage and a ``FEATURES`` edge from the document -- plus the
+        ``speakers`` properties those edges are rebuilt from, so an attributed document survives
+        a snapshot export and load. Every ``MERGE`` makes re-import a no-op. A ``chunk_id`` that
+        is not a passage of ``doc_id`` matches nothing and writes nothing.
+
+        When the post is dated, given a role or scored, those go on the ``SPOKE`` edge and on
+        the passage's ``speaker_posts``, which is what carries them into a snapshot. A second
+        call for the same speaker and passage replaces that record: one speaker holds one
+        passage once, however many times a file says so.
+        """
+        self._run(
+            """
+            MATCH (d:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk {id: $chunk_id})
+            MERGE (s:Speaker {name: $speaker})
+            MERGE (s)-[r:SPOKE]->(c)
+            MERGE (d)-[:FEATURES]->(s)
+            SET r.posted_at = $posted_at, r.role = $role, r.score = $score,
+                c.speakers = CASE
+                    WHEN $speaker IN coalesce(c.speakers, []) THEN c.speakers
+                    ELSE coalesce(c.speakers, []) + $speaker END,
+                d.speakers = CASE
+                    WHEN $speaker IN coalesce(d.speakers, []) THEN d.speakers
+                    ELSE coalesce(d.speakers, []) + $speaker END
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+            speaker=speaker,
+            posted_at=posted_at,
+            role=role,
+            score=score,
+        )
+        if posted_at is None and role is None and score is None:
+            return
+        self._run(
+            """
+            MATCH (d:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk {id: $chunk_id})
+            SET c.speaker_posts_json = $posts
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+            posts=json.dumps(self._merged_posts(doc_id, chunk_id, speaker, posted_at, role, score)),
+        )
+
+    def _merged_posts(
+        self,
+        doc_id: str,
+        chunk_id: str,
+        speaker: str,
+        posted_at: str | None,
+        role: str | None,
+        score: int | None,
+    ) -> list[dict[str, Any]]:
+        """The passage's post records with this speaker's replaced, read back before writing."""
+        rows = self._read(
+            """
+            MATCH (:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk {id: $chunk_id})
+            RETURN coalesce(c.speaker_posts_json, '[]') AS posts
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+        )
+        held = json.loads(rows[0]["posts"]) if rows else []
+        post = SpeakerPost(speaker=speaker, posted_at=posted_at, role=role, score=score)
+        return [p for p in held if p.get("speaker") != speaker] + [post.model_dump()]
+
+    def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id AND EXISTS { MATCH (d)-[:FEATURES]->(:Speaker) }
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
+    # ------------------------------------------------------------- node attributes
+    def set_speaker_attributes(
+        self, persona_id: str, speaker: str, attributes: Mapping[str, str]
+    ) -> list[str]:
+        """Record what this persona's corpus says the speaker is. Returns the keys it refused.
+
+        Held as prefixed properties on the shared ``Speaker`` node rather than on an edge to
+        the ``Persona``: a node with no passages left is deleted by the orphan sweep in
+        ``delete_persona``, and an attribute must not be the thing that keeps it alive.
+
+        Read then written, in two statements, because first-value-wins needs the held value and
+        Cypher cannot build a map from a computed list without APOC. The import path is a single
+        writer, so nothing races between the two. The write matches rather than merges the node:
+        a speaker no passage records is not a speaker, and an attribute is not a reason to keep
+        one alive.
+        """
+        wanted = {key: value for key, value in attributes.items() if value}
+        if not wanted:
+            return []
+        rows = self._read(
+            "MATCH (s:Speaker {name: $speaker}) RETURN properties(s) AS props", speaker=speaker
+        )
+        held = _speaker_attributes(rows[0]["props"], persona_id) if rows else {}
+        refused = [key for key, value in wanted.items() if held.get(key, value) != value]
+        fresh = {
+            _attr_prefix(persona_id) + key: value
+            for key, value in wanted.items()
+            if key not in refused
+        }
+        if fresh:
+            self._run(
+                "MATCH (s:Speaker {name: $speaker}) SET s += $props",
+                speaker=speaker,
+                props=fresh,
+            )
+        return refused
+
+    def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None:
+        """Merge attributes into the document, the incoming value winning per key."""
+        rows = self._read(
+            "MATCH (d:Document {id: $doc_id}) RETURN coalesce(d.attributes_json, '{}') AS held",
+            doc_id=doc_id,
+        )
+        if not rows:
+            return
+        merged = {**_attributes(rows[0]["held"]), **{k: v for k, v in attributes.items() if v}}
+        self._run(
+            "MATCH (d:Document {id: $doc_id}) SET d.attributes_json = $json",
+            doc_id=doc_id,
+            json=json.dumps(merged, sort_keys=True),
+        )
+
+    def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        """Every speaker of this persona that carries attributes, with what it carries."""
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            CALL {
+              WITH d
+              MATCH (d)-[:FEATURES]->(s:Speaker) RETURN s
+              UNION
+              WITH d
+              MATCH (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(s:Speaker) RETURN s
+            }
+            WITH DISTINCT s
+            RETURN s.name AS speaker, properties(s) AS props
+            ORDER BY speaker
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        out: dict[str, dict[str, str]] = {}
+        for row in rows:
+            attrs = _speaker_attributes(row["props"], persona_id)
+            if attrs:
+                out[row["speaker"]] = attrs
+        return out
+
+    def document_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.attributes_json IS NOT NULL AND d.attributes_json <> '{}'
+            RETURN d.id AS doc_id, d.attributes_json AS attrs
+            ORDER BY doc_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        return {row["doc_id"]: _attributes(row["attrs"]) for row in rows}
+
+    # ------------------------------------------------------------- annotation
+    def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None:
+        """Set ``stance`` on the ``MENTIONS`` edge from this passage to ``entity``.
+
+        The entity is looked up among the ones the passage already mentions, by id or by folded
+        name: a stance is a reading of an edge that exists, so an entity nobody extracted here
+        matches nothing and writes nothing rather than creating the edge it would need.
+        """
+        self._run(
+            f"""
+            MATCH (:Document {{id: $doc_id}})-[:HAS_CHUNK]->(c:Chunk {{id: $chunk_id}})
+            MATCH (c)-[m:MENTIONS]->(e:Entity)
+            WHERE e.id = $entity OR {FOLD_ENTITY_NAME} = $folded
+            SET m.stance = $stance
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+            entity=entity.strip(),
+            folded=_fold_name(entity),
+            stance=stance,
+        )
+
+    def annotate_chunk(self, doc_id: str, chunk_id: str, facets: Sequence[str]) -> None:
+        """Add ``facets`` to the passage's ``facets`` list, deduplicated and order-preserving."""
+        self._run(
+            """
+            MATCH (:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk {id: $chunk_id})
+            SET c.facets = reduce(
+                held = coalesce(c.facets, []), f IN $facets |
+                CASE WHEN f IN held THEN held ELSE held + f END)
+            """,
+            doc_id=doc_id,
+            chunk_id=chunk_id,
+            facets=list(facets),
+        )
+
+    def annotated_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        # A document counts as annotated when a passage carries a facet, a mention carries a
+        # stance, or the document itself carries an attribute. That third case covers an
+        # annotation file with nothing but a top-level `attributes` block and no `annotations`
+        # entries: it wrote `d.attributes_json`, and without this clause that import looks
+        # identical to one that never ran.
+        rows = self._read(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.source_id = $source_id
+              AND (EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+                            WHERE size(coalesce(c.facets, [])) > 0 }
+                   OR EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[m:MENTIONS]->(:Entity)
+                               WHERE m.stance IS NOT NULL }
+                   OR (d.attributes_json IS NOT NULL AND d.attributes_json <> '{}'))
+            RETURN d.id AS id
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return {r["id"] for r in rows}
+
+    def mention_stances(self, persona_id: str, source_id: str | None = None) -> list[MentionStance]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+            MATCH (c)-[m:MENTIONS]->(e:Entity)
+            WHERE m.stance IS NOT NULL AND ($source_id IS NULL OR d.source_id = $source_id)
+            RETURN e.id AS entity_id, e.name AS name, c.id AS chunk_id, d.id AS doc_id,
+                   m.stance AS stance, coalesce(c.speakers, []) AS speakers
+            ORDER BY entity_id, chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return [MentionStance.model_validate(r) for r in rows]
+
+    def chunk_facets(self, persona_id: str, source_id: str | None = None) -> list[ChunkFacets]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+            WHERE size(coalesce(c.facets, [])) > 0
+              AND ($source_id IS NULL OR d.source_id = $source_id)
+            RETURN c.id AS chunk_id, d.id AS doc_id, c.facets AS facets
+            ORDER BY chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return [ChunkFacets.model_validate(r) for r in rows]
+
+    # ------------------------------------------------------------- network analysis
+    def _paged(self, query: str, **params: Any) -> Iterator[dict[str, Any]]:
+        """Run a read-only query in ``BATCH``-row pages. The query must end in SKIP/LIMIT."""
+        skip = 0
+        while True:
+            rows = self._read(query, skip=skip, page=BATCH, **params)
+            yield from rows
+            if len(rows) < BATCH:
+                return
+            skip += BATCH
+
+    def speaker_document_pairs(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[SpeakerDocument]:
+        # A speaker belongs to a document either because the document credits them (FEATURES)
+        # or because they hold one of its passages (SPOKE); ingestion writes both, but an
+        # attribution pass can land one before the other, so take the union.
+        query = """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE $source_id IS NULL OR d.source_id = $source_id
+            CALL {
+              WITH d
+              MATCH (d)-[:FEATURES]->(s:Speaker) RETURN s
+              UNION
+              WITH d
+              MATCH (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(s:Speaker) RETURN s
+            }
+            WITH d, s
+            OPTIONAL MATCH (s)-[:SPOKE]->(c:Chunk {doc_id: d.id})
+            WITH d, s, count(c) AS chunks
+            RETURN s.name AS speaker, d.id AS doc_id, chunks, properties(s) AS props,
+                   coalesce(d.attributes_json, '{}') AS doc_attrs
+            ORDER BY speaker, doc_id
+            SKIP $skip LIMIT $page
+            """
+        if since is not None or until is not None:
+            # A window is answered from the dated SPOKE edges alone: a document credit carries no
+            # date, and an undated post is left out rather than assumed to fall in range.
+            query = """
+                MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+                MATCH (s:Speaker)-[r:SPOKE]->(c)
+                WHERE ($source_id IS NULL OR d.source_id = $source_id)
+                  AND r.posted_at IS NOT NULL
+                  AND ($since IS NULL OR r.posted_at >= $since)
+                  AND ($until IS NULL OR r.posted_at <= $until)
+                WITH d, s, count(c) AS chunks
+                RETURN s.name AS speaker, d.id AS doc_id, chunks, properties(s) AS props,
+                       coalesce(d.attributes_json, '{}') AS doc_attrs
+                ORDER BY speaker, doc_id
+                SKIP $skip LIMIT $page
+                """
+        rows = self._paged(
+            query, persona_id=persona_id, source_id=source_id, since=since, until=until
+        )
+        return [
+            SpeakerDocument(
+                speaker=r["speaker"],
+                doc_id=r["doc_id"],
+                chunks=int(r["chunks"]),
+                speaker_attributes=_speaker_attributes(r["props"], persona_id),
+                document_attributes=_attributes(r["doc_attrs"]),
+            )
+            for r in rows
+        ]
+
+    def entity_chunk_pairs(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityChunk]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+            MATCH (c)-[:MENTIONS]->(e:Entity)
+            WHERE ($source_id IS NULL OR d.source_id = $source_id)
+              AND ($types IS NULL OR e.type IN $types)
+            RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
+                   c.id AS chunk_id, d.id AS doc_id
+            ORDER BY entity_id, chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+            types=list(types) if types else None,
+        )
+        return [EntityChunk.model_validate(r) for r in rows]
+
+    def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]:
+        rows = self._paged(
+            """
+            MATCH (a:Topic)-[r:CO_OCCURS]-(b:Topic)
+            WHERE a.name < b.name AND coalesce(r.weight, 1) >= $min_weight
+              AND EXISTS { MATCH (:Document {persona_id: $persona_id})-[:ABOUT]->(a) }
+              AND EXISTS { MATCH (:Document {persona_id: $persona_id})-[:ABOUT]->(b) }
+            RETURN a.name AS source, b.name AS target, coalesce(r.weight, 1) AS weight
+            ORDER BY source, target
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            min_weight=min_weight,
+        )
+        return [
+            TopicEdge(source=r["source"], target=r["target"], weight=int(r["weight"])) for r in rows
+        ]
+
+    def mean_embeddings(self, persona_id: str, level: str = "document") -> tuple[list[str], Matrix]:
+        if level == "document":
+            query = """
+                MATCH (c:Chunk {persona_id: $persona_id})
+                RETURN c.doc_id AS key, c.embedding AS embedding
+                ORDER BY c.doc_id, c.ordinal
+                SKIP $skip LIMIT $page
+                """
+        elif level == "entity":
+            query = """
+                MATCH (c:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+                RETURN e.id AS key, c.embedding AS embedding
+                ORDER BY e.id, c.id
+                SKIP $skip LIMIT $page
+                """
+        else:
+            msg = f"level must be 'document' or 'entity', got {level!r}"
+            raise ValueError(msg)
+        sums: dict[str, np.ndarray] = {}
+        counts: Counter[str] = Counter()
+        for row in self._paged(query, persona_id=persona_id):
+            raw = row["embedding"]
+            if not raw:
+                continue
+            vec = np.asarray(raw, dtype=np.float32)
+            key = row["key"]
+            sums[key] = sums.get(key, np.zeros_like(vec)) + vec
+            counts[key] += 1
+        return stack_means(sums, counts)
+
+    def entity_mention_rows(
+        self,
+        persona_id: str,
+        source_id: str | None = None,
+        types: Sequence[str] | None = None,
+    ) -> list[EntityMention]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
+            MATCH (c)-[m:MENTIONS]->(e:Entity)
+            WHERE ($source_id IS NULL OR d.source_id = $source_id)
+              AND ($types IS NULL OR e.type IN $types)
+            RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
+                   c.id AS chunk_id, d.id AS doc_id, m.stance AS stance,
+                   coalesce(c.speakers, []) AS speakers,
+                   coalesce(d.attributes_json, '{}') AS doc_attrs
+            ORDER BY entity_id, chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+            types=list(types) if types else None,
+        )
+        return [
+            EntityMention(
+                entity_id=r["entity_id"],
+                name=r["name"],
+                type=r["type"],
+                chunk_id=r["chunk_id"],
+                doc_id=r["doc_id"],
+                stance=r["stance"],
+                speakers=list(r["speakers"]),
+                document_attributes=_attributes(r["doc_attrs"]),
+            )
+            for r in rows
+        ]

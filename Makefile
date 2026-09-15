@@ -11,8 +11,8 @@ Q           ?= how do I find product market fit
 K           ?= 5
 
 .PHONY: help build up down logs setup doctor hooks check check-local fmt lint type test \
-        test-integration test-integration-local ingest snapshot-export snapshot-load search \
-        context stats shell lsp embed-up enrich clean
+        test-integration test-integration-local validate ingest sync snapshot-export \
+        snapshot-load search context stats shell lsp embed-up enrich clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -110,8 +110,17 @@ test-integration-local:
 	pytest -q -m "integration"
 
 # ------------------------------------------------------------------ data
-ingest: ## Ingest SRC into PERSONA (SRC=path PERSONA=id) and export its snapshot
-	$(COMPOSE) run --rm -T graphrag graphrag ingest /app/$(SRC) --persona $(PERSONA) --export
+validate: ## Check a captured corpus (CORPUS=repo-relative path [MERGE=1])
+	$(COMPOSE) run --rm -T graphrag graphrag validate /app/$(or $(CORPUS),data/raw/$(PERSONA)) \
+		$(if $(MERGE),--merge,)
+
+ingest: ## Ingest SRC into PERSONA (SRC=repo-relative path PERSONA=id [SOURCE=id]) and export
+	$(COMPOSE) run --rm -T graphrag graphrag ingest /app/$(SRC) --persona $(PERSONA) \
+		$(if $(SOURCE),--source $(SOURCE)) --export
+
+sync: ## Ingest what is missing for PERSONA and re-import its sidecars (REFRESH=1 re-reads all)
+	$(COMPOSE) run --rm -T graphrag graphrag sync $(PERSONA) $(if $(SOURCE),--source $(SOURCE)) \
+		$(if $(REFRESH),--refresh-attribution --refresh-annotations)
 
 snapshot-export: ## Export PERSONA from Neo4j to data/snapshots/PERSONA
 	$(COMPOSE) run --rm -T graphrag graphrag snapshot export $(PERSONA)

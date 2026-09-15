@@ -12,7 +12,17 @@ from graphrag.app import AppContext
 from graphrag.config import EmbeddingSettings, Neo4jSettings, Settings
 from graphrag.embed.hashing import HashEmbedder
 from graphrag.graph.memory_store import InMemoryGraphStore
-from graphrag.models import PersonaSpec, RetrievalConfig, SourceSpec
+from graphrag.models import (
+    Chunk,
+    Document,
+    Enrichment,
+    Entity,
+    Mention,
+    PersonaSpec,
+    RetrievalConfig,
+    SourceSpec,
+    SpeakerPost,
+)
 from graphrag.personas.registry import PersonaRegistry
 from graphrag.pipeline import IngestPipeline, IngestReport
 from graphrag.retrieve.search import Retriever
@@ -97,6 +107,74 @@ EPISODES = {
 }
 
 
+"""A captured discussion thread: four posts by three handles, in one prose document.
+
+The loader that reads it knows nothing about posts, so the graph holds it with no speakers at
+all -- which is exactly the gap `graphrag attribution-import` fills. The bodies are long enough
+that the chunker splits the thread across more than one passage, so an anchor has somewhere
+wrong to land.
+"""
+THREAD_POSTS = [
+    (
+        "quill-maker",
+        "2025-02-03",
+        "I ran onboarding for three years and the part nobody warns you about is that the first "
+        "week decides how the next year goes. We tried a long written handbook and nobody read "
+        "it. What actually moved the needle was a single page listing the five things a new "
+        "person has to be able to do by Friday, and then getting out of the way. If you cannot "
+        "write that page, you do not understand the job well enough to hire for it yet. Write "
+        "the page first, hire second, and revise the page after every single start date.",
+    ),
+    (
+        "north-by",
+        "2025-02-03",
+        "Respectfully I think the one page idea is a trap. We used it for a year and all it did "
+        "was make people optimise for looking finished by Friday. The pairing model worked far "
+        "better for us. Every new starter sits with someone who joined six months earlier, "
+        "because that person still remembers which parts were confusing and has not yet "
+        "forgotten what the jargon means. It costs the pair about four hours a week for a month "
+        "and it has halved our time to a first real contribution, which is the only number I "
+        "actually care about.",
+    ),
+    (
+        "quill-maker",
+        "2025-02-04",
+        "That is fair and I do not think the two are opposed. We kept the page and added the "
+        "pairing on top of it once the team was big enough to spare the hours. The page is what "
+        "stops the pairing from turning into folklore, where each new person learns a slightly "
+        "different version of how things are done. Write down the parts that must not drift, and "
+        "let the pair handle everything else. The failure mode I still see most often is a "
+        "manager who delegates the whole thing and then wonders why two hires on one team work "
+        "completely differently.",
+    ),
+    (
+        "ledger-ann",
+        "2025-02-06",
+        "Late to this thread but I want to add the boring part that nobody mentions. Most of what "
+        "goes wrong in a first month is access. Accounts that were never created, a repository "
+        "nobody thought to grant, a calendar invite to the wrong address. We now run a checklist "
+        "the day before someone starts and we treat a missing account as an incident rather than "
+        "an inconvenience. It is unglamorous and it removed more frustration than any of the "
+        "mentoring schemes we tried before it.",
+    ),
+]
+
+
+def write_thread(root: Path) -> Path:
+    """Write the sample thread under ``root/threads``. Its own folder, so the ``docs`` fixtures
+    keep the document count their tests assert on."""
+    folder = root / "threads"
+    folder.mkdir(parents=True, exist_ok=True)
+    body = "\n\n".join(f"**{who}** wrote on {when}:\n{text}" for who, when, text in THREAD_POSTS)
+    path = folder / "onboarding-thread.md"
+    path.write_text(
+        "---\ntitle: How do you handle onboarding for a new hire\n---\n\n"
+        "# How do you handle onboarding for a new hire\n\n" + body + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_sample_corpus(root: Path) -> Path:
     """Write three small synthetic transcripts in the Lenny's-archive layout under ``root``."""
     for slug, ep in EPISODES.items():
@@ -140,6 +218,7 @@ def write_sample_corpus(root: Path) -> Path:
         "Frequently asked questions.\n\nCan I keep my doctor? Check the plan network first.\n",
         encoding="utf-8",
     )
+    write_thread(root)
     return root
 
 
@@ -163,6 +242,12 @@ def transcript_source() -> SourceSpec:
 @pytest.fixture
 def documents_source() -> SourceSpec:
     return SourceSpec(id="docs", kind="local", path="docs", loader="documents", glob="**/*")
+
+
+@pytest.fixture
+def thread_source() -> SourceSpec:
+    """A documents source whose one file is a discussion thread, so it arrives with no speakers."""
+    return SourceSpec(id="threads", kind="local", path="threads", loader="documents", glob="**/*")
 
 
 @pytest.fixture
@@ -216,6 +301,189 @@ def ingested(
 
 
 @pytest.fixture
+def thread_document(
+    sample_corpus: Path,
+    docs_persona: PersonaSpec,
+    thread_source: SourceSpec,
+    memory_store: InMemoryGraphStore,
+    hash_embedder: HashEmbedder,
+) -> str:
+    """The ingested thread's document id: one document, several passages, and no speakers yet."""
+    IngestPipeline(memory_store, hash_embedder).ingest(sample_corpus, docs_persona, thread_source)
+    return next(iter(memory_store.document_ids(docs_persona.id, thread_source.id)))
+
+
+"""A tiny corpus planted straight into the store, with every layer already on it.
+
+The ingest fixtures give a realistic corpus but no dates, no stances and no facets, and adding
+them through the importers would make every network test depend on anchor matching. These five
+posts are written directly instead, so each assertion below can name the number it expects:
+
+===== ======= ========== ================================ =================
+post  speaker posted     entities (stance)                facets
+===== ======= ========== ================================ =================
+1     ana     2025-01-10 Alpha (praise), Beta (praise)     quoting
+2     bo      2025-01-20 Alpha (complaint), Gamma (compl.) outage
+3     ana     2025-06-10 Beta (praise), Gamma (neutral)     quoting
+4     cy      2025-06-20 Alpha (complaint), Gamma (compl.) outage
+5     dot     undated    -                                  -
+===== ======= ========== ================================ =================
+
+So praise joins Alpha to Beta and complaint joins Alpha to Gamma twice: the stance filter does
+not thin one network, it produces a different one. The two halves of the year hold different
+speakers, and post 5 is dated by nobody, so it leaves every window.
+
+Each post also carries an invented node attribute, ``region``, on its document and on its
+speaker, so an attribute filter has something to keep and something to drop::
+
+    post-1 ana  region=north    post-2 bo  region=south
+    post-3 ana  region=north    post-4 cy  region=south
+    post-5 dot  no region at all
+
+``dot`` and post 5 are deliberately untagged: a node nobody tagged has to leave every filtered
+network, exactly as an undated post leaves every window.
+"""
+LAYERED_PERSONA = "test-layers"
+LAYERED_SOURCE = "posts"
+LAYERED_POSTS: tuple[tuple[str, str, str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "post-1",
+        "ana",
+        "2025-01-10",
+        "Alpha saved me an afternoon on the quote and Beta laid the numbers out side by side, "
+        "which is exactly what I wanted from both of them.",
+        ("quoting",),
+        ("pricing", "service"),
+    ),
+    (
+        "post-2",
+        "bo",
+        "2025-01-20",
+        "Alpha went down on the busiest morning of the month and Gamma took twenty minutes to "
+        "load one page, so I did the whole thing on paper.",
+        ("outage",),
+        ("service", "outages"),
+    ),
+    (
+        "post-3",
+        "ana",
+        "2025-06-10",
+        "Beta has been steady for a year now, and Gamma is simply the sheet I open when I want "
+        "to see the workings behind a number.",
+        ("quoting",),
+        ("pricing", "service"),
+    ),
+    (
+        "post-4",
+        "cy",
+        "2025-06-20",
+        "Alpha lost a half-finished quote again this week and Gamma dropped the session twice "
+        "while I had someone on the phone.",
+        ("outage",),
+        ("service", "outages"),
+    ),
+    (
+        "post-5",
+        "dot",
+        "",
+        "Nobody wrote a date on this one, which is exactly what makes it worth keeping here.",
+        (),
+        ("service",),
+    ),
+)
+#: Which region a post's document and its speaker were tagged with; absent means untagged.
+LAYERED_REGIONS: dict[str, str] = {
+    "post-1": "north",
+    "post-2": "south",
+    "post-3": "north",
+    "post-4": "south",
+}
+#: entity id -> (name, type) and, per post, the stance the annotation pass put on the mention.
+LAYERED_ENTITIES: dict[str, tuple[str, str]] = {
+    "product:alpha": ("Alpha", "product"),
+    "product:beta": ("Beta", "product"),
+    "product:gamma": ("Gamma", "product"),
+}
+LAYERED_MENTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "post-1": (("product:alpha", "praise"), ("product:beta", "praise")),
+    "post-2": (("product:alpha", "complaint"), ("product:gamma", "complaint")),
+    "post-3": (("product:beta", "praise"), ("product:gamma", "neutral")),
+    "post-4": (("product:alpha", "complaint"), ("product:gamma", "complaint")),
+}
+
+
+@pytest.fixture
+def layered(
+    memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder, registry: PersonaRegistry
+) -> InMemoryGraphStore:
+    """The planted corpus above, in the shared in-memory store and the shared registry."""
+    source = SourceSpec(id=LAYERED_SOURCE, kind="local", path="posts", loader="documents")
+    registry.save(
+        PersonaSpec(
+            id=LAYERED_PERSONA,
+            name="Test Layers",
+            role_prompt="You answer from captured posts.",
+            sources=[source],
+        )
+    )
+    documents: list[Document] = []
+    chunks: list[Chunk] = []
+    for ordinal, (slug, speaker, posted, text, facets, topics) in enumerate(LAYERED_POSTS):
+        doc_id = f"{LAYERED_PERSONA}:{LAYERED_SOURCE}:{slug}"
+        documents.append(
+            Document(
+                id=doc_id,
+                persona_id=LAYERED_PERSONA,
+                source_id=LAYERED_SOURCE,
+                title=slug,
+                path=f"posts/{slug}.md",
+                speakers=[speaker],
+                topics=list(topics),
+                word_count=len(text.split()),
+            )
+        )
+        chunks.append(
+            Chunk(
+                id=f"{doc_id}#0",
+                doc_id=doc_id,
+                persona_id=LAYERED_PERSONA,
+                ordinal=ordinal,
+                text=text,
+                speaker=speaker,
+                speakers=[speaker],
+                speaker_posts=[SpeakerPost(speaker=speaker, posted_at=posted or None)],
+                facets=list(facets),
+                word_count=len(text.split()),
+            )
+        )
+    memory_store.upsert_documents(documents)
+    memory_store.upsert_chunks(chunks, hash_embedder.embed_documents([c.text for c in chunks]))
+    for slug, region in LAYERED_REGIONS.items():
+        doc_id = f"{LAYERED_PERSONA}:{LAYERED_SOURCE}:{slug}"
+        memory_store.set_document_attributes(doc_id, {"region": region})
+        speaker = next(p[1] for p in LAYERED_POSTS if p[0] == slug)
+        memory_store.set_speaker_attributes(LAYERED_PERSONA, speaker, {"region": region})
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[
+                Entity(id=key, name=name, type=kind)
+                for key, (name, kind) in LAYERED_ENTITIES.items()
+            ],
+            mentions=[
+                Mention(
+                    chunk_id=f"{LAYERED_PERSONA}:{LAYERED_SOURCE}:{slug}#0",
+                    entity_id=entity_id,
+                    stance=stance,  # type: ignore[arg-type]
+                )
+                for slug, pairs in LAYERED_MENTIONS.items()
+                for entity_id, stance in pairs
+            ],
+        )
+    )
+    return memory_store
+
+
+@pytest.fixture
 def retriever(memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder) -> Retriever:
     return Retriever(memory_store, hash_embedder)
 
@@ -224,8 +492,11 @@ def retriever(memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder) -> 
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         personas_dir=tmp_path / "personas",
+        raw_dir=tmp_path / "raw",
         snapshots_dir=tmp_path / "snapshots",
         enrichment_dir=tmp_path / "enrichment",
+        attribution_dir=tmp_path / "attribution",
+        annotations_dir=tmp_path / "annotations",
         skills_dir=tmp_path / "skills",
         neo4j=Neo4jSettings(uri="bolt://unused:7687"),
         embedding=EmbeddingSettings(backend="hash", model="hash-test", dim=DIM),

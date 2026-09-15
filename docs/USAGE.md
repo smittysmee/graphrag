@@ -175,6 +175,9 @@ make search Q="roadmap review" PERSONA=product-leader K=5
 docker compose run --rm graphrag graphrag search "pricing" -p product-leader -k 5 --json
 docker compose run --rm graphrag graphrag context "retention" -p product-leader --json
 
+# check a captured corpus before ingesting it
+make validate CORPUS=data/raw/<persona>
+
 # personas
 docker compose run --rm graphrag graphrag persona list
 docker compose run --rm graphrag graphrag persona brief product-leader
@@ -210,6 +213,51 @@ That scaffolds `personas/<id>/persona.yaml` and a README with the runbook. Then:
 Fill in the persona's `role_prompt`, `voice` and `sdlc_stages` by hand. Those are what make the
 persona sound like someone rather than like a search engine.
 
+If the corpus is one you are researching and capturing yourself rather than one you already have,
+[MARKET_INVESTIGATION.md](MARKET_INVESTIGATION.md) describes the method that produces it, and
+`docs/templates/` holds fill-in briefs for the research waves and for a grounded-profiles skill.
+
+### Validate a captured corpus
+
+```bash
+make validate CORPUS=data/raw/<persona>            # check
+make validate CORPUS=data/raw/<persona> MERGE=1    # check, then merge the provenance manifests
+```
+
+A hand-captured document can be wrong in ways nothing downstream notices. Front-matter that does
+not parse loses the file's metadata; a missing `fetched_at` or `retrieval` means nobody can later
+say where the text came from or how faithful it is; a nine-word body becomes a chunk that matches
+every query weakly and answers none of them; a twelve-thousand-word body is a whole page captured
+instead of the passage that mattered. None of that raises anything at ingest time, so it is
+checked once, up front:
+
+| Check | Rule |
+| --- | --- |
+| Front-matter | Opens with a `---` fence and parses as a YAML mapping |
+| Required keys | `title`, `fetched_at`, `fetched_by`, `retrieval`, `content_fidelity`, `document_type`, `category` |
+| Source | A `source_url` unless `document_type` is `research_note` or `internal_context` |
+| Body length | Between 40 and 6,000 words |
+| Provenance | Every line of `provenance/*.jsonl` is JSON, and a line claiming a successful capture names a file that exists |
+
+It exits 1 when anything is wrong and prints one line per problem, naming the file. `--merge`
+writes `provenance/provenance.jsonl` from the per-researcher manifests, which is how several
+researchers working in parallel end up with one manifest for the corpus.
+
+`graphrag ingest` runs the same check first for any source whose loader is `documents`, and
+refuses with exit 2 rather than putting a bad capture into the graph:
+
+```
+2 problem(s) in 3 captured file(s) of source 'docs'
+  TOO LONG (6001 words): long.md
+  NEAR-EMPTY (12 words): stub.md
+refusing to ingest; fix the files or pass --allow-invalid
+```
+
+Pass `--allow-invalid` to ingest anyway. `transcripts` sources are never validated, because the
+archive that produced them owns their front-matter. The same logic is also a standalone script,
+`python scripts/validate_corpus.py <corpus-root> [--merge]`, for checking a corpus without the
+CLI or a container.
+
 ### Add the entity layer
 
 Entities are optional. Retrieval works without them; they earn their place when you want to ask
@@ -230,6 +278,280 @@ cheap and safe.
 There is also an unattended path that calls the API directly, `make enrich PERSONA=<id> LIMIT=10`,
 which needs `ANTHROPIC_API_KEY` in `.env`. The agent path needs no key and was used for the
 existing corpus.
+
+#### Entity ids, and what an `id collision` line means
+
+An entity's id is `<type>:<slug of the name>`, and the slug now spells out the three characters
+that tell two names apart rather than dropping them: `+` becomes `plus`, `&` becomes `and`, `#`
+becomes `sharp`, each as a word of its own.
+
+| Name       | Id                       |
+| ---------- | ------------------------ |
+| `Lumenta`  | `product:lumenta`        |
+| `Lumenta+` | `product:lumenta-plus`   |
+| `K++`      | `product:k-plus-plus`    |
+| `Verro&Hale` | `company:verro-and-hale` |
+
+Before this, `Lumenta+` and `Lumenta` shared one id, and importing the second renamed the first
+one's node and swallowed its mentions. **Ids changed for names holding those three characters,
+and there is no migration.** A snapshot exported before the change keeps the old ids, and nothing
+re-derives them on load; a full re-ingest and re-import of the persona re-creates them. Every
+other name keeps the id it already has. Re-ingest with:
+
+```bash
+make ingest PERSONA=<id> SRC=data/raw/<id>
+docker compose run --rm graphrag graphrag enrich-import <id> /app/data/enrichment/<id>/**/*.json
+```
+
+Punctuation outside that list still folds away, so `Lumenta!` and `Lumenta` still share an id.
+The import no longer resolves that quietly. When an incoming name lands on an id a node already
+holds under a different name, the node keeps its name, the mentions still attach, and the import
+prints one line per name:
+
+```
+collision: Lumenta! kept as Lumenta
+```
+
+Names are compared ignoring case and how the whitespace fell, and against the spellings already
+recorded on the node as `aliases`, so re-importing a known alias spelling is not a collision.
+Act on the line one of two ways: give the entity a name whose id differs, or -- if the two
+spellings really are one thing -- say so in the persona's `aliases.yaml` (below), which is the
+only sanctioned way to merge them. `make sync` prints the same line while it works.
+
+### Add the speaker layer
+
+Transcripts arrive with speakers, because their loader parses `Name (00:00:00):` turns. Prose
+documents do not: a captured discussion thread reaches the graph as one body of text with no
+`Speaker` node at all, so every speaker-shaped question about it comes back empty.
+
+Attribution fills that in, the same way enrichment fills in entities. An agent reads one document
+and writes one file per document under `data/attribution/<persona>/`:
+
+```json
+{
+  "doc_id": "<persona>:<source>:<slug>",
+  "posts": [
+    {
+      "speaker": "handle or name",
+      "anchor": "the verbatim opening words of the post, 6 to 20 words",
+      "role": "op",
+      "date": "2025-02-03",
+      "score": 12
+    }
+  ]
+}
+```
+
+Then:
+
+```bash
+docker compose run --rm graphrag graphrag attribution-import <persona> /app/data/attribution/<persona>/*.json --dry-run
+docker compose run --rm graphrag graphrag attribution-import <persona> /app/data/attribution/<persona>/*.json
+```
+
+Each anchor is looked for in the document's passages, ignoring case and how the whitespace fell,
+and the speaker is attached to the first passage that contains it. `role`, `date` and `score` are
+kept in the file as provenance; only who spoke in which passage reaches the graph.
+
+A post may also carry `attributes`, which describe the *speaker* rather than the post and go onto
+the speaker node:
+
+```json
+{"speaker": "handle", "anchor": "the verbatim opening words", "role": "reply",
+ "attributes": {"region": "north", "team": "Some Team"}}
+```
+
+Write one only when the document says it: a handle that states where they work, or whose posts
+across the thread are plainly one thing. Never infer one from a tool somebody mentions. The first
+value written for a speaker stands; a later post that disagrees is reported as `attribute
+conflict: <speaker> <key> <kept> vs <incoming>` and changes nothing, because which of two
+readings is right is a question for whoever wrote them.
+
+A post whose anchor occurs in no passage is reported as loose and skipped, never guessed at, so a
+paraphrased opening line costs that one post rather than the file. The dry run lists them, which
+is what you fix before writing. Import is idempotent.
+
+`make sync` re-imports these files by itself, on the same two triggers as the extraction files: a
+source it had to re-ingest (re-ingesting deletes the passages the speakers hang off), and a
+document sitting in the graph with no speaker at all. Neither trigger can see a file that was
+*rewritten* for a document that already has its layer, which is what a tagging pass produces, so
+attributes added to existing sidecars reach the graph through
+`make sync PERSONA=<id> REFRESH=1`, which passes `--refresh-attribution` and
+`--refresh-annotations` to `graphrag sync`.
+
+### Fold alias spellings together
+
+Extraction keeps the spelling each passage uses, so one thing can arrive as several nodes: an
+abbreviation, a former name, a typo. Every count over it is then low by however many spellings
+nobody looked for.
+
+A persona answers that with `personas/<persona>/aliases.yaml`:
+
+```yaml
+aliases:
+  Canonical Name: [Alias One, alias two, "Alias, with comma"]
+```
+
+Matching ignores case and how the whitespace fell, on both sides. A name may appear under one
+canonical only; two canonicals claiming the same alias is a contradiction the loader refuses,
+rather than resolving by file order.
+
+```bash
+docker compose run --rm graphrag graphrag aliases apply <persona> --dry-run
+docker compose run --rm graphrag graphrag aliases apply <persona>
+```
+
+The dry run counts the mentions each canonical would gain, from the graph as it stands. The real
+run re-points that persona's mentions and relations onto the canonical node, records the
+spellings on it as `aliases`, and deletes the alias nodes nothing else holds. Another persona's
+mentions of the same spelling are left where they are.
+
+The table also runs at import: `enrich-import` and `annotations-import` map names through it
+before writing, after the passages have been matched, so a new file never creates the alias node
+in the first place. `make sync` applies the table once at the end of a run, when the graph is
+whole.
+
+### Add the stance and facet layer
+
+Extraction records that a passage mentions something. It does not record whether the passage is
+praising it, complaining about it, or saying it was replaced -- so "most discussed" is the only
+question the entity layer can answer. It also does not record which function of a subject a
+passage is about.
+
+Annotations fill both in. An agent reads one document and writes one file per document under
+`data/annotations/<persona>/`:
+
+```json
+{
+  "doc_id": "<persona>:<source>:<slug>",
+  "annotations": [
+    {
+      "anchor": "verbatim six to twenty words of the passage",
+      "entity": "Entity name as written in that passage",
+      "stance": "praise | complaint | substitution | neutral",
+      "facets": ["handover", "access"],
+      "note": "optional short paraphrase, never quoted back as evidence"
+    }
+  ]
+}
+```
+
+`anchor` is required and `entity` is optional, but a `stance` needs an entity: a stance about
+nothing is not a reading. Then:
+
+```bash
+docker compose run --rm graphrag graphrag annotations-import <persona> /app/data/annotations/<persona>/*.json --dry-run
+docker compose run --rm graphrag graphrag annotations-import <persona> /app/data/annotations/<persona>/*.json
+```
+
+Anchors are placed exactly as attribution places them. The stance goes on the `MENTIONS` edge and
+the facets go on the passage, both of which ride the snapshot.
+
+The entity is checked against the graph rather than trusted. If the passage already mentions it,
+the stance goes on that edge. If it does not, the annotation is not thrown away on the spot:
+extraction and annotation read a document separately, so a passage can name a thing the
+extraction pass did not list there, or listed under another spelling. When the persona already
+has an entity of that name and one of its spellings occurs in the passage, the mention is created
+and the stance goes on it. When the persona has no such entity, or none of its spellings is in
+the passage, the annotation is reported as loose and skipped.
+
+Loose annotations are counted by reason, because the three send you to a different file:
+
+| reason | what to do about it |
+| --- | --- |
+| anchor not found | the anchor is a paraphrase; fix the quote in the annotation file |
+| entity unknown to the persona | add the spelling to `aliases.yaml`, or extend the extraction |
+| entity not in the passage | the annotation is pointing at the wrong passage |
+
+The summary line ends with those totals, so a dry run over a whole corpus tells you which of the
+three to fix first:
+
+```
+validated 170 files: 483 annotations, 470 stances, 612 facets, 12 mentions created, 235 loose (18 anchor not found, 190 entity unknown to the persona, 27 entity not in the passage)
+```
+
+An annotation file may also carry a top-level `attributes` object, which describes the
+*document* rather than any passage of it:
+
+```json
+{"doc_id": "<persona>:<source>:<slug>", "attributes": {"region": "north"}, "annotations": []}
+```
+
+A file may carry attributes and no annotations at all: a document nobody has a reading of still
+belongs to a part of the corpus. Document attributes are what `graphrag sna --where` cuts an
+entity or topic network by, and what `--by` partitions one by.
+
+When the persona keeps a `facets.yaml`, facets outside it are reported and dropped, and the same
+file declares which attributes exist:
+
+```yaml
+facets:
+  handover: Moving work or knowledge from one person to another.
+  access: Getting the accounts and permissions a job needs.
+attributes:
+  region:
+    values: [north, south]
+    description: Which half of the network this belongs to.
+  team:
+    description: The team a speaker says they are on, as written.
+```
+
+A key with `values` is closed, so a value outside the list is reported and dropped, per entry; a
+key without `values` is free text, which is the right shape for something nobody can enumerate in
+advance. Without the `attributes:` section, any key and value is accepted. `graphrag layers
+check` counts what the vocabulary refused as loose, under `speaker attribute invalid` and
+`document attribute invalid`, so a tagging pass that invented a value fails visibly.
+
+Without that file, any facet is accepted. Import is idempotent, and `make sync` re-imports these
+files on the same two triggers as the other layers: a source it had to re-ingest, and a document
+sitting in the graph with no stance and no facet.
+
+### Analyse the networks
+
+Three networks sit inside the graph and nobody has to build them: who appears alongside whom
+(speakers sharing a document), what is discussed together (entities sharing a passage), and how
+the ingestion topics co-occur. `graphrag sna` measures them, groups them, and checks whether the
+grouping means anything.
+
+```bash
+# which network, which method, and what each one is for
+docker compose run --rm graphrag graphrag sna guide
+
+# communities of speakers, with a stability score and a null-model check
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --method louvain --seed 1 --out /app/data/exports/speakers.md
+
+# k groups of entities, k chosen by silhouette
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network entities --method kmeans --features spectral --k-range 2-10 --seed 1 \
+  --out /app/data/exports/entities.md
+
+# the raw network, for Gephi or Cytoscape
+docker compose run --rm graphrag graphrag sna export <persona> \
+  --network topics --out /app/data/exports/topics.graphml
+```
+
+Pass `--seed` so the run can be repeated, and write under `/app/data/` so the file survives the
+container. The report carries the method rationale, the stability score, the null-model z-score
+and the caveats, so it can go into a corpus as a research note unedited.
+
+If the corpus carries node attributes, two more questions open up. `--where key=value` builds the
+network over one population of it, and `--by key` asks whether the network divides along that
+attribute at all, against a null that shuffles the labels and one that rewires the graph:
+
+```bash
+# one population, then the same network measured against the attribute itself
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --where region=north --seed 1 --out /app/data/exports/north.md
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --by region --seed 1 --out /app/data/exports/by-region.md
+```
+
+An attribute is a hypothesis about where a network divides, not a finding, and the report is
+written to be as able to say no as yes.
+
+[SNA.md](SNA.md) has the full reference: which method for which question, how to read a z-score,
+and what to do when silhouette and BIC disagree.
 
 ### Share a persona with someone
 
@@ -305,11 +627,29 @@ persona design.
 
 ```bash
 git submodule update --remote data/raw/product-leader
-make ingest PERSONA=product-leader SRC=data/raw/product-leader
+make sync PERSONA=product-leader
 git add data/raw/product-leader data/snapshots/product-leader && git commit
 ```
 
-Re-ingesting replaces a document rather than merging into it, so edits and deletions land cleanly.
+`make sync` is the one command to reach for after files under `data/raw/<persona>/` change. It asks
+the loaders which document ids those files would produce, compares them with what the graph holds,
+and for each source that is behind it re-ingests that source and re-imports its extraction JSON —
+which matters because re-ingesting replaces a document rather than merging into it, and entity
+mentions hang off the chunks it deletes. Sources that are already complete are skipped, so running
+it when nothing changed writes nothing. Add `SOURCE=<id>` to limit it to one source, or run
+`docker compose run --rm -T graphrag graphrag sync <persona> --dry-run` to see what it would do.
+`make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` is still there when you want to force one
+source through regardless.
+
+Sync decides what to re-import by asking whether a layer is *missing*, which a rewritten sidecar
+never is: an attribution file that gained posted dates, or an annotation file that gained facets,
+names a document that already has speakers or stances, so nothing picks the new fields up. The same is true of a sidecar that gained node attributes, which is what a tagging pass
+writes. Pass
+`--refresh-attribution` or `--refresh-annotations` to re-import every sidecar of that kind for the
+persona whatever the graph already holds (`make sync PERSONA=<id> REFRESH=1` passes both); each
+source's line then says `re-imported N attribution files` rather than the backfill wording, and
+`--dry-run` reports the same count without writing. Attribute problems and conflicts are printed
+as the run goes past, because nothing else would show them.
 
 ---
 

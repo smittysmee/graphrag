@@ -12,6 +12,7 @@ import numpy as np
 from graphrag.embed.base import Embedder
 from graphrag.extract.topics import topic_cooccurrence
 from graphrag.graph.store import GraphStore
+from graphrag.ingest import hygiene
 from graphrag.ingest.chunker import ChunkerConfig, chunk_document
 from graphrag.ingest.loaders import load_source
 from graphrag.models import Chunk, Document, PersonaSpec, SourceSpec
@@ -27,7 +28,12 @@ class IngestReport:
     chunks: int = 0
     seconds: float = 0.0
     embedding_model: str = ""
+    orphans_removed: int = 0
+    """Entity nodes deleted because the re-ingest left nothing mentioning them."""
     skipped: list[str] = field(default_factory=list)
+    flagged: list[tuple[str, str]] = field(default_factory=list)
+    """``(document path, one-line reason)`` for files whose raw text looks like an injection
+    attempt. Advisory only: the document was ingested anyway, and a human decides."""
 
 
 class IngestPipeline:
@@ -54,9 +60,11 @@ class IngestPipeline:
         self._store.ensure_schema(self._embedder.dim)
         self._store.upsert_persona(persona)
 
+        base = root / source.path if source.path else root
         pending_docs: list[Document] = []
         pending_chunks: list[Chunk] = []
         for loaded in load_source(root, source, persona.id):
+            self._flag(base, loaded.document, report)
             chunks = chunk_document(loaded, self._chunker)
             if not chunks:
                 report.skipped.append(loaded.document.path)
@@ -71,8 +79,22 @@ class IngestPipeline:
 
         all_docs = list(self._store.iter_documents(persona.id))
         self._store.upsert_topic_cooccurrence(topic_cooccurrence(all_docs))
+        # Replacing a document deleted the mentions on its passages. An entity those mentions
+        # were the only evidence for is left holding its id and nothing else, so the next
+        # extraction pass would land on the stale node instead of creating its own.
+        report.orphans_removed = self._store.delete_orphan_entities(persona.id)
         report.seconds = time.perf_counter() - started
         return report
+
+    def _flag(self, base: Path, document: Document, report: IngestReport) -> None:
+        """Record injection-shaped text found in the file as it sits on disk.
+
+        The scan runs on the raw body, before the loader cleaned it, so a stripped zero-width
+        run still reaches the report. Nothing here stops the ingest.
+        """
+        reason = hygiene.summarize(hygiene.scan_file(base / document.path))
+        if reason:
+            report.flagged.append((document.path, reason))
 
     def _flush(self, docs: list[Document], chunks: list[Chunk], report: IngestReport) -> None:
         matrix = self._embedder.embed_documents([c.text for c in chunks])
