@@ -182,6 +182,22 @@ about the same function". The same three files serve any corpus.
   note reaches the graph and is found only by a later reader.
 - Sync detects missing documents and missing entity layers, not modified documents. A note
   revised in place must be re-ingested explicitly (per-source) before its new text is searchable.
+- A validator that refuses per source is a validator that lets one file block hundreds. When a
+  wave lands many documents and one note is over length, the whole source waits. Run the
+  validator on the corpus before starting the sync, and trust its word count over the author's.
+- Never let two syncs of the same persona overlap. A stale background job and a fresh run spent
+  hours re-embedding the same source against each other. Make the sync take an advisory lock
+  with a heartbeat, and check for a running one before launching another.
+- Slice the primary list, not a list derived from it. A slug list assembled from an earlier
+  verdicts note carried seven entries the source sitemap never had; they cost a researcher each
+  and had to be excluded afterwards.
+- Pooled and per-slice readings can disagree. Four researchers concluded from their own forty
+  rows that disclosure and platform-naming were unrelated; pooled over two hundred, the
+  relation is monotone. Report both readings and reconcile, rather than letting the synthesis
+  overrule the slices or the slices veto the pool.
+- Researchers checking layers against the graph before the sync only learn "not in the graph"
+  and compete with the sync for the runtime. Have them validate sidecars locally and leave the
+  graph check to the lead after the sync.
 
 ## Change log
 
