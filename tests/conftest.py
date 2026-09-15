@@ -498,6 +498,7 @@ def settings(tmp_path: Path) -> Settings:
         attribution_dir=tmp_path / "attribution",
         annotations_dir=tmp_path / "annotations",
         skills_dir=tmp_path / "skills",
+        sync_lock_dir=tmp_path / "locks",
         neo4j=Neo4jSettings(uri="bolt://unused:7687"),
         embedding=EmbeddingSettings(backend="hash", model="hash-test", dim=DIM),
     )

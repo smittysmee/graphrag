@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -408,6 +409,13 @@ def sync(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Report what is missing; write nothing.")
     ] = False,
+    force_lock: Annotated[
+        bool,
+        typer.Option(
+            "--force-lock",
+            help="Take the persona's sync lock even if another run appears to hold it live.",
+        ),
+    ] = False,
     export: Annotated[bool, typer.Option(help="Export the snapshot afterwards.")] = True,
 ) -> None:
     """Ingest whatever the graph is missing for a persona and re-import its extraction JSON.
@@ -429,54 +437,120 @@ def sync(
     instead, whatever the graph already holds, and each source's line says which it did. A
     tagging pass that adds node attributes to files the graph already has speakers and stances
     for is exactly that case, so those flags are how attributes reach the graph.
+
+    Before touching the graph, this takes an advisory lock for the persona under
+    `Settings.sync_lock_dir`, so a second `sync` against the same persona refuses instead of
+    racing the first one for hours and risking a half-written document if one is killed. A lock
+    whose heartbeat is older than `Settings.sync_lock_stale_seconds` is treated as abandoned and
+    replaced; `--force-lock` takes a live one anyway. `--dry-run` never takes the lock, and only
+    reports whether one is currently held.
     """
-    from graphrag.sync import UnknownSourceError, summary_lines, sync_persona
+    from graphrag.sync import (
+        SyncLockError,
+        UnknownSourceError,
+        acquire_sync_lock,
+        read_sync_lock,
+        refresh_sync_lock,
+        release_sync_lock,
+        summary_lines,
+        sync_persona,
+    )
 
     ctx = State.context()
     try:
         spec = ctx.registry.get(persona)
+        lock_dir = ctx.settings.sync_lock_dir
+        stale_after = ctx.settings.sync_lock_stale_seconds
+
+        if dry_run:
+            # dry-run never takes the lock: it only reports what it saw.
+            held = read_sync_lock(lock_dir, spec.id)
+            if held is not None:
+                state = "stale" if held.is_stale(stale_after) else "live"
+                err.print(
+                    f"[yellow]{spec.id}: lock held ({state}) -- {held.held_message()}[/yellow]"
+                )
+
+        command_parts = ["graphrag", "sync", persona]
+        if source:
+            command_parts += ["--source", source]
+        if refresh_attribution:
+            command_parts.append("--refresh-attribution")
+        if refresh_annotations:
+            command_parts.append("--refresh-annotations")
+        if allow_invalid:
+            command_parts.append("--allow-invalid")
+        if force_lock:
+            command_parts.append("--force-lock")
+
+        lock = None
+        if not dry_run:
+            try:
+                lock = acquire_sync_lock(
+                    lock_dir,
+                    spec.id,
+                    command=shlex.join(command_parts),
+                    stale_after_seconds=stale_after,
+                    force=force_lock,
+                    progress=_progress,
+                )
+            except SyncLockError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(1) from exc
+
+        def _progress_and_heartbeat(msg: str) -> None:
+            _progress(msg)
+            if lock is not None:
+                refresh_sync_lock(lock_dir, lock)
+
         try:
-            report = sync_persona(
-                spec,
-                store=ctx.store,
-                embedder=ctx.require_embedder,
-                raw_root=ctx.settings.raw_dir / spec.id,
-                enrichment_root=ctx.settings.enrichment_dir,
-                attribution_root=ctx.settings.attribution_dir,
-                annotation_root=ctx.settings.annotations_dir,
-                aliases=_alias_table(ctx, spec.id),
-                facets=_facet_table(ctx, spec.id),
-                attributes=_attribute_table(ctx, spec.id),
-                source_id=source,
-                refresh_attribution=refresh_attribution,
-                refresh_annotations=refresh_annotations,
-                allow_invalid=allow_invalid,
-                dry_run=dry_run,
-                progress=_progress,
-            )
-        except UnknownSourceError as exc:
-            err.print(f"[red]{exc}[/red]")
-            raise typer.Exit(2) from exc
-        for line in summary_lines(report):
-            console.print(line, markup=False, highlight=False)
-        if report.errors:
-            err.print(f"[yellow]{len(report.errors)} files failed to import[/yellow]")
-        if report.invalid_sources:
-            err.print(
-                f"[red]{len(report.invalid_sources)} source(s) refused; fix the files or pass "
-                "--allow-invalid[/red]"
-            )
-        if export and report.wrote:
-            snap.export_snapshot(
-                ctx.store,
-                spec,
-                ctx.snapshots_dir,
-                embedding_model=ctx.settings.embedding.model,
-                embedding_dim=ctx.settings.embedding.dim,
-            )
-            console.print(f"snapshot exported to {snap.snapshot_dir(ctx.snapshots_dir, spec.id)}")
-        if report.errors or report.invalid_sources:
-            raise typer.Exit(2)
+            try:
+                report = sync_persona(
+                    spec,
+                    store=ctx.store,
+                    embedder=ctx.require_embedder,
+                    raw_root=ctx.settings.raw_dir / spec.id,
+                    enrichment_root=ctx.settings.enrichment_dir,
+                    attribution_root=ctx.settings.attribution_dir,
+                    annotation_root=ctx.settings.annotations_dir,
+                    aliases=_alias_table(ctx, spec.id),
+                    facets=_facet_table(ctx, spec.id),
+                    attributes=_attribute_table(ctx, spec.id),
+                    source_id=source,
+                    refresh_attribution=refresh_attribution,
+                    refresh_annotations=refresh_annotations,
+                    allow_invalid=allow_invalid,
+                    dry_run=dry_run,
+                    progress=_progress_and_heartbeat,
+                )
+            except UnknownSourceError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(2) from exc
+            for line in summary_lines(report):
+                console.print(line, markup=False, highlight=False)
+            if report.errors:
+                err.print(f"[yellow]{len(report.errors)} files failed to import[/yellow]")
+            if report.invalid_sources:
+                err.print(
+                    f"[red]{len(report.invalid_sources)} source(s) refused; fix the files or pass "
+                    "--allow-invalid[/red]"
+                )
+            if export and report.wrote:
+                snap.export_snapshot(
+                    ctx.store,
+                    spec,
+                    ctx.snapshots_dir,
+                    embedding_model=ctx.settings.embedding.model,
+                    embedding_dim=ctx.settings.embedding.dim,
+                )
+                console.print(
+                    f"snapshot exported to {snap.snapshot_dir(ctx.snapshots_dir, spec.id)}"
+                )
+            if report.errors or report.invalid_sources:
+                raise typer.Exit(2)
+        finally:
+            if lock is not None:
+                release_sync_lock(lock_dir, spec.id)
     finally:
         ctx.close()
 

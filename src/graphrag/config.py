@@ -48,12 +48,23 @@ class EmbeddingSettings(BaseSettings):
     dim: int = 384
     batch_size: int = Field(default=64, ge=1, le=2048)
     cuda: bool = False
+    # How many CPU threads the in-process ONNX runtime may use. Unset leaves the runtime's own
+    # default, which spins one thread per core and can collapse inside a container or VM where
+    # those threads contend; a small fixed number is often many times faster there.
+    threads: int | None = Field(default=None, ge=1)
     # Off by default: many environments forbid fetching model weights, and fastembed would
     # otherwise download silently on first use. Supply the model via a bundle or model-import.
     allow_download: bool = False
     base_url: str | None = None
     api_key: SecretStr | None = None
     timeout_seconds: float = Field(default=120.0, gt=0)
+
+    @field_validator("threads", mode="before")
+    @classmethod
+    def _empty_threads_is_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -83,6 +94,11 @@ class Settings(BaseSettings):
     annotations_dir: Path = Path("data/annotations")
     model_cache_dir: Path = Path("/models")
     skills_dir: Path = Path(".claude/skills")
+    sync_lock_dir: Path = Path("data/.locks")
+    # A lock whose heartbeat is older than this is abandoned -- the process that held it died, or
+    # was killed, without the chance to clean up -- and `graphrag sync` reports and replaces it
+    # rather than let a dead run block every future sync forever.
+    sync_lock_stale_seconds: float = 900.0
 
     mcp_host: str = "0.0.0.0"  # noqa: S104 - bound inside a container on purpose
     mcp_port: int = 8765

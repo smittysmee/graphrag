@@ -102,3 +102,29 @@ def test_missing_model_fails_with_instructions_instead_of_downloading(
     assert "downloading is disabled" in str(exc.value)
     assert "make model-import" in str(exc.value)
     assert os.environ["HF_HUB_OFFLINE"] == "1"
+
+
+def test_fastembed_model_kwargs_pin_threads_only_when_set() -> None:
+    """The thread pin reaches fastembed only when configured, so the default stays the library's."""
+    from graphrag.embed.fastembed_embedder import model_kwargs
+
+    assert model_kwargs("m") == {"model_name": "m"}
+    assert model_kwargs("m", cache_dir="/c", cuda=True, threads=4) == {
+        "model_name": "m",
+        "cache_dir": "/c",
+        "cuda": True,
+        "threads": 4,
+    }
+
+
+def test_embedding_settings_threads_default_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import ValidationError
+
+    from graphrag.config import EmbeddingSettings
+
+    monkeypatch.delenv("GRAPHRAG_EMBEDDING_THREADS", raising=False)
+    assert EmbeddingSettings(_env_file=None).threads is None
+    assert EmbeddingSettings(_env_file=None, threads=4).threads == 4
+    assert EmbeddingSettings(_env_file=None, threads="").threads is None
+    with pytest.raises(ValidationError):
+        EmbeddingSettings(_env_file=None, threads=0)

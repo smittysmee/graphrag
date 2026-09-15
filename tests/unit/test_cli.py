@@ -158,6 +158,61 @@ def test_sync_refuses_an_invalid_documents_source(cli_context: AppContext) -> No
     assert cli_context.store.stats().documents == 1
 
 
+def test_sync_refuses_a_second_run_while_a_live_lock_is_held(cli_context: AppContext) -> None:
+    """Two `sync` runs against the same persona must not race each other for hours."""
+    from graphrag.sync import acquire_sync_lock
+
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+    acquire_sync_lock(
+        cli_context.settings.sync_lock_dir,
+        "test-pm",
+        "graphrag sync test-pm",
+        stale_after_seconds=cli_context.settings.sync_lock_stale_seconds,
+    )
+
+    refused = runner.invoke(app, ["sync", "test-pm"])
+    assert refused.exit_code != 0
+    assert "test-pm" in refused.output
+    assert "--force-lock" in refused.output
+    assert cli_context.store.stats().documents == 0  # refused before anything was ingested
+
+
+def test_sync_dry_run_reports_a_held_lock_but_never_takes_it(cli_context: AppContext) -> None:
+    from graphrag.sync import acquire_sync_lock, read_sync_lock
+
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+    held = acquire_sync_lock(
+        cli_context.settings.sync_lock_dir,
+        "test-pm",
+        "graphrag sync test-pm",
+        stale_after_seconds=cli_context.settings.sync_lock_stale_seconds,
+    )
+
+    dry = runner.invoke(app, ["sync", "test-pm", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "lock held" in dry.output
+    # the dry run left the other run's lock exactly as it was
+    assert read_sync_lock(cli_context.settings.sync_lock_dir, "test-pm") == held
+
+
+def test_sync_force_lock_takes_over_a_live_lock_and_completes(cli_context: AppContext) -> None:
+    from graphrag.sync import acquire_sync_lock, read_sync_lock
+
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+    acquire_sync_lock(
+        cli_context.settings.sync_lock_dir,
+        "test-pm",
+        "graphrag sync test-pm (stale job)",
+        stale_after_seconds=cli_context.settings.sync_lock_stale_seconds,
+    )
+
+    forced = runner.invoke(app, ["sync", "test-pm", "--force-lock"])
+    assert forced.exit_code == 0, forced.output
+    assert cli_context.store.stats().documents == 3
+    # the lock is released once the run finishes, same as an uncontested sync
+    assert read_sync_lock(cli_context.settings.sync_lock_dir, "test-pm") is None
+
+
 def test_enrich_import_from_agent_json(
     cli_context: AppContext, ingested: IngestReport, tmp_path: Path
 ) -> None:

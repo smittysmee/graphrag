@@ -64,5 +64,6 @@ def build_embedder(settings: EmbeddingSettings) -> Embedder:
         dim=settings.dim,
         batch_size=settings.batch_size,
         cuda=settings.cuda,
+        threads=settings.threads,
         allow_download=settings.allow_download,
     )

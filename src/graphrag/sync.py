@@ -46,8 +46,10 @@ skips the check, as it does for ``ingest``.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from graphrag.embed.base import Embedder
@@ -64,13 +66,19 @@ from graphrag.pipeline import IngestPipeline
 
 __all__ = [
     "SourceReport",
+    "SyncLock",
+    "SyncLockError",
     "SyncReport",
     "UnknownSourceError",
+    "acquire_sync_lock",
     "expected_document_ids",
     "index_annotations",
     "index_attributions",
     "index_extractions",
     "missing_document_ids",
+    "read_sync_lock",
+    "refresh_sync_lock",
+    "release_sync_lock",
     "summary_lines",
     "sync_persona",
 ]
@@ -80,6 +88,140 @@ Progress = Callable[[str], None]
 
 class UnknownSourceError(LookupError):
     """Raised when ``--source`` names something the persona does not define."""
+
+
+@dataclass(frozen=True)
+class SyncLock:
+    """One persona's advisory sync lock, as it sits on disk.
+
+    Advisory: nothing stops a second process from ingesting anyway. It exists so ``graphrag
+    sync`` can notice a run already in progress against the same persona and refuse rather than
+    race it -- two syncs re-ingesting the same source at once compete for CPU for hours and risk
+    a half-written document if one is killed mid-run, and nothing else on disk says a run is
+    already under way.
+    """
+
+    persona_id: str
+    started_at: str  # ISO 8601, UTC
+    heartbeat_at: str  # ISO 8601, UTC; bumped while the run is alive
+    command: str  # what was typed, for the message a second run sees
+
+    def age_seconds(self, *, now: datetime | None = None) -> float:
+        """How long since the lock last heartbeat."""
+        heartbeat = datetime.fromisoformat(self.heartbeat_at)
+        return ((now or datetime.now(UTC)) - heartbeat).total_seconds()
+
+    def is_stale(self, stale_after_seconds: float, *, now: datetime | None = None) -> bool:
+        return self.age_seconds(now=now) > stale_after_seconds
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "persona": self.persona_id,
+            "started_at": self.started_at,
+            "heartbeat_at": self.heartbeat_at,
+            "command": self.command,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, object]) -> SyncLock:
+        return cls(
+            persona_id=str(data["persona"]),
+            started_at=str(data["started_at"]),
+            heartbeat_at=str(data["heartbeat_at"]),
+            command=str(data["command"]),
+        )
+
+    def held_message(self) -> str:
+        """What a refused second run should tell the operator."""
+        return (
+            f"{self.persona_id}: sync already in progress -- started {self.started_at}, last "
+            f"heartbeat {self.heartbeat_at} (command: {self.command!r}). If that run is no longer "
+            "actually running, pass --force-lock to take over."
+        )
+
+
+class SyncLockError(RuntimeError):
+    """Raised by :func:`acquire_sync_lock` when a live lock already exists for the persona."""
+
+    def __init__(self, lock: SyncLock) -> None:
+        self.lock = lock
+        super().__init__(lock.held_message())
+
+
+def _lock_path(lock_dir: Path, persona_id: str) -> Path:
+    return lock_dir / f"{persona_id}.lock.json"
+
+
+def read_sync_lock(lock_dir: Path, persona_id: str) -> SyncLock | None:
+    """The lock on disk for ``persona_id``, or ``None`` if there is none, or it cannot be read.
+
+    A file that fails to parse (corrupt JSON, a field missing, deleted out from under this read)
+    is treated the same as no lock: the lock is advisory, and refusing to sync over a file this
+    cannot even make sense of would trade one problem for a worse one.
+    """
+    try:
+        data = json.loads(_lock_path(lock_dir, persona_id).read_text(encoding="utf-8"))
+        return SyncLock.from_json(data)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _write_lock(lock_dir: Path, lock: SyncLock) -> None:
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    path = _lock_path(lock_dir, lock.persona_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(lock.to_json(), indent=2), encoding="utf-8")
+    tmp.replace(path)  # atomic on the same filesystem: a reader never sees a half-written lock
+
+
+def acquire_sync_lock(
+    lock_dir: Path,
+    persona_id: str,
+    command: str,
+    *,
+    stale_after_seconds: float,
+    force: bool = False,
+    progress: Progress | None = None,
+) -> SyncLock:
+    """Take the persona's sync lock, refusing a live one and replacing an abandoned one.
+
+    Raises :class:`SyncLockError` when a lock already exists, its heartbeat is within
+    ``stale_after_seconds``, and ``force`` is not set. ``force`` (``--force-lock`` on the CLI) is
+    for the operator who knows the other run is not really still going -- a crashed container, a
+    lock left behind by a job that was hard-killed -- and skips the refusal outright.
+    """
+    say = progress or (lambda _msg: None)
+    existing = read_sync_lock(lock_dir, persona_id)
+    if existing is not None and not force:
+        if not existing.is_stale(stale_after_seconds):
+            raise SyncLockError(existing)
+        say(
+            f"{persona_id}: replacing abandoned lock (last heartbeat {existing.heartbeat_at}, "
+            f"{existing.age_seconds():.0f}s ago, command: {existing.command!r})"
+        )
+    elif existing is not None and force:
+        say(f"{persona_id}: --force-lock, taking over lock held since {existing.started_at}")
+    now = datetime.now(UTC).isoformat()
+    lock = SyncLock(persona_id=persona_id, started_at=now, heartbeat_at=now, command=command)
+    _write_lock(lock_dir, lock)
+    return lock
+
+
+def refresh_sync_lock(lock_dir: Path, lock: SyncLock) -> SyncLock:
+    """Bump the lock's heartbeat, so a long-running sync is never mistaken for an abandoned one."""
+    refreshed = SyncLock(
+        persona_id=lock.persona_id,
+        started_at=lock.started_at,
+        heartbeat_at=datetime.now(UTC).isoformat(),
+        command=lock.command,
+    )
+    _write_lock(lock_dir, refreshed)
+    return refreshed
+
+
+def release_sync_lock(lock_dir: Path, persona_id: str) -> None:
+    """Remove the persona's lock file, if it is still there."""
+    _lock_path(lock_dir, persona_id).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
