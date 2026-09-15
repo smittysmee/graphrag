@@ -36,6 +36,29 @@ def _forbid_downloads() -> None:
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 
+def model_kwargs(
+    model_name: str,
+    *,
+    cache_dir: str | None = None,
+    cuda: bool = False,
+    threads: int | None = None,
+) -> dict[str, Any]:
+    """The arguments handed to fastembed's ``TextEmbedding``.
+
+    ``threads`` pins the ONNX runtime's intra-op thread count. Left unset, the runtime spins one
+    thread per visible core; inside a container or VM those threads contend for a few real cores
+    and a batch that should take milliseconds takes seconds, so a small fixed number wins there.
+    """
+    kwargs: dict[str, Any] = {"model_name": model_name}
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+    if cuda:
+        kwargs["cuda"] = True
+    if threads is not None:
+        kwargs["threads"] = threads
+    return kwargs
+
+
 class FastEmbedEmbedder:
     def __init__(
         self,
@@ -45,17 +68,14 @@ class FastEmbedEmbedder:
         cuda: bool = False,
         cache_dir: str | None = None,
         allow_download: bool = False,
+        threads: int | None = None,
     ) -> None:
         from fastembed import TextEmbedding
 
         if not allow_download:
             _forbid_downloads()
 
-        kwargs: dict[str, Any] = {"model_name": model_name}
-        if cache_dir:
-            kwargs["cache_dir"] = cache_dir
-        if cuda:
-            kwargs["cuda"] = True
+        kwargs = model_kwargs(model_name, cache_dir=cache_dir, cuda=cuda, threads=threads)
 
         try:
             self._model = TextEmbedding(**kwargs)

@@ -10,7 +10,9 @@ content (see NOTICE.md), otherwise each user ingests locally.
 - `make test-integration` — against a throwaway Neo4j (pre-push hook)
 - `make sync PERSONA=<id> [REFRESH=1]` — ingest what is missing and re-import that source's
   sidecars; `REFRESH=1` re-reads every attribution and annotation file, which is how a
-  rewritten sidecar (node attributes, say) reaches a graph that already has that layer
+  rewritten sidecar (node attributes, say) reaches a graph that already has that layer;
+  it takes an advisory per-persona lock first, so a second concurrent sync refuses instead
+  of racing the first (`--force-lock` overrides a lock that looks abandoned)
 - `make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` / `make enrich` / `make search Q="..."` / `make context`
 - `make doctor` — Neo4j, embedder placement (local vs http), snapshot compatibility
 

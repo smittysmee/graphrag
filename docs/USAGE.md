@@ -44,6 +44,11 @@ Face stack offline and refuses to construct a model that is not already cached, 
 instructions rather than fetching silently mid-query. `GRAPHRAG_EMBEDDING_ALLOW_DOWNLOAD` defaults
 to `false`.
 
+`GRAPHRAG_EMBEDDING_THREADS` pins the ONNX runtime's CPU thread count for the in-process backend.
+Unset, the runtime spins one thread per visible core; inside Docker Desktop or another VM those
+threads contend for a few real cores and a batch that should take milliseconds takes seconds. A
+small fixed number (`4`) was ten times faster than the default on a 16-thread laptop VM.
+
 Three ways to get the model onto a machine, in order of least network:
 
 ```bash
@@ -630,6 +635,11 @@ git submodule update --remote data/raw/product-leader
 make sync PERSONA=product-leader
 git add data/raw/product-leader data/snapshots/product-leader && git commit
 ```
+
+`sync` takes an advisory per-persona lock before touching the graph (under `Settings.sync_lock_dir`,
+heartbeat every progress step) so a second `sync` against the same persona refuses instead of racing
+the first one for hours; `--dry-run` never takes it, and `--force-lock` overrides a lock that looks
+abandoned.
 
 `make sync` is the one command to reach for after files under `data/raw/<persona>/` change. It asks
 the loaders which document ids those files would produce, compares them with what the graph holds,
