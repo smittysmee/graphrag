@@ -27,7 +27,10 @@ sidecar is rewritten: an attribution file that gains posted dates, or an annotat
 gains facets, names a document that already has speakers or stances, so nothing would re-import
 it and the new fields would never reach the graph. ``refresh_attribution`` and
 ``refresh_annotations`` answer that case by re-importing every sidecar of that kind the persona
-has, whatever the graph already holds, and each source's line says so.
+has, whatever the graph already holds, and each source's line says so. A tagging pass that adds
+node attributes to files the graph already has speakers and stances for is exactly that case, so
+those two flags are how attributes reach the graph; what the vocabulary refuses, and what a
+second file contradicts, is printed as the run goes past.
 
 The persona's alias table is applied once at the end, after every file has landed. An import can
 only canonicalise the names inside the file it is reading; folding two spellings that arrived in
@@ -50,6 +53,7 @@ from pathlib import Path
 from graphrag.embed.base import Embedder
 from graphrag.extract.aliases import EMPTY_ALIASES, AliasReport, AliasTable, apply_alias_table
 from graphrag.extract.annotations import EntityIndex, FacetTable, import_annotation_file
+from graphrag.extract.attributes import EMPTY_ATTRIBUTES, AttributeTable
 from graphrag.extract.attribution import import_attribution_file
 from graphrag.extract.importer import import_extraction_file, read_doc_id
 from graphrag.graph.store import GraphStore
@@ -247,6 +251,7 @@ def sync_persona(
     annotation_root: Path | None = None,
     aliases: AliasTable = EMPTY_ALIASES,
     facets: FacetTable | None = None,
+    attributes: AttributeTable = EMPTY_ATTRIBUTES,
     source_id: str | None = None,
     refresh_attribution: bool = False,
     refresh_annotations: bool = False,
@@ -357,7 +362,7 @@ def sync_persona(
             store, persona, source, voices, reingested=bool(missing), refresh=refresh_attribution
         )
         attributed, voice_errors = _reimport_attribution(
-            store, waiting, say, reingested=bool(missing) or refresh_attribution
+            store, waiting, say, attributes, reingested=bool(missing) or refresh_attribution
         )
         # And for the readings, which hang off the same chunks and the mentions on them.
         unread = _pending_annotation(
@@ -370,6 +375,7 @@ def sync_persona(
             persona.id,
             aliases,
             facets,
+            attributes,
             reingested=bool(missing) or refresh_annotations,
         )
         reports.append(
@@ -519,12 +525,20 @@ def _pending_attribution(
 
 
 def _reimport_attribution(
-    store: GraphStore, files: list[Path], say: Progress, *, reingested: bool
+    store: GraphStore,
+    files: list[Path],
+    say: Progress,
+    attributes: AttributeTable,
+    *,
+    reingested: bool,
 ) -> tuple[int, tuple[str, ...]]:
     """Put a source's pending attribution files back into the graph.
 
     A file whose anchors all came loose still counts as imported: it was read and applied, and
-    the loose anchors are ``attribution-import``'s report to make, not this one's.
+    the loose anchors are ``attribution-import``'s report to make, not this one's. What a file
+    says about its speakers is not the importer's to keep quiet about, though: an invalid
+    attribute and a value two files disagree on are both said out loud here, because a refresh
+    run is exactly where a rewritten sidecar's attributes land and nothing else would show them.
     """
     if files:
         what = "re-importing" if reingested else "importing"
@@ -532,9 +546,13 @@ def _reimport_attribution(
     imported = 0
     errors: list[str] = []
     for path in files:
-        result = import_attribution_file(store, path)
+        result = import_attribution_file(store, path, attributes=attributes)
         if result.ok:
             imported += 1
+            for problem in result.attribute_problems:
+                say(f"{path.name}: attribute invalid: {problem}")
+            for conflict in result.conflicts:
+                say(f"{path.name}: {conflict}")
         else:
             errors.append(f"{path.name}: {result.error}")
     return imported, tuple(errors)
@@ -577,6 +595,7 @@ def _reimport_annotation(
     persona_id: str,
     aliases: AliasTable,
     facets: FacetTable | None,
+    attributes: AttributeTable,
     *,
     reingested: bool,
 ) -> tuple[int, tuple[str, ...]]:
@@ -595,9 +614,13 @@ def _reimport_annotation(
     imported = 0
     errors: list[str] = []
     for path in files:
-        result = import_annotation_file(store, path, aliases=aliases, facets=facets, entities=known)
+        result = import_annotation_file(
+            store, path, aliases=aliases, facets=facets, attributes=attributes, entities=known
+        )
         if result.ok:
             imported += 1
+            for problem in result.attribute_problems:
+                say(f"{path.name}: attribute invalid: {problem}")
         else:
             errors.append(f"{path.name}: {result.error}")
     return imported, tuple(errors)

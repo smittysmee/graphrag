@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import date
 from itertools import pairwise
 from typing import Any
@@ -109,6 +109,28 @@ def _chunk_from_node(node: dict[str, Any]) -> Chunk:
     )
 
 
+#: How a persona's speaker attributes are named on the shared ``Speaker`` node. The node is
+#: keyed on the name alone, so two personas can hold the same handle; a reading written for one
+#: corpus is not a fact about the other, and the prefix is what keeps them apart. Keys are
+#: slugs (:data:`graphrag.extract.attributes.KEY_RE`) and persona ids are slugs, so the double
+#: underscore never occurs inside either half and the split back is unambiguous.
+ATTR_PREFIX = "attr__"
+
+
+def _attr_prefix(persona_id: str) -> str:
+    return f"{ATTR_PREFIX}{persona_id}__"
+
+
+def _speaker_attributes(props: Mapping[str, Any], persona_id: str) -> dict[str, str]:
+    """This persona's attributes out of a ``Speaker`` node's properties."""
+    prefix = _attr_prefix(persona_id)
+    return {
+        key[len(prefix) :]: str(value)
+        for key, value in props.items()
+        if key.startswith(prefix) and value is not None
+    }
+
+
 def _doc_props(doc: Document) -> dict[str, Any]:
     return {
         "persona_id": doc.persona_id,
@@ -121,8 +143,20 @@ def _doc_props(doc: Document) -> dict[str, Any]:
         "speakers": doc.speakers,
         "topics": doc.topics,
         "metadata_json": json.dumps(doc.metadata, sort_keys=True),
+        # Carried as JSON for the reason `metadata_json` is: a map cannot be a node property.
+        # Written on every upsert, so a re-ingest drops what the annotation layer put here
+        # exactly as it drops the stances, and `sync --refresh-annotations` puts it back.
+        "attributes_json": json.dumps(doc.attributes, sort_keys=True),
         "word_count": doc.word_count,
     }
+
+
+def _attributes(raw: Any) -> dict[str, str]:
+    """A node's ``attributes_json`` as a plain mapping of strings."""
+    loaded = json.loads(raw or "{}")
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): str(value) for key, value in loaded.items() if value is not None}
 
 
 def _doc_from_node(node: dict[str, Any]) -> Document:
@@ -139,6 +173,7 @@ def _doc_from_node(node: dict[str, Any]) -> Document:
         speakers=list(node.get("speakers") or []),
         topics=list(node.get("topics") or []),
         metadata=json.loads(node.get("metadata_json") or "{}"),
+        attributes=_attributes(node.get("attributes_json")),
         word_count=int(node.get("word_count") or 0),
     )
 
@@ -967,6 +1002,97 @@ class Neo4jGraphStore:
         )
         return {r["id"] for r in rows}
 
+    # ------------------------------------------------------------- node attributes
+    def set_speaker_attributes(
+        self, persona_id: str, speaker: str, attributes: Mapping[str, str]
+    ) -> list[str]:
+        """Record what this persona's corpus says the speaker is. Returns the keys it refused.
+
+        Held as prefixed properties on the shared ``Speaker`` node rather than on an edge to
+        the ``Persona``: a node with no passages left is deleted by the orphan sweep in
+        ``delete_persona``, and an attribute must not be the thing that keeps it alive.
+
+        Read then written, in two statements, because first-value-wins needs the held value and
+        Cypher cannot build a map from a computed list without APOC. The import path is a single
+        writer, so nothing races between the two. The write matches rather than merges the node:
+        a speaker no passage records is not a speaker, and an attribute is not a reason to keep
+        one alive.
+        """
+        wanted = {key: value for key, value in attributes.items() if value}
+        if not wanted:
+            return []
+        rows = self._read(
+            "MATCH (s:Speaker {name: $speaker}) RETURN properties(s) AS props", speaker=speaker
+        )
+        held = _speaker_attributes(rows[0]["props"], persona_id) if rows else {}
+        refused = [key for key, value in wanted.items() if held.get(key, value) != value]
+        fresh = {
+            _attr_prefix(persona_id) + key: value
+            for key, value in wanted.items()
+            if key not in refused
+        }
+        if fresh:
+            self._run(
+                "MATCH (s:Speaker {name: $speaker}) SET s += $props",
+                speaker=speaker,
+                props=fresh,
+            )
+        return refused
+
+    def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None:
+        """Merge attributes into the document, the incoming value winning per key."""
+        rows = self._read(
+            "MATCH (d:Document {id: $doc_id}) RETURN coalesce(d.attributes_json, '{}') AS held",
+            doc_id=doc_id,
+        )
+        if not rows:
+            return
+        merged = {**_attributes(rows[0]["held"]), **{k: v for k, v in attributes.items() if v}}
+        self._run(
+            "MATCH (d:Document {id: $doc_id}) SET d.attributes_json = $json",
+            doc_id=doc_id,
+            json=json.dumps(merged, sort_keys=True),
+        )
+
+    def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        """Every speaker of this persona that carries attributes, with what it carries."""
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            CALL {
+              WITH d
+              MATCH (d)-[:FEATURES]->(s:Speaker) RETURN s
+              UNION
+              WITH d
+              MATCH (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(s:Speaker) RETURN s
+            }
+            WITH DISTINCT s
+            RETURN s.name AS speaker, properties(s) AS props
+            ORDER BY speaker
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        out: dict[str, dict[str, str]] = {}
+        for row in rows:
+            attrs = _speaker_attributes(row["props"], persona_id)
+            if attrs:
+                out[row["speaker"]] = attrs
+        return out
+
+    def document_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        rows = self._paged(
+            """
+            MATCH (d:Document {persona_id: $persona_id})
+            WHERE d.attributes_json IS NOT NULL AND d.attributes_json <> '{}'
+            RETURN d.id AS doc_id, d.attributes_json AS attrs
+            ORDER BY doc_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        return {row["doc_id"]: _attributes(row["attrs"]) for row in rows}
+
     # ------------------------------------------------------------- annotation
     def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None:
         """Set ``stance`` on the ``MENTIONS`` edge from this passage to ``entity``.
@@ -1084,7 +1210,9 @@ class Neo4jGraphStore:
             }
             WITH d, s
             OPTIONAL MATCH (s)-[:SPOKE]->(c:Chunk {doc_id: d.id})
-            RETURN s.name AS speaker, d.id AS doc_id, count(c) AS chunks
+            WITH d, s, count(c) AS chunks
+            RETURN s.name AS speaker, d.id AS doc_id, chunks, properties(s) AS props,
+                   coalesce(d.attributes_json, '{}') AS doc_attrs
             ORDER BY speaker, doc_id
             SKIP $skip LIMIT $page
             """
@@ -1098,7 +1226,9 @@ class Neo4jGraphStore:
                   AND r.posted_at IS NOT NULL
                   AND ($since IS NULL OR r.posted_at >= $since)
                   AND ($until IS NULL OR r.posted_at <= $until)
-                RETURN s.name AS speaker, d.id AS doc_id, count(c) AS chunks
+                WITH d, s, count(c) AS chunks
+                RETURN s.name AS speaker, d.id AS doc_id, chunks, properties(s) AS props,
+                       coalesce(d.attributes_json, '{}') AS doc_attrs
                 ORDER BY speaker, doc_id
                 SKIP $skip LIMIT $page
                 """
@@ -1106,7 +1236,13 @@ class Neo4jGraphStore:
             query, persona_id=persona_id, source_id=source_id, since=since, until=until
         )
         return [
-            SpeakerDocument(speaker=r["speaker"], doc_id=r["doc_id"], chunks=int(r["chunks"]))
+            SpeakerDocument(
+                speaker=r["speaker"],
+                doc_id=r["doc_id"],
+                chunks=int(r["chunks"]),
+                speaker_attributes=_speaker_attributes(r["props"], persona_id),
+                document_attributes=_attributes(r["doc_attrs"]),
+            )
             for r in rows
         ]
 
@@ -1195,7 +1331,8 @@ class Neo4jGraphStore:
               AND ($types IS NULL OR e.type IN $types)
             RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
                    c.id AS chunk_id, d.id AS doc_id, m.stance AS stance,
-                   coalesce(c.speakers, []) AS speakers
+                   coalesce(c.speakers, []) AS speakers,
+                   coalesce(d.attributes_json, '{}') AS doc_attrs
             ORDER BY entity_id, chunk_id
             SKIP $skip LIMIT $page
             """,
@@ -1203,4 +1340,16 @@ class Neo4jGraphStore:
             source_id=source_id,
             types=list(types) if types else None,
         )
-        return [EntityMention.model_validate(r) for r in rows]
+        return [
+            EntityMention(
+                entity_id=r["entity_id"],
+                name=r["name"],
+                type=r["type"],
+                chunk_id=r["chunk_id"],
+                doc_id=r["doc_id"],
+                stance=r["stance"],
+                speakers=list(r["speakers"]),
+                document_attributes=_attributes(r["doc_attrs"]),
+            )
+            for r in rows
+        ]

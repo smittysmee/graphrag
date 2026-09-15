@@ -41,6 +41,16 @@ the passage is an annotation pointing at the wrong one.
 When the persona keeps a ``facets.yaml``, facets outside it are reported and dropped, per
 annotation, so one invented slug costs that slug rather than the file.
 
+One optional field sits outside the list, because it describes the document rather than any
+passage of it::
+
+    {"doc_id": "...", "attributes": {"region": "north"}, "annotations": [...]}
+
+Those go on the ``Document`` node, validated against the same file's ``attributes:`` section
+(:mod:`graphrag.extract.attributes`). A key or value outside the declared vocabulary is reported
+and dropped, per key, exactly as a facet is. This is what lets a network be cut by what kind of
+document a passage came from, and what an attribute analysis partitions by.
+
 Stance goes on the ``MENTIONS`` edge, facets go on the passage; both ride the snapshot. Re-import
 is a no-op, which is what lets :mod:`graphrag.sync` re-run these files after a re-ingest.
 """
@@ -56,6 +66,7 @@ import yaml
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from graphrag.extract.aliases import EMPTY_ALIASES, AliasTable, fold_name
+from graphrag.extract.attributes import EMPTY_ATTRIBUTES, VOCABULARY_FILE, AttributeTable
 from graphrag.extract.attribution import find_anchor, fold_passage
 from graphrag.graph.store import GraphStore
 from graphrag.models import Enrichment, Entity, Mention, Stance
@@ -92,8 +103,9 @@ LOOSE_REASONS: dict[LooseReason, str] = {
     "entity-absent": "entity not in the passage",
 }
 
-#: Where a persona keeps the functions its corpus talks about, beside ``persona.yaml``.
-FACET_FILE = "facets.yaml"
+#: Where a persona keeps the functions its corpus talks about, beside ``persona.yaml``. The same
+#: file declares the attribute vocabulary, which :mod:`graphrag.extract.attributes` reads.
+FACET_FILE = VOCABULARY_FILE
 
 #: Enough to cover any single document; the store pages, so this is one read either way.
 _ALL_CHUNKS = 100_000
@@ -189,6 +201,9 @@ class DocumentAnnotations(BaseModel):
     """One document's annotations as produced by an agent (``graphrag annotations-import``)."""
 
     doc_id: str
+    #: What kind of document this is. Optional, and a file may carry these and no annotations
+    #: at all: a document nobody has a reading of can still belong to a part of the corpus.
+    attributes: dict[str, str] = Field(default_factory=dict)
     annotations: list[Annotation] = Field(default_factory=list)
 
 
@@ -236,7 +251,8 @@ class AnnotationResult:
     ``applied`` counts annotations that reached the graph, ``stances`` and ``facets`` count what
     they wrote and ``created`` the mentions the fallback added. ``loose`` holds the annotations
     that were skipped, each carrying the reason it was, and ``unknown_facets`` the slugs dropped
-    for being outside the persona's declared vocabulary.
+    for being outside the persona's declared vocabulary. ``attributes`` counts the document
+    attributes written and ``attribute_problems`` holds the ones the vocabulary refused.
     """
 
     path: Path
@@ -247,9 +263,11 @@ class AnnotationResult:
     stances: int = 0
     facets: int = 0
     created: int = 0
+    attributes: int = 0
     entities: tuple[str, ...] = ()
     loose: tuple[LooseAnnotation, ...] = ()
     unknown_facets: tuple[str, ...] = ()
+    attribute_problems: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -270,6 +288,7 @@ def import_annotation_file(
     dry_run: bool = False,
     aliases: AliasTable = EMPTY_ALIASES,
     facets: FacetTable | None = None,
+    attributes: AttributeTable = EMPTY_ATTRIBUTES,
     entities: EntityIndex | None = None,
 ) -> AnnotationResult:
     """Validate one annotation file and write its stances and facets into the graph.
@@ -290,6 +309,10 @@ def import_annotation_file(
         return AnnotationResult(
             path=path, doc_id=payload.doc_id, error=f"unknown document {payload.doc_id}"
         )
+
+    kept_attributes, attribute_problems = attributes.check(payload.attributes)
+    if kept_attributes and not dry_run:
+        store.set_document_attributes(payload.doc_id, kept_attributes)
 
     folded = [(c.id, fold_passage(c.text)) for c in chunks]
     passages = dict(folded)
@@ -355,9 +378,11 @@ def import_annotation_file(
         stances=stances,
         facets=facet_writes,
         created=created,
+        attributes=len(kept_attributes),
         entities=tuple(named),
         loose=tuple(loose),
         unknown_facets=tuple(dict.fromkeys(unknown)),
+        attribute_problems=tuple(attribute_problems),
     )
 
 
@@ -423,14 +448,21 @@ def report_lines(result: AnnotationResult) -> list[str]:
     head = (
         f"{result.doc_id}: {result.applied}/{result.annotations} annotations, "
         f"{result.stances} stances, {result.facets} facets"
+        + (f", {result.attributes} attributes" if result.attributes else "")
         + (f", {result.created} mentions created" if result.created else "")
         + (f"; {len(result.loose)} loose" if result.loose else "")
         + (f"; {len(result.unknown_facets)} unknown facets" if result.unknown_facets else "")
+        + (
+            f"; {len(result.attribute_problems)} attribute problems"
+            if result.attribute_problems
+            else ""
+        )
     )
     return [
         head,
         *(f"  loose: {item}" for item in result.loose),
         *(f"  unknown facet: {facet}" for facet in result.unknown_facets),
+        *(f"  attribute invalid: {problem}" for problem in result.attribute_problems),
     ]
 
 

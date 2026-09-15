@@ -14,10 +14,18 @@ attaches the speaker to it::
                 "anchor": "verbatim opening words of the post, 6 to 20 words",
                 "role": "op" | "reply",
                 "date": "YYYY-MM-DD" | null,
-                "score": <int> | null}]}
+                "score": <int> | null,
+                "attributes": {"region": "north"}}]}
 
 ``role``, ``date`` and ``score`` are validated and passed through to the ``SPOKE`` edge, so a
 speaker network can be cut to a time window without going back to the files.
+
+``attributes`` describe the speaker rather than the post, and go on the ``Speaker`` node after
+being checked against the persona's vocabulary (:mod:`graphrag.extract.attributes`); a key or
+value outside it is reported and dropped, per key. Two posts that disagree about one speaker do
+not fight over the node: the first value written stands and the second is reported as
+``attribute conflict: <speaker> <key> <kept> vs <incoming>``, because which of two readings is
+right is a question for whoever wrote them, not for whichever file was imported last.
 
 Anchors are matched case-insensitively with whitespace folded, against the document's passages in
 order, and the first passage containing one wins. A post whose anchor matches nothing is reported
@@ -38,6 +46,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
+from graphrag.extract.attributes import EMPTY_ATTRIBUTES, AttributeTable
 from graphrag.graph.store import GraphStore
 from graphrag.textutil import sanitize_inline
 
@@ -68,6 +77,8 @@ class AttributedPost(BaseModel):
     role: Literal["op", "reply"] = "reply"
     date: dt.date | None = None
     score: int | None = None
+    #: What this post says the speaker *is*, not what the post is. Written onto the speaker.
+    attributes: dict[str, str] = Field(default_factory=dict)
 
 
 class DocumentAttribution(BaseModel):
@@ -84,6 +95,11 @@ class AttributionResult:
     ``attached`` counts posts placed in a passage, ``speakers`` names the distinct people that
     produced, and ``loose`` holds the posts whose anchor occurs in no passage of the document.
     A loose post is skipped rather than guessed at, so nothing is attributed to the wrong voice.
+
+    ``attributes`` counts the speaker attributes written, ``attribute_problems`` the keys the
+    persona's vocabulary refused, and ``conflicts`` the ones a stored value already contradicts.
+    The last two are different findings: a problem is a file to fix, a conflict is two readings
+    of one speaker that disagree, and only the file's author can say which is right.
     """
 
     path: Path
@@ -91,8 +107,11 @@ class AttributionResult:
     error: str = ""
     posts: int = 0
     attached: int = 0
+    attributes: int = 0
     speakers: tuple[str, ...] = ()
     loose: tuple[str, ...] = ()
+    attribute_problems: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -131,13 +150,29 @@ def report_lines(result: AttributionResult) -> list[str]:
     head = (
         f"{result.doc_id}: {result.attached}/{result.posts} posts attached, "
         f"{len(result.speakers)} speakers"
+        + (f", {result.attributes} speaker attributes" if result.attributes else "")
         + (f"; {len(result.loose)} loose anchors" if result.loose else "")
+        + (
+            f"; {len(result.attribute_problems)} attribute problems"
+            if result.attribute_problems
+            else ""
+        )
+        + (f"; {len(result.conflicts)} attribute conflicts" if result.conflicts else "")
     )
-    return [head, *(f"  loose: {post}" for post in result.loose)]
+    return [
+        head,
+        *(f"  loose: {post}" for post in result.loose),
+        *(f"  attribute invalid: {problem}" for problem in result.attribute_problems),
+        *(f"  {conflict}" for conflict in result.conflicts),
+    ]
 
 
 def import_attribution_file(
-    store: GraphStore, path: Path, *, dry_run: bool = False
+    store: GraphStore,
+    path: Path,
+    *,
+    dry_run: bool = False,
+    attributes: AttributeTable = EMPTY_ATTRIBUTES,
 ) -> AttributionResult:
     """Validate one attribution file and attach its speakers to the passages they wrote.
 
@@ -158,8 +193,13 @@ def import_attribution_file(
     folded = [(c.id, fold_passage(c.text)) for c in chunks]
     speakers: list[str] = []
     loose: list[str] = []
+    problems: list[str] = []
+    claimed: dict[str, dict[str, str]] = {}
+    conflicts: list[str] = []
     attached = 0
     for post in payload.posts:
+        kept, refused = attributes.check(post.attributes)
+        problems.extend(refused)
         chunk_id = find_anchor(post.anchor, folded)
         if chunk_id is None:
             loose.append(
@@ -169,6 +209,9 @@ def import_attribution_file(
         attached += 1
         if post.speaker not in speakers:
             speakers.append(post.speaker)
+        # Attributes ride on a post that placed: an anchor nobody can find is not evidence of
+        # anything, including of who the speaker is.
+        _claim(claimed.setdefault(post.speaker, {}), post.speaker, kept, conflicts)
         if not dry_run:
             store.attach_speaker(
                 payload.doc_id,
@@ -178,11 +221,73 @@ def import_attribution_file(
                 role=post.role,
                 score=post.score,
             )
+    written, stored_conflicts = _write_attributes(
+        store, chunks[0].persona_id, claimed, dry_run=dry_run
+    )
     return AttributionResult(
         path=path,
         doc_id=payload.doc_id,
         posts=len(payload.posts),
         attached=attached,
+        attributes=written,
         speakers=tuple(speakers),
         loose=tuple(loose),
+        attribute_problems=tuple(problems),
+        conflicts=tuple(conflicts + stored_conflicts),
     )
+
+
+def _conflict(speaker: str, key: str, kept: str, incoming: str) -> str:
+    """The one line a disagreement produces, wherever the kept value came from."""
+    return (
+        f"attribute conflict: {sanitize_inline(speaker, _LABEL)} {key} "
+        f"{sanitize_inline(kept, _LABEL)} vs {sanitize_inline(incoming, _LABEL)}"
+    )
+
+
+def _claim(
+    held: dict[str, str], speaker: str, incoming: dict[str, str], conflicts: list[str]
+) -> None:
+    """Fold one post's attributes into what this file already claims about its speaker.
+
+    First value written wins, inside a file exactly as across files: a thread where one post
+    says one thing and a later post says another is a disagreement to report, not a race for
+    whichever line the reader reached last.
+    """
+    for key, value in incoming.items():
+        if key in held and held[key] != value:
+            conflicts.append(_conflict(speaker, key, held[key], value))
+        else:
+            held.setdefault(key, value)
+
+
+def _write_attributes(
+    store: GraphStore, persona_id: str, claimed: dict[str, dict[str, str]], *, dry_run: bool
+) -> tuple[int, list[str]]:
+    """Put this file's speaker attributes on the nodes, and report what was already contradicted.
+
+    The stored values are read once, before anything is written, so a dry run reports exactly
+    the conflicts a real import would: the store keeps the first value and returns the keys it
+    refused, and the read supplies the value it kept them at, for the report.
+    """
+    if not claimed:
+        return 0, []
+    held = store.speaker_attributes(persona_id)
+    conflicts: list[str] = []
+    written = 0
+    for speaker, incoming in claimed.items():
+        if not incoming:
+            continue
+        stored = held.get(speaker, {})
+        refused = (
+            [key for key, value in incoming.items() if stored.get(key, value) != value]
+            if dry_run
+            else store.set_speaker_attributes(persona_id, speaker, incoming)
+        )
+        conflicts += [
+            _conflict(speaker, key, stored.get(key, ""), incoming[key])
+            for key in refused
+            if key in incoming
+        ]
+        written += len(incoming) - len(refused)
+    return written, conflicts

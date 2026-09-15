@@ -6,9 +6,10 @@ grouping means anything. It is built on `networkx` (graphs, Louvain, modularity)
 Nothing here re-implements an algorithm those libraries provide.
 
 The code lives in `src/graphrag/sna/`: `export.py` builds the networks, `measures.py` measures
-them, `cluster.py` groups them and checks the grouping, `guide.py` holds the selection rules,
-`analysis.py` runs one analysis end to end and renders the report, `stances.py` reports what the
-corpus says about each entity, and `compare.py` runs one network over two time windows.
+them, `cluster.py` groups them and checks the grouping, `attributes.py` measures a network
+against a property its nodes carry, `guide.py` holds the selection rules, `analysis.py` runs one
+analysis end to end and renders the report, `stances.py` reports what the corpus says about each
+entity, and `compare.py` runs one network over two builds.
 
 Four networks come out of the graph. Three are one-mode -- speakers, entities, topics -- and
 `speakers-entities` is two-mode: speakers on one side, the entities their passages mention on the
@@ -21,6 +22,13 @@ saying so next to the numbers:
 - `--facet <slug>` keeps only passages about one function of the subject.
 - `--since` / `--until` keep only passages dated into the window, which drops every document
   nobody dated.
+- `--where key=value` keeps only nodes attributed that way: a speaker by what an attribution
+  pass recorded about them, an entity or a topic by the attributes of the document its passage
+  belongs to. A node with no value for that key is out of the network, not in some other group.
+
+`graphrag sna analyze --by key` goes further and asks whether the network *divides* along one of
+those attributes, which is a different question from what any filter answers. See
+[Reading a report](#reading-a-report) and the node-attribute rules below.
 
 ## Commands
 
@@ -55,6 +63,17 @@ graphrag sna analyze <persona> --network speakers-entities --project speakers --
 graphrag sna stances <persona> --entity "Some Product" --facet quoting \
     --out /app/data/exports/stances.md
 
+# one population of the corpus, and whether the network divides along that attribute
+graphrag sna analyze <persona> --network speakers --where region=north --seed 1 \
+    --out /app/data/exports/north.md
+graphrag sna analyze <persona> --network speakers --by region --seed 1 \
+    --out /app/data/exports/by-region.md
+
+# two populations as two builds, compared the way two windows are
+graphrag sna compare <persona> --network entities --min-weight 2 \
+    --where region=north --where2 region=south --seed 1 \
+    --out /app/data/exports/north-vs-south.md
+
 # the same network over two windows: who entered, who left, what moved
 graphrag sna compare <persona> --network speakers \
     --since 2024-01-01 --until 2024-12-31 --since2 2025-01-01 --until2 2025-12-31 \
@@ -73,6 +92,10 @@ the container exits and the CLI warns you about it.
 | `--stance` | entities, speakers-entities | keep only mentions with this stance; repeat for several |
 | `--facet` | all networks, stances | keep only passages carrying this facet; repeat for several |
 | `--since`, `--until` | all networks | keep only passages dated in this window, ISO `YYYY-MM-DD` |
+| `--where` | all networks, stances, compare | keep only nodes attributed `key=value`; repeat for several keys |
+| `--where2` | compare | the second build's attribute filter (defaults to `--where`) |
+| `--by` | analyze | also report whether the network divides along this node attribute |
+| `--permutations` | analyze `--by` | label shuffles behind the assortativity null (default 200) |
 | `--project` | speakers-entities | collapse the two-mode network onto `speakers` or `entities` |
 | `--entity` | stances | limit the report to this entity by name; repeat for several |
 | `--quotes` | stances | verbatim passages to quote per stance (default 3) |
@@ -127,6 +150,22 @@ passages constantly while meaning entirely different things.
 and the entities their passages named, in documents. A projection throws the other mode away, so
 this is read from the partners recorded on each node when the network was built, not from the
 graph you are looking at.
+
+**The attribute section (`--by`).** Read it top down, because it is ordered by what it can
+support. The value counts come first: a value with four nodes in it supports nothing, and the
+untagged count says how much of the network is outside every number below. Then assortativity
+against a permutation null, which holds the graph and the labels fixed and moves only which node
+holds which label, so the z-score is about this attribute and not about the network having
+structure. Then the modularity of the attribute partition against two things at once: a
+degree-preserving null, which says whether it beats chance, and Louvain's best grouping of the
+same nodes, which says whether it is the division in the network or merely a division. Near-zero
+assortativity beside a strong Louvain result is a finding: the network divides, and not along
+this. Last, the adjusted Rand index and mutual information between the run's groups and the
+labels, each with the baseline a shuffle produces.
+
+An entity or a topic inherits its value from the documents its passages sit in, which can
+disagree; the section says how many nodes were mixed, and a large number there means the
+attribute describes documents and the entity network is the wrong place to ask about it.
 
 **The stance report.** Every number in it counts annotations, not mentions. An entity with no
 complaints has no annotated complaints, which is not the same as no complaints, and the
@@ -198,6 +237,15 @@ claims, the annotation is wrong.
 - **The projection throws the other mode away** — a heavy speaker-speaker edge does not say which entities it ran through. Export the two-mode network beside the projected one, or read the partners recorded on each node, before naming what a group has in common.
 - **Sharing a node is not agreement** — two speakers joined by an entity both named it, which includes one recommending it and the other warning against it. Add --stance if the question is whether they agreed.
 
+### Node attributes (--where / --by)
+
+- **An attribute is a hypothesis, not a finding** — somebody tagged these nodes because they expected the network to divide along the tag. Measuring it tests that expectation; it does not confirm it. Report the assortativity and its permutation null in the same breath as the value counts, and be as willing to write 'the network does not divide along this' as the opposite.
+- **Near-zero assortativity with a strong Louvain result is a finding** — it says the network has structure and the attribute is not it. Name what the Louvain groups actually have in common before reaching for another tag; the division is real and you have not found it yet.
+- **Report n per value** — a 90/10 split scores differently from a 50/50 one on every measure here, and a value with four nodes in it supports nothing at all. Print the per-value counts above the coefficients, and say how many nodes carry no value.
+- **Untagged is not a third value** — every measure is computed over the nodes that carry a value, because a node nobody tagged has no label to correlate. A corpus tagged in half therefore describes that half. Check the untagged count before generalising, and never read an absent tag as a value of its own.
+- **Two values are two builds, not two halves of one** — --where on one value and --where2 on the other builds two networks, each with its own n, density and communities, exactly as two time windows are two networks. Compare them the way the comparison report does -- counts first, structure second -- and never subtract one from the unfiltered whole to infer the other.
+- **A majority label on a shared node is a majority** — a speaker carries the value somebody wrote for them, but an entity or a topic inherits one from the documents its passages sit in, which can disagree. The report says how many nodes were mixed; when that number is large the attribute is describing documents, and the entity network is the wrong place to ask about it.
+
 ### Always
 
 - Report n. A centrality ranking over 12 nodes is an anecdote with decimal places.
@@ -222,6 +270,10 @@ claims, the annotation is wrong.
   remainder is not the opposite stance and not the other facet; it is unread.
 - A window is answered from the dates an attribution pass wrote onto passages. A corpus with no
   dates produces an empty window rather than an error, which is why `compare` prints n first.
+- An attribute is a claim somebody wrote down about a node, so `--where` and `--by` describe the
+  part of the corpus a tagging pass reached. Untagged nodes are outside every filtered network
+  and every attribute measure; they are not a value, and a corpus tagged in half describes that
+  half.
 
 ## Writing the result up
 

@@ -332,6 +332,16 @@ post  speaker posted     entities (stance)                facets
 So praise joins Alpha to Beta and complaint joins Alpha to Gamma twice: the stance filter does
 not thin one network, it produces a different one. The two halves of the year hold different
 speakers, and post 5 is dated by nobody, so it leaves every window.
+
+Each post also carries an invented node attribute, ``region``, on its document and on its
+speaker, so an attribute filter has something to keep and something to drop::
+
+    post-1 ana  region=north    post-2 bo  region=south
+    post-3 ana  region=north    post-4 cy  region=south
+    post-5 dot  no region at all
+
+``dot`` and post 5 are deliberately untagged: a node nobody tagged has to leave every filtered
+network, exactly as an undated post leaves every window.
 """
 LAYERED_PERSONA = "test-layers"
 LAYERED_SOURCE = "posts"
@@ -381,6 +391,13 @@ LAYERED_POSTS: tuple[tuple[str, str, str, str, tuple[str, ...], tuple[str, ...]]
         ("service",),
     ),
 )
+#: Which region a post's document and its speaker were tagged with; absent means untagged.
+LAYERED_REGIONS: dict[str, str] = {
+    "post-1": "north",
+    "post-2": "south",
+    "post-3": "north",
+    "post-4": "south",
+}
 #: entity id -> (name, type) and, per post, the stance the annotation pass put on the mention.
 LAYERED_ENTITIES: dict[str, tuple[str, str]] = {
     "product:alpha": ("Alpha", "product"),
@@ -441,6 +458,11 @@ def layered(
         )
     memory_store.upsert_documents(documents)
     memory_store.upsert_chunks(chunks, hash_embedder.embed_documents([c.text for c in chunks]))
+    for slug, region in LAYERED_REGIONS.items():
+        doc_id = f"{LAYERED_PERSONA}:{LAYERED_SOURCE}:{slug}"
+        memory_store.set_document_attributes(doc_id, {"region": region})
+        speaker = next(p[1] for p in LAYERED_POSTS if p[0] == slug)
+        memory_store.set_speaker_attributes(LAYERED_PERSONA, speaker, {"region": region})
     memory_store.upsert_enrichment(
         Enrichment(
             entities=[

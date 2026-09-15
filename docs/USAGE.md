@@ -353,13 +353,31 @@ Each anchor is looked for in the document's passages, ignoring case and how the 
 and the speaker is attached to the first passage that contains it. `role`, `date` and `score` are
 kept in the file as provenance; only who spoke in which passage reaches the graph.
 
+A post may also carry `attributes`, which describe the *speaker* rather than the post and go onto
+the speaker node:
+
+```json
+{"speaker": "handle", "anchor": "the verbatim opening words", "role": "reply",
+ "attributes": {"region": "north", "team": "Some Team"}}
+```
+
+Write one only when the document says it: a handle that states where they work, or whose posts
+across the thread are plainly one thing. Never infer one from a tool somebody mentions. The first
+value written for a speaker stands; a later post that disagrees is reported as `attribute
+conflict: <speaker> <key> <kept> vs <incoming>` and changes nothing, because which of two
+readings is right is a question for whoever wrote them.
+
 A post whose anchor occurs in no passage is reported as loose and skipped, never guessed at, so a
 paraphrased opening line costs that one post rather than the file. The dry run lists them, which
 is what you fix before writing. Import is idempotent.
 
 `make sync` re-imports these files by itself, on the same two triggers as the extraction files: a
 source it had to re-ingest (re-ingesting deletes the passages the speakers hang off), and a
-document sitting in the graph with no speaker at all.
+document sitting in the graph with no speaker at all. Neither trigger can see a file that was
+*rewritten* for a document that already has its layer, which is what a tagging pass produces, so
+attributes added to existing sidecars reach the graph through
+`make sync PERSONA=<id> REFRESH=1`, which passes `--refresh-attribution` and
+`--refresh-annotations` to `graphrag sync`.
 
 ### Fold alias spellings together
 
@@ -452,13 +470,37 @@ three to fix first:
 validated 170 files: 483 annotations, 470 stances, 612 facets, 12 mentions created, 235 loose (18 anchor not found, 190 entity unknown to the persona, 27 entity not in the passage)
 ```
 
-When the persona keeps a `facets.yaml`, facets outside it are reported and dropped:
+An annotation file may also carry a top-level `attributes` object, which describes the
+*document* rather than any passage of it:
+
+```json
+{"doc_id": "<persona>:<source>:<slug>", "attributes": {"region": "north"}, "annotations": []}
+```
+
+A file may carry attributes and no annotations at all: a document nobody has a reading of still
+belongs to a part of the corpus. Document attributes are what `graphrag sna --where` cuts an
+entity or topic network by, and what `--by` partitions one by.
+
+When the persona keeps a `facets.yaml`, facets outside it are reported and dropped, and the same
+file declares which attributes exist:
 
 ```yaml
 facets:
   handover: Moving work or knowledge from one person to another.
   access: Getting the accounts and permissions a job needs.
+attributes:
+  region:
+    values: [north, south]
+    description: Which half of the network this belongs to.
+  team:
+    description: The team a speaker says they are on, as written.
 ```
+
+A key with `values` is closed, so a value outside the list is reported and dropped, per entry; a
+key without `values` is free text, which is the right shape for something nobody can enumerate in
+advance. Without the `attributes:` section, any key and value is accepted. `graphrag layers
+check` counts what the vocabulary refused as loose, under `speaker attribute invalid` and
+`document attribute invalid`, so a tagging pass that invented a value fails visibly.
 
 Without that file, any facet is accepted. Import is idempotent, and `make sync` re-imports these
 files on the same two triggers as the other layers: a source it had to re-ingest, and a document
@@ -492,6 +534,21 @@ docker compose run --rm graphrag graphrag sna export <persona> \
 Pass `--seed` so the run can be repeated, and write under `/app/data/` so the file survives the
 container. The report carries the method rationale, the stability score, the null-model z-score
 and the caveats, so it can go into a corpus as a research note unedited.
+
+If the corpus carries node attributes, two more questions open up. `--where key=value` builds the
+network over one population of it, and `--by key` asks whether the network divides along that
+attribute at all, against a null that shuffles the labels and one that rewires the graph:
+
+```bash
+# one population, then the same network measured against the attribute itself
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --where region=north --seed 1 --out /app/data/exports/north.md
+docker compose run --rm graphrag graphrag sna analyze <persona> \
+  --network speakers --by region --seed 1 --out /app/data/exports/by-region.md
+```
+
+An attribute is a hypothesis about where a network divides, not a finding, and the report is
+written to be as able to say no as yes.
 
 [SNA.md](SNA.md) has the full reference: which method for which question, how to read a z-score,
 and what to do when silhouette and BIC disagree.
@@ -586,10 +643,13 @@ source through regardless.
 
 Sync decides what to re-import by asking whether a layer is *missing*, which a rewritten sidecar
 never is: an attribution file that gained posted dates, or an annotation file that gained facets,
-names a document that already has speakers or stances, so nothing picks the new fields up. Pass
+names a document that already has speakers or stances, so nothing picks the new fields up. The same is true of a sidecar that gained node attributes, which is what a tagging pass
+writes. Pass
 `--refresh-attribution` or `--refresh-annotations` to re-import every sidecar of that kind for the
-persona whatever the graph already holds; each source's line then says `re-imported N attribution
-files` rather than the backfill wording, and `--dry-run` reports the same count without writing.
+persona whatever the graph already holds (`make sync PERSONA=<id> REFRESH=1` passes both); each
+source's line then says `re-imported N attribution files` rather than the backfill wording, and
+`--dry-run` reports the same count without writing. Attribute problems and conflicts are printed
+as the run goes past, because nothing else would show them.
 
 ---
 

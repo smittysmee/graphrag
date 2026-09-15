@@ -181,6 +181,59 @@ def test_attach_speaker_and_attributed_document_ids(
     assert memory_store.stats().speakers == 2
 
 
+def test_node_attributes_are_kept_per_persona_and_ride_the_rows_that_read_them(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """The store contract behind `--where` and `--by`.
+
+    The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
+    """
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.attach_speaker(thread_document, chunks[0].id, "quill-maker")
+
+    assert (
+        memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "north"}) == []
+    )
+    memory_store.set_document_attributes(thread_document, {"region": "south"})
+
+    assert memory_store.speaker_attributes("test-docs") == {"quill-maker": {"region": "north"}}
+    assert memory_store.document_attributes("test-docs") == {thread_document: {"region": "south"}}
+    # Speaker attributes are a reading of one corpus, so another persona's graph holds none.
+    assert memory_store.speaker_attributes("other-persona") == {}
+
+    row = next(r for r in memory_store.speaker_document_pairs("test-docs"))
+    assert row.speaker_attributes == {"region": "north"}
+    assert row.document_attributes == {"region": "south"}
+
+
+def test_the_first_speaker_attribute_written_wins_and_the_rest_come_back(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "north"})
+
+    same = memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "north"})
+    other = memory_store.set_speaker_attributes(
+        "test-docs", "quill-maker", {"region": "south", "team": "Blue"}
+    )
+
+    assert same == []  # an identical value is not a disagreement
+    assert other == ["region"]  # the key it refused, for the caller to report
+    assert memory_store.speaker_attributes("test-docs")["quill-maker"] == {
+        "region": "north",
+        "team": "Blue",
+    }
+
+
+def test_deleting_a_persona_takes_its_speaker_attributes_with_it(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "north"})
+
+    memory_store.delete_persona("test-docs")
+
+    assert memory_store.speaker_attributes("test-docs") == {}
+
+
 def test_network_reads_return_the_edges_the_sna_package_projects_from(
     ingested: IngestReport, memory_store: InMemoryGraphStore
 ) -> None:

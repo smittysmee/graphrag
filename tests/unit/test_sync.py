@@ -736,6 +736,71 @@ def test_refresh_attribution_re_imports_a_document_that_already_has_speakers(
     )
 
 
+def test_a_refresh_is_how_node_attributes_reach_a_graph_that_already_has_the_layer(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+    annotation_root: Path,
+) -> None:
+    """A tagging pass rewrites sidecars for documents that already have speakers and stances.
+
+    Nothing in the graph says those files changed, so the two refresh flags are the only thing
+    that carries the new attributes in; what the vocabulary refuses is said out loud on the way.
+    """
+    from graphrag.extract.attributes import load_attributes
+
+    vocabulary = raw_root.parent / "facets.yaml"
+    vocabulary.write_text("attributes:\n  region:\n    values: [north, south]\n", encoding="utf-8")
+    directory = attribution_root / PERSONA_ID / THREADS
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{threaded.rsplit(':', 1)[-1]}.json").write_text(
+        json.dumps(
+            {
+                "doc_id": threaded,
+                "posts": [
+                    {
+                        "speaker": "quill-maker",
+                        "anchor": THREAD_POSTS[0][2][:60],
+                        "role": "op",
+                        "attributes": {"region": "north", "colour": "green"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    readings = annotation_root / PERSONA_ID / THREADS
+    readings.mkdir(parents=True, exist_ok=True)
+    (readings / f"{threaded.rsplit(':', 1)[-1]}.json").write_text(
+        json.dumps({"doc_id": threaded, "attributes": {"region": "south"}}), encoding="utf-8"
+    )
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "quill-maker"
+    )
+    said: list[str] = []
+
+    report = run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        annotation_root=annotation_root,
+        attributes=load_attributes(vocabulary),
+        refresh_attribution=True,
+        refresh_annotations=True,
+        progress=said.append,
+    )
+
+    assert report.errors == ()
+    assert memory_store.speaker_attributes(PERSONA_ID) == {"quill-maker": {"region": "north"}}
+    assert memory_store.documents[threaded].attributes == {"region": "south"}
+    assert any("attribute invalid: colour" in line for line in said)
+
+
 def test_without_the_flag_a_rewritten_attribution_file_is_left_alone(
     threaded: str,
     memory_store: InMemoryGraphStore,

@@ -92,6 +92,10 @@ class Document(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     topics: list[str] = Field(default_factory=list)
     metadata: dict[str, Scalar] = Field(default_factory=dict)
+    #: What kind of document this is, from the annotation layer: one short value per declared
+    #: key. Carried on the model rather than in a side table so it rides the snapshot, and set
+    #: only by a person or an agent that read the document, never inferred at ingest.
+    attributes: dict[str, str] = Field(default_factory=dict)
     word_count: int = 0
 
 
@@ -391,6 +395,12 @@ class SpeakerDocument(BaseModel):
     speaker: str
     doc_id: str
     chunks: int = 0
+    #: What an attribution pass recorded about this speaker, and what an annotation pass
+    #: recorded about the document. Carried on the edge so a network can be cut by either
+    #: without a second read: the speaker network filters on the first, every network built
+    #: from passages filters on the second.
+    speaker_attributes: dict[str, str] = Field(default_factory=dict)
+    document_attributes: dict[str, str] = Field(default_factory=dict)
 
 
 class EntityChunk(BaseModel):
@@ -452,3 +462,6 @@ class EntityMention(BaseModel):
     doc_id: str
     stance: Stance | None = None
     speakers: list[str] = Field(default_factory=list)
+    #: The attributes of the document this passage belongs to, so a two-mode network can be cut
+    #: by what kind of document a mention came from without joining the documents back on.
+    document_attributes: dict[str, str] = Field(default_factory=dict)

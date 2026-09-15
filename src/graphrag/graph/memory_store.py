@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -70,6 +70,9 @@ class InMemoryGraphStore:
         self.entities: dict[str, Entity] = {}
         self.mentions: list[Mention] = []
         self.relations: list[Relation] = []
+        #: (persona_id, speaker) -> attributes. Keyed on the persona because a speaker name is
+        #: shared between personas exactly as the Neo4j ``Speaker`` node is.
+        self.speaker_attrs: dict[tuple[str, str], dict[str, str]] = {}
         self.dim: int | None = None
 
     # ------------------------------------------------------------- lifecycle
@@ -259,6 +262,7 @@ class InMemoryGraphStore:
         self.mentions = [m for m in self.mentions if m.chunk_id not in chunk_ids]
         self.relations = [r for r in self.relations if r.chunk_id not in chunk_ids]
         self.personas.pop(persona_id, None)
+        self.speaker_attrs = {k: v for k, v in self.speaker_attrs.items() if k[0] != persona_id}
         self.delete_orphan_entities(persona_id)
 
     # ------------------------------------------------------------- search
@@ -497,6 +501,44 @@ class InMemoryGraphStore:
         wanted = self.document_ids(persona_id, source_id)
         return {doc_id for doc_id in wanted if self.documents[doc_id].speakers}
 
+    # ------------------------------------------------------------- node attributes
+    def set_speaker_attributes(
+        self, persona_id: str, speaker: str, attributes: Mapping[str, str]
+    ) -> list[str]:
+        """Record what this persona's corpus says the speaker is. Returns the keys it refused.
+
+        First value written wins: a key already held under a different value is left alone and
+        comes back for the caller to report. An identical value is not a conflict, so
+        re-importing the same file is the no-op every other import here is.
+        """
+        held = self.speaker_attrs.setdefault((persona_id, speaker), {})
+        refused = [key for key, value in attributes.items() if held.get(key, value) != value]
+        for key, value in attributes.items():
+            held.setdefault(key, value)
+        return refused
+
+    def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None:
+        document = self.documents.get(doc_id)
+        if document is None:
+            return
+        merged = {**document.attributes, **attributes}
+        if merged != document.attributes:
+            self.documents[doc_id] = document.model_copy(update={"attributes": merged})
+
+    def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        return {
+            speaker: dict(attrs)
+            for (pid, speaker), attrs in self.speaker_attrs.items()
+            if pid == persona_id and attrs
+        }
+
+    def document_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        return {
+            doc.id: dict(doc.attributes)
+            for doc in self.documents.values()
+            if doc.persona_id == persona_id and doc.attributes
+        }
+
     # ------------------------------------------------------------- annotation
     def _mention_index(self, doc_id: str, chunk_id: str, entity: str) -> int | None:
         """Where the ``MENTIONS`` edge this annotation is about sits, or ``None``.
@@ -607,7 +649,15 @@ class InMemoryGraphStore:
                 }
             for name in sorted(names):
                 spoken = sum(1 for c in chunks if _holds(c, name, since, until, windowed))
-                rows.append(SpeakerDocument(speaker=name, doc_id=doc_id, chunks=spoken))
+                rows.append(
+                    SpeakerDocument(
+                        speaker=name,
+                        doc_id=doc_id,
+                        chunks=spoken,
+                        speaker_attributes=dict(self.speaker_attrs.get((persona_id, name), {})),
+                        document_attributes=dict(doc.attributes),
+                    )
+                )
         rows.sort(key=lambda r: (r.speaker, r.doc_id))
         return rows
 
@@ -701,6 +751,7 @@ class InMemoryGraphStore:
                     doc_id=chunk.doc_id,
                     stance=mention.stance,
                     speakers=list(chunk.speakers),
+                    document_attributes=dict(self.documents[chunk.doc_id].attributes),
                 )
             )
         rows.sort(key=lambda r: (r.entity_id, r.chunk_id))

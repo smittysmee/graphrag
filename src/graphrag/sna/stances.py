@@ -19,14 +19,14 @@ praised together and two things complained about together are different findings
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import combinations
 
 from graphrag.extract.aliases import fold_name
 from graphrag.graph.store import GraphStore
 from graphrag.models import MentionStance, Stance
-from graphrag.sna.export import STANCES
+from graphrag.sna.export import STANCES, matches, where_text
 from graphrag.textutil import sanitize_inline
 
 __all__ = [
@@ -82,6 +82,7 @@ class StanceReport:
     persona_id: str
     source_id: str = ""
     facets: tuple[str, ...] = ()
+    where: str = ""
     entities: tuple[EntityStances, ...] = ()
     pairs: tuple[SignedPair, ...] = ()
     annotations: int = 0
@@ -102,6 +103,7 @@ def build_stance_report(
     source_id: str | None = None,
     entities: Sequence[str] = (),
     facets: Sequence[str] = (),
+    where: Mapping[str, str] | None = None,
     quotes_per_stance: int = 3,
 ) -> StanceReport:
     """Read the annotation layer for one persona and group it by entity and by stance.
@@ -110,8 +112,16 @@ def build_stance_report(
     insensitive with whitespace folded, against the stored name. A name that matches nothing is
     reported rather than silently dropped, because a typo and an entity with no annotations look
     identical in the output otherwise.
+
+    ``where`` keeps only annotations whose document carries those attribute values, which is how
+    one population's opinion of a thing is read apart from another's. Run it twice and compare
+    the two tables rather than reading one against the unfiltered whole: the denominators are
+    different corpora.
     """
     rows = store.mention_stances(persona_id, source_id)
+    if where:
+        attributes = store.document_attributes(persona_id)
+        rows = [r for r in rows if matches(attributes.get(r.doc_id, {}), where)]
     facet_of = {r.chunk_id: list(r.facets) for r in store.chunk_facets(persona_id, source_id)}
     if facets:
         wanted_facets = {f.strip() for f in facets if f.strip()}
@@ -145,6 +155,7 @@ def build_stance_report(
         persona_id=persona_id,
         source_id=source_id or "",
         facets=tuple(facets),
+        where=where_text(where),
         entities=tuple(built),
         pairs=_signed_pairs(rows_by_chunk(rows)),
         annotations=len(rows),
@@ -239,6 +250,8 @@ def render_stances(report: StanceReport) -> str:
         filters.append(f"source={report.source_id}")
     if report.facets:
         filters.append(f"facets={', '.join(report.facets)}")
+    if report.where:
+        filters.append(f"where={report.where}")
     lines = [
         f"# Stances: {report.persona_id}",
         "",

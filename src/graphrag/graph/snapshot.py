@@ -3,10 +3,15 @@
 Layout of ``data/snapshots/<persona>/``::
 
     manifest.json        model name, dim, counts, source commit
-    documents.jsonl.gz   one Document per line
+    documents.jsonl.gz   one Document per line (its attributes ride on the model)
     chunks.jsonl.gz      one Chunk per line (no vectors), in the same order as embeddings.npy
     embeddings.npy       float32 (n_chunks, dim)
     enrichment.json.gz   entities / mentions / relations (may be empty)
+    speakers.json.gz     speaker -> attributes, for the speakers an attribution pass tagged
+
+``speakers.json.gz`` is the one file a snapshot written before node attributes existed does not
+have, so loading treats it as optional; everything else a snapshot holds has always been there.
+Document attributes need no file of their own, because a ``Document`` carries them.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ DOCUMENTS = "documents.jsonl.gz"
 CHUNKS = "chunks.jsonl.gz"
 EMBEDDINGS = "embeddings.npy"
 ENRICHMENT = "enrichment.json.gz"
+SPEAKERS = "speakers.json.gz"
 LOAD_BATCH = 1000
 
 
@@ -93,6 +99,9 @@ def export_snapshot(
     enrichment = store.enrichment_for_persona(persona.id)
     with gzip.open(target / ENRICHMENT, "wt", encoding="utf-8") as fh:
         fh.write(enrichment.model_dump_json())
+
+    with gzip.open(target / SPEAKERS, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(store.speaker_attributes(persona.id), indent=2, sort_keys=True))
 
     manifest = SnapshotManifest(
         persona_id=persona.id,
@@ -176,9 +185,28 @@ def load_snapshot(
         with gzip.open(enrichment_file, "rt", encoding="utf-8") as fh:
             enrichment = Enrichment.model_validate_json(fh.read())
         store.upsert_enrichment(enrichment)
+
+    speaker_file = target / SPEAKERS
+    if speaker_file.exists():
+        # Written after the chunks, because a speaker is a node only once a passage records it.
+        with gzip.open(speaker_file, "rt", encoding="utf-8") as fh:
+            for speaker, attributes in _speaker_attributes(fh.read()).items():
+                store.set_speaker_attributes(persona.id, speaker, attributes)
     if on_progress:
         on_progress(f"{persona.id}: loaded")
     return manifest
+
+
+def _speaker_attributes(raw: str) -> dict[str, dict[str, str]]:
+    """``speakers.json.gz`` as a mapping, ignoring anything that is not two levels of strings."""
+    loaded = json.loads(raw or "{}")
+    if not isinstance(loaded, dict):
+        return {}
+    return {
+        str(speaker): {str(key): str(value) for key, value in attributes.items()}
+        for speaker, attributes in loaded.items()
+        if isinstance(attributes, dict)
+    }
 
 
 def manifest_summary(manifest: SnapshotManifest) -> dict[str, object]:

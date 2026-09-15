@@ -7,15 +7,20 @@ which is what the adjusted Rand index and normalised mutual information measure.
 that rose twenty places in a centrality ranking may simply have stayed put while half the
 network left, which is why the node sets are reported before the ranks are.
 
-So this module reports, in this order: n for each window, who entered and who left, how far the
+So this module reports, in this order: n for each build, who entered and who left, how far the
 two partitions agree over the nodes in common, and the largest rank changes among those nodes
-only. Nothing is compared across the whole of both windows, because the two whole networks are
+only. Nothing is compared across the whole of both builds, because the two whole networks are
 not two measurements of one thing.
+
+The two builds are usually two time windows. They can be two attribute values instead -- one
+population of a corpus against another, with ``--where`` and ``--where2`` -- and every caution
+above holds unchanged, including the one that matters most: two populations that share no nodes
+produce no similarity score, and saying so is the finding.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -24,7 +29,7 @@ import networkx as nx
 from graphrag import __version__
 from graphrag.graph.store import GraphStore
 from graphrag.sna.cluster import LouvainResult, compare_partitions, louvain
-from graphrag.sna.export import Project, build_network
+from graphrag.sna.export import Project, build_network, where_text
 from graphrag.sna.guide import ALWAYS
 from graphrag.sna.measures import CENTRALITIES, centrality, summary
 
@@ -50,17 +55,22 @@ class Window:
     until: str
     graph: nx.Graph
     summary: dict[str, float]
+    where: str = ""
     louvain_result: LouvainResult | None = None
 
     @property
     def label(self) -> str:
+        """What this build was cut to, in words: its window, its attribute filter, or both."""
+        window = ""
         if self.since and self.until:
-            return f"{self.since} to {self.until}"
-        if self.since:
-            return f"{self.since} onward"
-        if self.until:
-            return f"up to {self.until}"
-        return "no window"
+            window = f"{self.since} to {self.until}"
+        elif self.since:
+            window = f"{self.since} onward"
+        elif self.until:
+            window = f"up to {self.until}"
+        if window and self.where:
+            return f"{window}, {self.where}"
+        return window or self.where or "no window"
 
     @property
     def communities(self) -> list[list[str]]:
@@ -134,18 +144,29 @@ def compare_windows(
     types: Sequence[str] | None = None,
     stances: Sequence[str] | None = None,
     facets: Sequence[str] | None = None,
+    where: Mapping[str, str] | None = None,
+    where2: Mapping[str, str] | None = None,
     project: Project | None = None,
     centrality_kind: str = "weighted_degree",
     resolution: float = 1.0,
     runs: int = 10,
     seed: int | None = None,
 ) -> Comparison:
-    """Build one network twice, on two windows, and compare the two results."""
+    """Build one network twice, and compare the two results.
+
+    The two builds usually differ by their window, which is what the module is named for. They
+    may differ by their attribute filter instead: ``where`` and ``where2`` build the network
+    over two populations of the same corpus -- one value of an attribute against another -- and
+    everything below reads the same way, because a population is a sampling frame exactly as a
+    window is. Two attribute values are not two measurements of one thing any more than two
+    windows are, which is why n comes first and the partitions are compared only over the nodes
+    both builds hold.
+    """
     if centrality_kind not in CENTRALITIES:
         msg = f"centrality must be one of {', '.join(CENTRALITIES)}, got {centrality_kind!r}"
         raise ValueError(msg)
 
-    def window(start: str | None, end: str | None) -> Window:
+    def window(start: str | None, end: str | None, filters: Mapping[str, str] | None) -> Window:
         graph = build_network(
             store,
             network,
@@ -157,6 +178,7 @@ def compare_windows(
             facets=facets,
             since=start,
             until=end,
+            where=filters,
             project=project,
         )
         result = (
@@ -167,12 +189,14 @@ def compare_windows(
         return Window(
             since=start or "",
             until=end or "",
+            where=where_text(filters),
             graph=graph,
             summary=summary(graph),
             louvain_result=result,
         )
 
-    first, second = window(since, until), window(since2, until2)
+    first = window(since, until, where)
+    second = window(since2, until2, where2 if where2 is not None else where)
     nodes_a, nodes_b = set(first.graph.nodes), set(second.graph.nodes)
     shared = sorted(nodes_a & nodes_b)
 
@@ -219,13 +243,17 @@ def _notes(a: Window, b: Window, shared: Sequence[str]) -> tuple[str, ...]:
     for window in (a, b):
         nodes = int(window.summary["nodes"])
         if nodes == 0:
-            notes.append(
-                f"The window {window.label} is empty. Either nothing was dated into it, or the "
-                "attribution pass has not run on the documents that fall in it."
+            why = (
+                "nothing carries those attribute values, or the tagging pass has not covered "
+                "the documents that would"
+                if window.where
+                else "nothing was dated into it, or the attribution pass has not run on the "
+                "documents that fall in it"
             )
+            notes.append(f"The build {window.label} is empty. Either {why}.")
         elif nodes < 30:
             notes.append(
-                f"The window {window.label} holds {nodes} nodes, which is small enough that its "
+                f"The build {window.label} holds {nodes} nodes, which is small enough that its "
                 "communities and rankings describe those nodes and estimate nothing."
             )
     if 0 < len(shared) < MIN_SHARED:
@@ -235,8 +263,10 @@ def _notes(a: Window, b: Window, shared: Sequence[str]) -> tuple[str, ...]:
         )
     if not shared:
         notes.append(
-            "The two windows share no nodes at all, so there is nothing to compare: report them "
-            "as two separate networks rather than as a change."
+            "The two builds share no nodes at all, so there is nothing to compare: report them "
+            "as two separate networks rather than as a change. Two attribute values that share "
+            "no nodes are the expected case, not a failure -- the comparison is then the two "
+            "node counts and the two structures, side by side."
         )
     return tuple(notes)
 
@@ -275,16 +305,21 @@ def render_comparison(comparison: Comparison) -> str:
         "",
         f"**Sampling frame.** {a.graph.graph.get('frame', '')}",
         "",
-        "**What is being compared.** Two builds of the same network over two windows. Community "
-        "numbers are not comparable between two Louvain runs, so the partitions are compared by "
-        "how much they agree on the nodes both windows contain, and the rankings are compared "
-        "over those same nodes only.",
+        *(
+            [f"**Sampling frame, {b.label}.** {b.graph.graph.get('frame', '')}", ""]
+            if b.graph.graph.get("frame") != a.graph.graph.get("frame")
+            else []
+        ),
+        f"**What is being compared.** Two builds of the same network: {a.label} against "
+        f"{b.label}. Community numbers are not comparable between two Louvain runs, so the "
+        "partitions are compared by how much they agree on the nodes both builds contain, and "
+        "the rankings are compared over those same nodes only.",
         "",
-        "## Each window",
+        "## Each build",
         "",
     ]
     lines += _table(
-        ["window", "nodes", "edges", "components", "communities", "modularity"],
+        ["build", "nodes", "edges", "components", "communities", "modularity"],
         [
             [
                 window.label,
@@ -306,8 +341,9 @@ def render_comparison(comparison: Comparison) -> str:
         f"{_listing(b.graph, comparison.entered)}",
         f"- only in {a.label}: {len(comparison.left):,} — {_listing(a.graph, comparison.left)}",
         "",
-        "A node absent from a window was not necessarily quiet in it: it is absent when nothing "
-        "it appears in carries a date inside the window.",
+        "A node absent from a build was not necessarily quiet in it: it is absent when nothing "
+        "it appears in carries a date inside the window, or a value the attribute filter asked "
+        "for. Absence is a property of the tagging and the dating, before it is anything else.",
         "",
     ]
 
@@ -321,19 +357,19 @@ def render_comparison(comparison: Comparison) -> str:
             f"{_num(comparison.similarity['normalized_mutual_information'])} — not "
             "chance-corrected, and drifts up as the number of communities grows, so read it "
             "beside the index above and never instead of it",
-            f"- computed over the {len(comparison.shared):,} node(s) in both windows",
+            f"- computed over the {len(comparison.shared):,} node(s) in both builds",
             "",
         ]
     else:
         lines += [
-            "Not computed: one of the windows has no communities, or the windows share no nodes.",
+            "Not computed: one of the builds has no communities, or the two share no nodes.",
             "",
         ]
 
     lines += [
         f"## Largest rank changes ({comparison.centrality})",
         "",
-        "Rank 1 is the highest score. Ranks are computed inside each window, so a climb can mean "
+        "Rank 1 is the highest score. Ranks are computed inside each build, so a climb can mean "
         "the node rose or that the nodes above it left.",
         "",
     ]
@@ -351,7 +387,7 @@ def render_comparison(comparison: Comparison) -> str:
             ],
         )
     else:
-        lines += ["No node appears in both windows with a rank in each.", ""]
+        lines += ["No node appears in both builds with a rank in each.", ""]
 
     lines += ["## Caveats", ""]
     lines += [f"- {item}" for item in ALWAYS]

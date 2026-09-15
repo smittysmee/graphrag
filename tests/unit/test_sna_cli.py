@@ -534,3 +534,160 @@ def test_sna_compare_writes_a_two_window_report(
     )
     assert bad.exit_code == 2
     assert "centrality must be one of" in bad.output
+
+
+def test_sna_export_takes_an_attribute_filter(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    target = tmp_path / "north.json"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--network",
+            "speakers",
+            "--where",
+            "region=north",
+            "-o",
+            str(target),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(target.read_text())
+    assert {n["id"] for n in payload["nodes"]} == {"ana"}
+    assert payload["graph"]["where"] == "region=north"
+    assert "Restricted to nodes attributed region=north" in payload["graph"]["frame"]
+    # The value rides on the node, so a downstream tool can colour by it.
+    assert payload["nodes"][0]["attr_region"] == "north"
+
+
+def test_sna_rejects_a_where_it_cannot_read(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = str(tmp_path / "x.json")
+    malformed = runner.invoke(app, ["sna", "export", "test-layers", "--where", "region", "-o", out])
+    assert malformed.exit_code == 2
+    assert "must look like key=value" in malformed.output
+
+    twice = runner.invoke(
+        app,
+        [
+            "sna",
+            "export",
+            "test-layers",
+            "--where",
+            "region=north",
+            "--where",
+            "region=south",
+            "-o",
+            out,
+        ],
+    )
+    assert twice.exit_code == 2
+    assert "given twice" in twice.output
+
+
+def test_sna_analyze_by_attribute_adds_the_section_to_the_report_and_the_json(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "by-region.md"
+    as_json = tmp_path / "by-region.json"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "analyze",
+            "test-layers",
+            "--network",
+            "entities",
+            "--min-weight",
+            "1",
+            "--by",
+            "region",
+            "--permutations",
+            "20",
+            "--samples",
+            "5",
+            "--runs",
+            "2",
+            "--seed",
+            "1",
+            "--out",
+            str(out),
+            "--json",
+            str(as_json),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    text = out.read_text()
+    assert "## By attribute: region" in text
+    assert "hypothesis about where this network divides" in text
+    payload = json.loads(as_json.read_text())
+    assert payload["attribute"]["key"] == "region"
+    assert payload["attribute"]["counts"] == {"south": 2, "north": 1}
+
+
+def test_sna_stances_can_be_cut_to_one_population(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "north-stances.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "stances",
+            "test-layers",
+            "--where",
+            "region=north",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    text = out.read_text()
+    assert "where=region=north" in text
+    # The north posts praise Alpha and Beta and read Gamma neutrally; nobody complains there.
+    assert "complaint" not in text.split("## By entity")[1].split("###")[0]
+
+
+def test_sna_compare_can_build_two_populations_instead_of_two_windows(
+    cli_context: AppContext, layered: InMemoryGraphStore, tmp_path: Path
+) -> None:
+    out = tmp_path / "north-vs-south.md"
+    result = runner.invoke(
+        app,
+        [
+            "sna",
+            "compare",
+            "test-layers",
+            "--network",
+            "entities",
+            "--min-weight",
+            "1",
+            "--where",
+            "region=north",
+            "--where2",
+            "region=south",
+            "--seed",
+            "1",
+            "--runs",
+            "2",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    text = out.read_text()
+    assert "region=north against region=south" in text
+    assert "Sampling frame, region=south" in text
+    assert "3 nodes in region=north" in result.stdout
+
+
+def test_the_cli_default_for_permutations_matches_the_analysis_default() -> None:
+    """The CLI cannot import the analysis package at module scope, so it repeats the number."""
+    from graphrag.cli import WHERE_PERMUTATIONS
+    from graphrag.sna.attributes import PERMUTATIONS
+
+    assert WHERE_PERMUTATIONS == PERMUTATIONS

@@ -43,7 +43,8 @@ def test_the_guide_covers_every_filtered_network_rule() -> None:
         for rule in rules:
             assert rule.name in text
             assert rule.rule in text
-    assert len(READING_RULES) == 3  # signed networks, time windows, bipartite projections
+    # signed networks, time windows, bipartite projections, node attributes
+    assert len(READING_RULES) == 4
 
 
 def test_every_method_has_a_rationale_line_for_the_report() -> None:

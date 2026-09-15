@@ -24,12 +24,25 @@ subject; ``--since``/``--until`` keep dated passages, which drops every undated 
 ``graphrag sna stances`` reports what the corpus says about each entity, and ``graphrag sna
 compare`` builds one network over two windows and reports what moved.
 
+A fourth filter cuts by what the nodes *are* rather than by what they say: ``--where key=value``
+keeps the speakers an attribution pass tagged that way, and the entities and topics whose
+passages sit in documents an annotation pass tagged that way. ``graphrag sna analyze --by key``
+then asks whether the network divides along that attribute at all, against a permutation null
+and a degree-preserving one -- because a partition handed to a graph always produces a number.
+
 Every network is a sample of a corpus, not of a population: it describes who was recorded and
 what was written down. ``graphrag.sna.guide`` holds the method-selection rules, and the report
 repeats the sampling frame next to every number.
 """
 
 from graphrag.sna.analysis import Analysis, render_markdown, run_analysis, to_payload
+from graphrag.sna.attributes import (
+    AttributeReport,
+    analyse_attribute,
+    attribute_labels,
+    attribute_payload,
+    render_attribute,
+)
 from graphrag.sna.cluster import (
     GMMResult,
     KChoice,
@@ -56,13 +69,17 @@ from graphrag.sna.export import (
     NETWORKS,
     PROJECTIONS,
     STANCES,
+    attr_count_key,
+    attr_key,
     bipartite_projection,
     build_network,
     ego,
     entity_co_mention,
+    matches,
     speaker_co_participation,
     speaker_entity_bipartite,
     topic_co_occurrence,
+    where_text,
     write_graph,
 )
 from graphrag.sna.guide import render_guide
@@ -81,6 +98,7 @@ __all__ = [
     "PROJECTIONS",
     "STANCES",
     "Analysis",
+    "AttributeReport",
     "Comparison",
     "EntityStances",
     "GMMResult",
@@ -92,6 +110,11 @@ __all__ = [
     "SignedPair",
     "StanceReport",
     "Window",
+    "analyse_attribute",
+    "attr_count_key",
+    "attr_key",
+    "attribute_labels",
+    "attribute_payload",
     "bipartite_projection",
     "brokers",
     "build_network",
@@ -106,7 +129,9 @@ __all__ = [
     "gmm",
     "kmeans",
     "louvain",
+    "matches",
     "null_model_modularity",
+    "render_attribute",
     "render_comparison",
     "render_guide",
     "render_markdown",
@@ -119,5 +144,6 @@ __all__ = [
     "to_payload",
     "top_n",
     "topic_co_occurrence",
+    "where_text",
     "write_graph",
 ]

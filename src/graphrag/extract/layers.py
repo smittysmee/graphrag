@@ -19,6 +19,11 @@ an entity name that occurs in no passage, a post anchor that matches nothing, an
 pointing at an entity the passage does not name -- is collected here as *loose*, counted by
 reason, because each reason sends a reviewer to a different file.
 
+Node attributes ride the same check. An attribution or annotation file may say what kind of
+speaker or document it is about, and a key or value the persona's vocabulary does not declare is
+counted here as a loose entry with its own reason, ``attribute invalid``: nothing is written, so
+a tagging pass that invented a value fails visibly rather than half-landing.
+
 Nothing here knows about any particular corpus: the persona's own ``persona.yaml`` supplies the
 sources, and its ``aliases.yaml`` and ``facets.yaml`` supply the vocabulary the importers check
 against.
@@ -37,6 +42,7 @@ from graphrag.extract.annotations import (
     FacetTable,
     import_annotation_file,
 )
+from graphrag.extract.attributes import EMPTY_ATTRIBUTES, AttributeTable
 from graphrag.extract.attribution import import_attribution_file
 from graphrag.extract.importer import import_extraction_file, read_doc_id
 from graphrag.graph.store import GraphStore
@@ -44,6 +50,7 @@ from graphrag.models import PersonaSpec, SourceSpec
 from graphrag.textutil import slugify
 
 __all__ = [
+    "ATTRIBUTE_INVALID",
     "LAYERS",
     "LOOSE_LABELS",
     "DocumentCheck",
@@ -62,6 +69,12 @@ __all__ = [
 #: The layers a captured document can carry, in the order the contract asks for them.
 LAYERS: tuple[str, ...] = ("extraction", "attribution", "annotation")
 
+#: A key or value the persona's vocabulary does not declare. Both sidecar kinds can carry one,
+#: and both mean the same thing -- a tagger invented a key or a value, and it was dropped -- so
+#: the reason is the same in each. The label names the sidecar to open, which is not the same:
+#: one is a post in an attribution file, the other the top of an annotation file.
+ATTRIBUTE_INVALID = "attribute invalid"
+
 #: Why one entry of a sidecar did not land, keyed ``<layer>/<reason>``. The reasons are kept
 #: apart rather than summed because each sends a reviewer somewhere else: a non-verbatim entity
 #: name is a fix in the extraction file, an anchor that matched nothing is a paraphrased quote,
@@ -70,7 +83,9 @@ LOOSE_LABELS: dict[str, str] = {
     "extraction/loose": "entity name not verbatim in any passage",
     "extraction/unmatched": "entity name in no passage",
     "attribution/anchor": "post anchor not found",
+    "attribution/attribute": f"speaker {ATTRIBUTE_INVALID}",
     **{f"annotation/{reason}": text for reason, text in LOOSE_REASONS.items()},
+    "annotation/attribute": f"document {ATTRIBUTE_INVALID}",
 }
 
 #: How much of a name or an anchor is echoed when an entry is reported as loose.
@@ -345,6 +360,7 @@ def check_documents(
     source_id: str | None = None,
     aliases: AliasTable = EMPTY_ALIASES,
     facets: FacetTable | None = None,
+    attributes: AttributeTable = EMPTY_ATTRIBUTES,
 ) -> LayerReport:
     """Check every layer of ``doc_ids``, or of the whole persona when they are not given.
 
@@ -370,7 +386,7 @@ def check_documents(
                 continue
             if layer == "annotation" and known is None:
                 known = EntityIndex.build(store, persona.id)
-            sidecars[layer] = _dry_run(store, layer, path, aliases, facets, known)
+            sidecars[layer] = _dry_run(store, layer, path, aliases, facets, attributes, known)
         checks.append(
             DocumentCheck(
                 doc_id=doc_id,
@@ -419,6 +435,7 @@ def _dry_run(
     path: Path,
     aliases: AliasTable,
     facets: FacetTable | None,
+    attributes: AttributeTable,
     known: EntityIndex | None,
 ) -> SidecarCheck:
     """Run one sidecar through its own importer without writing, and record what came loose."""
@@ -438,17 +455,25 @@ def _dry_run(
             + tuple(("extraction/unmatched", _short(name)) for name in result.unmatched),
         )
     if layer == "attribution":
-        posts = import_attribution_file(store, path, dry_run=True)
+        posts = import_attribution_file(store, path, dry_run=True, attributes=attributes)
         if not posts.ok:
             return SidecarCheck(layer=layer, path=path, error=posts.error)
         return SidecarCheck(
             layer=layer,
             path=path,
-            summary=f"{posts.attached}/{posts.posts} posts, {len(posts.speakers)} speakers",
-            loose=tuple(("attribution/anchor", _short(entry)) for entry in posts.loose),
+            summary=f"{posts.attached}/{posts.posts} posts, {len(posts.speakers)} speakers"
+            + (f", {posts.attributes} attributes" if posts.attributes else ""),
+            loose=tuple(("attribution/anchor", _short(entry)) for entry in posts.loose)
+            + tuple(("attribution/attribute", _short(entry)) for entry in posts.attribute_problems),
         )
     readings = import_annotation_file(
-        store, path, dry_run=True, aliases=aliases, facets=facets, entities=known
+        store,
+        path,
+        dry_run=True,
+        aliases=aliases,
+        facets=facets,
+        attributes=attributes,
+        entities=known,
     )
     if not readings.ok:
         return SidecarCheck(layer=layer, path=path, error=readings.error)
@@ -458,13 +483,15 @@ def _dry_run(
         summary=(
             f"{readings.applied}/{readings.annotations} annotations, "
             f"{readings.stances} stances, {readings.facets} facets"
+            + (f", {readings.attributes} attributes" if readings.attributes else "")
             + (
                 f", {len(readings.unknown_facets)} unknown facets"
                 if readings.unknown_facets
                 else ""
             )
         ),
-        loose=tuple((f"annotation/{item.reason}", _short(item.detail)) for item in readings.loose),
+        loose=tuple((f"annotation/{item.reason}", _short(item.detail)) for item in readings.loose)
+        + tuple(("annotation/attribute", _short(entry)) for entry in readings.attribute_problems),
     )
 
 

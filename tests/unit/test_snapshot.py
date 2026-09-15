@@ -89,14 +89,14 @@ def test_export_preserves_source_commit(
     assert again.source_commit == "abc"
 
 
-def test_speaker_dates_stances_and_facets_ride_the_snapshot(
+def test_speaker_dates_stances_facets_and_attributes_ride_the_snapshot(
     tmp_path: Path,
     thread_document: str,
     memory_store: InMemoryGraphStore,
     docs_persona: PersonaSpec,
     hash_embedder: HashEmbedder,
 ) -> None:
-    """The three layers a teammate would otherwise have to rebuild after loading a snapshot.
+    """The layers a teammate would otherwise have to rebuild after loading a snapshot.
 
     The Neo4j store is held to the same assertions in ``tests/integration/test_neo4j_store.py``.
     """
@@ -121,6 +121,8 @@ def test_speaker_dates_stances_and_facets_ride_the_snapshot(
     )
     memory_store.annotate_mention(thread_document, chunks[0].id, "Handbook", "complaint")
     memory_store.annotate_chunk(thread_document, chunks[0].id, ["handover"])
+    memory_store.set_document_attributes(thread_document, {"region": "north"})
+    memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "south"})
 
     root = tmp_path / "snapshots"
     snap.export_snapshot(
@@ -147,6 +149,12 @@ def test_speaker_dates_stances_and_facets_ride_the_snapshot(
     stance = fresh.mention_stances("test-docs")[0]
     assert (stance.name, stance.stance) == ("Handbook", "complaint")
     assert fresh.entities["concept:handbook"].aliases == ["hand book"]
+    # Node attributes ride too: the document's on the document, the speaker's in its own file.
+    assert fresh.document_attributes("test-docs") == {thread_document: {"region": "north"}}
+    assert fresh.speaker_attributes("test-docs") == {"quill-maker": {"region": "south"}}
+    row = next(r for r in fresh.speaker_document_pairs("test-docs"))
+    assert row.speaker_attributes == {"region": "south"}
+    assert row.document_attributes == {"region": "north"}
 
 
 def test_punctuated_entity_ids_survive_the_round_trip(

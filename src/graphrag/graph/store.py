@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Protocol
 
 from graphrag.embed.base import Matrix, Vector
@@ -127,6 +127,24 @@ class GraphStore(Protocol):
     # documents of one source that already carry at least one speaker
     def attributed_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
 
+    # node attributes: what kind of speaker this is, and what kind of document that is
+    # Speaker attributes are scoped to one persona, because a Speaker node is shared between
+    # personas and a reading written for one corpus is not a fact about the other.
+    # First value written wins: a key this persona already holds under a different value is
+    # left exactly as it is and its name comes back, for the caller to report. Saying which of
+    # two readings is right is the annotator's job, not a writer's.
+    def set_speaker_attributes(
+        self, persona_id: str, speaker: str, attributes: Mapping[str, str]
+    ) -> list[str]: ...
+    # Merge into the document's attributes, incoming value winning per key. One annotation file
+    # holds one document, so there is no second writer to disagree with.
+    def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None: ...
+    # Every speaker of this persona that carries attributes, and every document that does.
+    # Read by the importers (to report conflicts), by the snapshot, and by the networks, which
+    # need one lookup rather than one read per node.
+    def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]: ...
+    def document_attributes(self, persona_id: str) -> dict[str, dict[str, str]]: ...
+
     # annotation: what a passage says about an entity, and which functions it is about
     # Both are idempotent, and both ignore a chunk that is not a passage of `doc_id`.
     def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None: ...
@@ -144,6 +162,8 @@ class GraphStore(Protocol):
     # topic co-occurrence edges. Read-only, paged, and scoped to one persona.
     # `since`/`until` are inclusive ISO dates read from the SPOKE edge; when either is given,
     # an edge with no date is left out, because an undated post cannot be put in a window.
+    # Each row carries the speaker's attributes and the document's, so an attribute filter
+    # never costs a second read.
     def speaker_document_pairs(
         self,
         persona_id: str,

@@ -37,6 +37,12 @@ app.add_typer(persona_app, name="persona")
 console = Console(soft_wrap=True)
 err = Console(stderr=True, soft_wrap=True)
 
+#: Default label shuffles behind ``sna analyze --by``. Repeated from
+#: :data:`graphrag.sna.attributes.PERMUTATIONS` rather than imported, because a default in a
+#: signature is evaluated at import time and the analysis package pulls in numpy and sklearn;
+#: a unit test holds the two to the same number.
+WHERE_PERMUTATIONS = 200
+
 
 class State:
     """Holds an injectable context so tests can run commands against in-memory fakes."""
@@ -420,7 +426,9 @@ def sync(
     That check asks whether a layer is missing, so a rewritten sidecar is invisible to it: an
     attribution file that gained posted dates names a document that already has speakers.
     `--refresh-attribution` and `--refresh-annotations` re-import every sidecar of that kind
-    instead, whatever the graph already holds, and each source's line says which it did.
+    instead, whatever the graph already holds, and each source's line says which it did. A
+    tagging pass that adds node attributes to files the graph already has speakers and stances
+    for is exactly that case, so those flags are how attributes reach the graph.
     """
     from graphrag.sync import UnknownSourceError, summary_lines, sync_persona
 
@@ -438,6 +446,7 @@ def sync(
                 annotation_root=ctx.settings.annotations_dir,
                 aliases=_alias_table(ctx, spec.id),
                 facets=_facet_table(ctx, spec.id),
+                attributes=_attribute_table(ctx, spec.id),
                 source_id=source,
                 refresh_attribution=refresh_attribution,
                 refresh_annotations=refresh_annotations,
@@ -1045,17 +1054,32 @@ def attribution_import(
     each post names a speaker and quotes its opening words, and those words are looked for in
     the document's passages. Reports posts whose anchor occurs in no passage (they are skipped,
     never guessed at), so a reviewer can fix the quote before writing.
+
+    A post may also carry `attributes`, which describe the speaker rather than the post and go
+    on the speaker: `{"region": "north"}`. They are checked against the `attributes:` section of
+    `personas/<id>/facets.yaml` when the persona declares one; a key or value outside it is
+    reported and dropped. The first value written for a speaker stands, and a later post that
+    disagrees is reported as a conflict rather than overwriting it.
     """
+    from graphrag.extract.attributes import AttributeTableError
     from graphrag.extract.attribution import import_attribution_file, report_lines
 
     ctx = State.context()
     try:
         spec = ctx.registry.get(persona)
+        try:
+            vocabulary = _attribute_table(ctx, spec.id)
+        except AttributeTableError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
         total_posts = total_attached = total_loose = 0
+        total_attributes = total_invalid = total_conflicts = 0
         voices: set[str] = set()
         problems = 0
         for file in files:
-            result = import_attribution_file(ctx.store, file, dry_run=dry_run)
+            result = import_attribution_file(
+                ctx.store, file, dry_run=dry_run, attributes=vocabulary
+            )
             if not result.ok:
                 err.print(f"[red]{file}: {result.error}[/red]")
                 problems += 1
@@ -1063,6 +1087,9 @@ def attribution_import(
             total_posts += result.posts
             total_attached += result.attached
             total_loose += len(result.loose)
+            total_attributes += result.attributes
+            total_invalid += len(result.attribute_problems)
+            total_conflicts += len(result.conflicts)
             voices.update(result.speakers)
             for line in report_lines(result):
                 console.print(line, markup=False, highlight=False)
@@ -1070,6 +1097,9 @@ def attribution_import(
         console.print(
             f"[green]{verb}[/green] {len(files) - problems} files: {total_attached}/{total_posts} "
             f"posts attached, {len(voices)} speakers, {total_loose} loose anchors"
+            + (f", {total_attributes} speaker attributes" if total_attributes else "")
+            + (f", {total_invalid} attribute problems" if total_invalid else "")
+            + (f", {total_conflicts} attribute conflicts" if total_conflicts else "")
         )
         if problems:
             raise typer.Exit(2)
@@ -1153,6 +1183,32 @@ def _clean(values: list[str] | None) -> list[str] | None:
     return cleaned or None
 
 
+def _where_or_exit(values: list[str] | None, option: str = "--where") -> dict[str, str] | None:
+    """``--where key=value``, repeatable, into a mapping. Exits 2 on anything it cannot read.
+
+    A key given twice is refused rather than resolved: a node holds one value per key, so
+    ``--where region=north --where region=south`` can only ever match nothing, and silently
+    keeping the last one would answer a question nobody asked.
+    """
+    if not values:
+        return None
+    where: dict[str, str] = {}
+    for item in values:
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key or not value:
+            err.print(f"[red]{option} must look like key=value, got {item!r}[/red]")
+            raise typer.Exit(2)
+        if key in where:
+            err.print(
+                f"[red]{option} {key} given twice; a node holds one value per key, so no node "
+                "could match both[/red]"
+            )
+            raise typer.Exit(2)
+        where[key] = value
+    return where
+
+
 def _network_or_bad_parameter(build: Callable[[], Any]) -> Any:
     """Build a network, turning the builder's rejection of a filter combination into exit 2."""
     try:
@@ -1186,17 +1242,31 @@ def sna_export(
     ] = None,
     since: Annotated[str | None, typer.Option(help="Earliest post date, ISO YYYY-MM-DD.")] = None,
     until: Annotated[str | None, typer.Option(help="Latest post date, ISO YYYY-MM-DD.")] = None,
+    where: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--where",
+            help="Keep only nodes whose attribute matches, as key=value; repeatable.",
+        ),
+    ] = None,
     project: Annotated[
         str | None,
         typer.Option(help="Collapse the two-mode network onto speakers | entities."),
     ] = None,
 ) -> None:
-    """Write one of the graph's networks to GraphML or node-link JSON."""
+    """Write one of the graph's networks to GraphML or node-link JSON.
+
+    `--where key=value` keeps only nodes attributed that way: a speaker by what an attribution
+    pass recorded about them, an entity or a topic by the attributes of the document its passage
+    belongs to. A node with no value for that key is left out rather than treated as a group of
+    its own. Every node carries its attributes into the file as `attr_<key>`.
+    """
     from graphrag.sna.export import build_network, write_graph
 
     network = _network_or_exit(network)
     stances = _stances_or_exit(stance)
     side = _project_or_exit(project)
+    filters = _where_or_exit(where)
     ctx = State.context()
     try:
         ctx.registry.get(persona)  # fail fast on an unknown persona
@@ -1212,6 +1282,7 @@ def sna_export(
                 facets=_clean(facet),
                 since=since,
                 until=until,
+                where=filters,
                 project=side,
             )
         )
@@ -1256,6 +1327,23 @@ def sna_analyze(
     ] = None,
     since: Annotated[str | None, typer.Option(help="Earliest post date, ISO YYYY-MM-DD.")] = None,
     until: Annotated[str | None, typer.Option(help="Latest post date, ISO YYYY-MM-DD.")] = None,
+    where: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--where",
+            help="Keep only nodes whose attribute matches, as key=value; repeatable.",
+        ),
+    ] = None,
+    by: Annotated[
+        str | None,
+        typer.Option(
+            "--by",
+            help="Also report whether the network divides along this node attribute.",
+        ),
+    ] = None,
+    permutations: Annotated[
+        int, typer.Option(help="Label shuffles for the --by assortativity null.")
+    ] = WHERE_PERMUTATIONS,
     project: Annotated[
         str | None,
         typer.Option(help="Collapse the two-mode network onto speakers | entities."),
@@ -1263,13 +1351,24 @@ def sna_analyze(
     seed: Annotated[int | None, typer.Option(help="Fix every random seed.")] = None,
     as_json: Annotated[Path | None, typer.Option("--json", help="Also write JSON here.")] = None,
 ) -> None:
-    """Measure a network, group it, check the grouping, and write a markdown report."""
+    """Measure a network, group it, check the grouping, and write a markdown report.
+
+    `--by <key>` adds an attribute section: how many nodes carry each value, how far edges join
+    like to like (assortativity, against a null that shuffles the labels), how the partition by
+    that attribute scores against the best Louvain grouping and against a degree-preserving
+    null, and how far the groups this run found agree with the attribute. It answers whether
+    the network divides along something already known about its nodes, which is a question the
+    grouping itself cannot be asked.
+
+    `--where key=value` narrows the network to nodes attributed that way before any of it runs.
+    """
     from graphrag.sna.analysis import METHODS, render_markdown, run_analysis, to_payload
     from graphrag.sna.export import build_network
 
     network = _network_or_exit(network)
     stances = _stances_or_exit(stance)
     side = _project_or_exit(project)
+    filters = _where_or_exit(where)
     if method not in METHODS:
         err.print(f"[red]--method must be one of {', '.join(METHODS)}[/red]")
         raise typer.Exit(2)
@@ -1289,6 +1388,7 @@ def sna_analyze(
                 facets=_clean(facet),
                 since=since,
                 until=until,
+                where=filters,
                 project=side,
             )
         )
@@ -1307,6 +1407,8 @@ def sna_analyze(
                 dims=dims,
                 covariance=covariance,
                 samples=samples,
+                by=by.strip() if by else None,
+                permutations=permutations,
                 seed=seed,
             )
         except ValueError as exc:
@@ -1354,6 +1456,13 @@ def sna_stances(
         list[str] | None,
         typer.Option("--facet", help="Keep only passages with this facet; repeatable."),
     ] = None,
+    where: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--where",
+            help="Keep only documents whose attribute matches, as key=value; repeatable.",
+        ),
+    ] = None,
     quotes: Annotated[int, typer.Option(help="Verbatim passages to quote per stance.")] = 3,
 ) -> None:
     """Report what the corpus says about each entity, not merely how often it names it.
@@ -1365,9 +1474,15 @@ def sna_stances(
 
     Every count is a count of annotations. An entity with no complaints has no annotated
     complaints, which is not the same as no complaints.
+
+    `--where key=value` keeps only the annotations whose document is attributed that way, which
+    is how one population's reading of a thing is separated from another's. Run it once per
+    value and compare the two reports; the filtered table and the unfiltered one have different
+    denominators and do not subtract.
     """
     from graphrag.sna.stances import build_stance_report, render_stances
 
+    filters = _where_or_exit(where)
     ctx = State.context()
     try:
         ctx.registry.get(persona)
@@ -1377,6 +1492,7 @@ def sna_stances(
             source_id=source,
             entities=_clean(entity) or [],
             facets=_clean(facet) or [],
+            where=filters,
             quotes_per_stance=max(0, quotes),
         )
     finally:
@@ -1413,6 +1529,20 @@ def sna_compare(
     facet: Annotated[
         list[str] | None, typer.Option("--facet", help="Facet filter; repeatable.")
     ] = None,
+    where: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--where",
+            help="Attribute filter for the first build, as key=value; repeatable.",
+        ),
+    ] = None,
+    where2: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--where2",
+            help="Attribute filter for the second build; defaults to --where. Repeatable.",
+        ),
+    ] = None,
     project: Annotated[
         str | None, typer.Option(help="Collapse the two-mode network onto speakers | entities.")
     ] = None,
@@ -1432,12 +1562,19 @@ def sna_compare(
     Community numbers are not comparable between two Louvain runs, so nothing here says
     "community 2 grew"; a window is read from dated passages, so an undated document is in
     neither window.
+
+    The two builds need not differ by a window. `--where key=value` and `--where2 key=other`
+    build the same network over two populations of one corpus and report them exactly as two
+    windows are reported: counts first, then structure. `--where2` defaults to `--where`, so a
+    window comparison inside one population takes a single filter.
     """
     from graphrag.sna.compare import compare_windows, render_comparison
 
     network = _network_or_exit(network)
     stances = _stances_or_exit(stance)
     side = _project_or_exit(project)
+    filters = _where_or_exit(where)
+    filters2 = _where_or_exit(where2, "--where2")
     ctx = State.context()
     try:
         ctx.registry.get(persona)
@@ -1455,6 +1592,8 @@ def sna_compare(
                 types=[t.strip() for t in types.split(",") if t.strip()] if types else None,
                 stances=stances,
                 facets=_clean(facet),
+                where=filters,
+                where2=filters2,
                 project=side,
                 centrality_kind=centrality,
                 resolution=resolution,
@@ -1513,6 +1652,13 @@ def _facet_table(ctx: AppContext, persona_id: str) -> Any:
     from graphrag.extract.annotations import load_persona_facets
 
     return load_persona_facets(ctx.registry.directory, persona_id)
+
+
+def _attribute_table(ctx: AppContext, persona_id: str) -> Any:
+    """The persona's attribute vocabulary, out of the same file. Empty means anything goes."""
+    from graphrag.extract.attributes import load_persona_attributes
+
+    return load_persona_attributes(ctx.registry.directory, persona_id)
 
 
 @aliases_app.command("apply")
@@ -1593,6 +1739,11 @@ def annotations_import(
     entity not in the passage -- so a reviewer knows whether to fix the anchors, extend the alias
     file or extend the extraction. Facets outside `personas/<id>/facets.yaml`, when the persona
     keeps one, are reported and dropped.
+
+    A file may also carry a top-level `attributes` object, which describes the document rather
+    than any passage of it and goes on the document: `{"region": "north"}`. It is checked
+    against the `attributes:` section of the same `facets.yaml`, and a file may carry attributes
+    and no annotations at all.
     """
     from graphrag.extract.annotations import (
         AnnotationResult,
@@ -1610,6 +1761,7 @@ def annotations_import(
         try:
             table = _alias_table(ctx, spec.id)
             vocabulary = _facet_table(ctx, spec.id)
+            attributes = _attribute_table(ctx, spec.id)
         except (FacetError, ValueError) as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(2) from exc
@@ -1624,6 +1776,7 @@ def annotations_import(
                 dry_run=dry_run,
                 aliases=table,
                 facets=vocabulary,
+                attributes=attributes,
                 entities=known,
             )
             if not result.ok:
@@ -1640,8 +1793,18 @@ def annotations_import(
             f"[green]{verb}[/green] {len(files) - problems} files: "
             f"{sum(r.applied for r in results)} annotations, "
             f"{sum(r.stances for r in results)} stances, {sum(r.facets for r in results)} facets, "
-            f"{sum(r.created for r in results)} mentions created, {loose} loose"
+            + (
+                f"{sum(r.attributes for r in results)} document attributes, "
+                if any(r.attributes for r in results)
+                else ""
+            )
+            + f"{sum(r.created for r in results)} mentions created, {loose} loose"
             + (f" ({loose_summary(totals)})" if loose else "")
+            + (
+                f", {sum(len(r.attribute_problems) for r in results)} attribute problems"
+                if any(r.attribute_problems for r in results)
+                else ""
+            )
         )
         if problems:
             raise typer.Exit(2)
@@ -1736,7 +1899,8 @@ def layers_check(
     reports exactly what a real import would place and what it would leave loose.
 
     Exits 1 when a listed document has no extraction JSON, when a sidecar fails to import, or
-    when anything came loose; 0 when every layer is complete.
+    when anything came loose; 0 when every layer is complete. A node attribute the persona's
+    vocabulary does not declare counts as loose, under `attribute invalid`.
     """
     from graphrag.extract.layers import (
         LAYERS,
@@ -1773,6 +1937,7 @@ def layers_check(
             source_id=None if wanted else source,
             aliases=_alias_table(ctx, spec.id),
             facets=_facet_table(ctx, spec.id),
+            attributes=_attribute_table(ctx, spec.id),
         )
         table = Table(title=f"layers: {spec.id}")
         # Folded rather than truncated: a document id a reader cannot finish reading is the one

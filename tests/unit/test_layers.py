@@ -277,6 +277,75 @@ def test_attribution_and_annotation_sidecars_are_dry_run_too(
     assert not report.ok
 
 
+def test_an_attribute_outside_the_vocabulary_is_loose_in_either_sidecar(
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    thread_document: str,
+    tmp_path: Path,
+) -> None:
+    """A tagging pass that invented a key or a value fails visibly rather than half-landing."""
+    from graphrag.extract.attributes import load_attributes
+
+    vocabulary = tmp_path / "facets.yaml"
+    vocabulary.write_text("attributes:\n  region:\n    values: [north, south]\n", encoding="utf-8")
+    write_extraction(tmp_path / "enrichment" / "t.json", thread_document, ["Handbook"])
+    write_attribution(
+        tmp_path / "attribution" / "t.json",
+        thread_document,
+        [{"speaker": "quill-maker", "anchor": FIRST, "attributes": {"region": "west"}}],
+    )
+    (tmp_path / "annotations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "annotations" / "t.json").write_text(
+        json.dumps({"doc_id": thread_document, "attributes": {"colour": "green"}}),
+        encoding="utf-8",
+    )
+
+    report = check_documents(
+        memory_store,
+        docs_persona,
+        enrichment_root=tmp_path / "enrichment",
+        attribution_root=tmp_path / "attribution",
+        annotation_root=tmp_path / "annotations",
+        doc_ids=[thread_document],
+        attributes=load_attributes(vocabulary),
+    )
+
+    assert report.loose_totals["attribution/attribute"] == 1
+    assert report.loose_totals["annotation/attribute"] == 1
+    lines = "\n".join(summary_lines(report))
+    assert "1 speaker attribute invalid" in lines
+    assert "1 document attribute invalid" in lines
+    assert not report.ok
+    assert memory_store.speaker_attributes("test-docs") == {}  # the dry run wrote nothing
+    assert memory_store.documents[thread_document].attributes == {}
+
+
+def test_a_valid_attribute_is_not_loose_and_is_counted_in_the_sidecars_summary(
+    memory_store: InMemoryGraphStore,
+    docs_persona: PersonaSpec,
+    thread_document: str,
+    tmp_path: Path,
+) -> None:
+    write_extraction(tmp_path / "enrichment" / "t.json", thread_document, ["Handbook"])
+    write_attribution(
+        tmp_path / "attribution" / "t.json",
+        thread_document,
+        [{"speaker": "quill-maker", "anchor": FIRST, "attributes": {"region": "north"}}],
+    )
+
+    report = check_documents(
+        memory_store,
+        docs_persona,
+        enrichment_root=tmp_path / "enrichment",
+        attribution_root=tmp_path / "attribution",
+        doc_ids=[thread_document],
+    )
+
+    check = report.documents[0].sidecar("attribution")
+    assert check is not None and "1 attributes" in check.summary
+    assert report.loose_totals["attribution/attribute"] == 0
+
+
 def test_all_walks_the_persona_and_a_source_narrows_it(
     memory_store: InMemoryGraphStore, persona: PersonaSpec, ingested: IngestReport, tmp_path: Path
 ) -> None:

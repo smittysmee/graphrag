@@ -19,6 +19,13 @@ import numpy as np
 
 from graphrag import __version__
 from graphrag.graph.store import GraphStore
+from graphrag.sna.attributes import (
+    PERMUTATIONS,
+    AttributeReport,
+    analyse_attribute,
+    attribute_payload,
+    render_attribute,
+)
 from graphrag.sna.cluster import (
     GMMResult,
     KChoice,
@@ -86,6 +93,7 @@ class Analysis:
     gmm_result: GMMResult | None = None
     choice: KChoice | None = None
     null_model: NullModelResult | None = None
+    attribute: AttributeReport | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -153,9 +161,17 @@ def run_analysis(
     dims: int = 8,
     covariance: str = "full",
     samples: int = 50,
+    by: str | None = None,
+    permutations: int = PERMUTATIONS,
     seed: int | None = None,
 ) -> Analysis:
-    """Measure the network, group it with the chosen method, and check the grouping."""
+    """Measure the network, group it with the chosen method, and check the grouping.
+
+    ``by`` adds the attribute section: whether the network divides along a property its nodes
+    already carry, measured against a permutation null and a degree-preserving one, and compared
+    with the grouping this run found. It is asked of the network after it is grouped, never
+    instead of grouping it -- the point of the section is the comparison.
+    """
     stats = summary(graph)
     centralities = {kind: top_n(centrality(graph, kind), TOP_N) for kind in CENTRALITIES}
     notes: list[str] = []
@@ -220,6 +236,17 @@ def run_analysis(
                 notes.append("The mixture did not converge; treat the memberships as indicative.")
     _warn_if_it_only_found_the_components(analysis)
     analysis.brokers = brokers(graph, analysis.groups, TOP_N)
+    if by:
+        analysis.attribute = analyse_attribute(
+            graph,
+            by,
+            groups=analysis.groups,
+            group_noun=analysis.group_noun,
+            resolution=resolution,
+            permutations=permutations,
+            samples=samples,
+            seed=seed,
+        )
     return analysis
 
 
@@ -284,6 +311,7 @@ FILTER_KEYS: tuple[tuple[str, str], ...] = (
     ("facets", "facets"),
     ("since", "since"),
     ("until", "until"),
+    ("where", "where"),
     ("project", "projected onto"),
 )
 
@@ -389,6 +417,8 @@ def render_markdown(analysis: Analysis) -> str:
 
     lines += _cross_mode(analysis)
     lines += _render_checks(analysis)
+    if analysis.attribute is not None:
+        lines += render_attribute(analysis.attribute)
 
     lines += ["## Centrality", ""]
     for kind, scores in analysis.centralities.items():
@@ -545,6 +575,8 @@ def to_payload(analysis: Analysis) -> dict[str, Any]:
         "notes": analysis.notes,
         "caveats": list(ALWAYS),
     }
+    if analysis.attribute is not None:
+        payload["attribute"] = attribute_payload(analysis.attribute)
     if louvain_result is not None:
         payload["louvain"] = {
             "modularity": louvain_result.modularity,

@@ -67,10 +67,34 @@ passage and the check reports it as loose.
 `role` is `op` or `reply`; `date` and `score` may be `null`. A post whose anchor occurs in no
 passage is skipped, never guessed at.
 
+**Node attributes** — what a speaker or a document *is*, as opposed to what it says. A post may
+carry `"attributes": {"region": "north"}`, which goes on the speaker; an annotation file may
+carry a top-level `"attributes": {"region": "north"}`, which goes on the document, and a file may
+carry attributes and no annotations at all. Both are checked against the `attributes:` section of
+`personas/<persona>/facets.yaml`:
+
+```yaml
+attributes:
+  region:
+    values: [north, south]        # closed: any other value is dropped and reported
+  team:
+    description: As written.      # no values: free text
+```
+
+Three rules make the tags worth measuring later:
+
+- Tag only what the document states. A key you inferred from something the speaker merely
+  mentions is not evidence, and it will be counted as though it were.
+- The first value written for a speaker wins. A second post that disagrees is reported as a
+  conflict and changes nothing, so decide which reading is right and fix the file.
+- Leave the key out when the document does not say. An untagged node is outside every filtered
+  network and every attribute measure, which is correct; a guessed one is worse than absent.
+
 **Annotation** — what a passage says about something, and which function it is about:
 
 ```json
 {"doc_id": "<persona>:<source>:<slug>",
+ "attributes": {"region": "north"},
  "annotations": [{"anchor": "verbatim six to twenty words of the passage",
                   "entity": "Entity name as written in that passage",
                   "stance": "praise | complaint | substitution | neutral",
@@ -111,6 +135,8 @@ Fix the file the reason points at and run it again:
 | post anchor not found / annotation anchor not found | copy the words verbatim from the document |
 | entity unknown to the persona | extraction has not covered it, or it needs an alias |
 | entity not in the passage | the anchor points at the wrong passage |
+| speaker attribute invalid | the key or value is not in `facets.yaml`; fix the post or declare it |
+| document attribute invalid | the same, at the top of the annotation file |
 | unknown document | the text has not been ingested yet; run `make sync` first |
 
 Then put it all in the graph:
@@ -120,7 +146,10 @@ make sync PERSONA=<persona>
 ```
 
 One command: it ingests what is missing, re-imports the sidecars for anything it re-ingested,
-imports sidecars for documents that have none of that layer, and applies the alias table. Run
+imports sidecars for documents that have none of that layer, and applies the alias table. It
+cannot see a sidecar that was *rewritten* for a document whose layer is already there, which is
+what adding attributes to existing files produces: use `make sync PERSONA=<persona> REFRESH=1`
+for that. Run
 `graphrag layers check <persona> --file ...` once more afterwards; it should exit 0 with every
 layer `ok`.
 

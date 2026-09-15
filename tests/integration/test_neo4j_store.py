@@ -159,6 +159,77 @@ def test_attribution_writes_speakers_that_survive_a_snapshot(
     assert clean_store.document_chunks(doc_id, 0, 1)[0].speakers == ["quill-maker"]
 
 
+def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+    tmp_path: Path,
+) -> None:
+    """The other half of the attribute contract in ``tests/unit/test_pipeline_and_store.py``.
+
+    Speaker attributes are properties on a shared ``Speaker`` node, so the two things worth
+    proving against a real database are that one persona's reading cannot be read as another's,
+    and that an attribute never keeps a speaker alive whose passages are gone.
+    """
+    persona = PersonaSpec(id="it-attrs", name="IT Attributes", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
+    doc_id = next(iter(clean_store.document_ids("it-attrs", "threads")))
+    chunks = clean_store.document_chunks(doc_id, 0, 100)
+    clean_store.attach_speaker(doc_id, chunks[0].id, "quill-maker")
+
+    assert clean_store.set_speaker_attributes("it-attrs", "quill-maker", {"region": "north"}) == []
+    clean_store.set_document_attributes(doc_id, {"region": "south"})
+
+    assert clean_store.speaker_attributes("it-attrs") == {"quill-maker": {"region": "north"}}
+    assert clean_store.document_attributes("it-attrs") == {doc_id: {"region": "south"}}
+    row = next(r for r in clean_store.speaker_document_pairs("it-attrs"))
+    assert row.speaker_attributes == {"region": "north"}
+    assert row.document_attributes == {"region": "south"}
+
+    # first value written wins, and an identical one is not a disagreement
+    assert clean_store.set_speaker_attributes("it-attrs", "quill-maker", {"region": "north"}) == []
+    refused = clean_store.set_speaker_attributes(
+        "it-attrs", "quill-maker", {"region": "south", "team": "blue"}
+    )
+    assert refused == ["region"]
+    assert clean_store.speaker_attributes("it-attrs")["quill-maker"] == {
+        "region": "north",
+        "team": "blue",
+    }
+
+    # a second persona holding the same handle reads none of the first one's attributes
+    other = PersonaSpec(id="it-attrs-two", name="IT Attributes 2", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, other, thread_source)
+    second_doc = next(iter(clean_store.document_ids("it-attrs-two", "threads")))
+    second_chunks = clean_store.document_chunks(second_doc, 0, 100)
+    clean_store.attach_speaker(second_doc, second_chunks[0].id, "quill-maker")
+    assert clean_store.speaker_attributes("it-attrs-two") == {}
+
+    # both attribute sets ride the snapshot
+    root = tmp_path / "snapshots"
+    snap.export_snapshot(
+        clean_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+    clean_store.delete_persona("it-attrs")
+    snap.load_snapshot(
+        clean_store, persona, root, embedding_model="hash-test", embedding_dim=hash_embedder.dim
+    )
+    assert clean_store.document_attributes("it-attrs") == {doc_id: {"region": "south"}}
+    assert clean_store.speaker_attributes("it-attrs")["quill-maker"] == {
+        "region": "north",
+        "team": "blue",
+    }
+
+    # an attribute is not a reason to keep a speaker nothing records any more
+    clean_store.delete_persona("it-attrs")
+    clean_store.delete_persona("it-attrs-two")
+    left = clean_store.run_readonly_cypher(
+        "MATCH (s:Speaker {name: 'quill-maker'}) RETURN count(s) AS n"
+    )
+    assert left[0]["n"] == 0
+
+
 def test_network_reads_and_mean_embeddings_on_neo4j(
     clean_store: Neo4jGraphStore,
     sample_corpus: Path,

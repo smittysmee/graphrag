@@ -259,6 +259,62 @@ BIPARTITE_RULES: tuple[ReadingRule, ...] = (
     ),
 )
 
+ATTRIBUTE_RULES: tuple[ReadingRule, ...] = (
+    ReadingRule(
+        name="An attribute is a hypothesis, not a finding",
+        rule=(
+            "somebody tagged these nodes because they expected the network to divide along the "
+            "tag. Measuring it tests that expectation; it does not confirm it. Report the "
+            "assortativity and its permutation null in the same breath as the value counts, "
+            "and be as willing to write 'the network does not divide along this' as the "
+            "opposite."
+        ),
+    ),
+    ReadingRule(
+        name="Near-zero assortativity with a strong Louvain result is a finding",
+        rule=(
+            "it says the network has structure and the attribute is not it. Name what the "
+            "Louvain groups actually have in common before reaching for another tag; the "
+            "division is real and you have not found it yet."
+        ),
+    ),
+    ReadingRule(
+        name="Report n per value",
+        rule=(
+            "a 90/10 split scores differently from a 50/50 one on every measure here, and a "
+            "value with four nodes in it supports nothing at all. Print the per-value counts "
+            "above the coefficients, and say how many nodes carry no value."
+        ),
+    ),
+    ReadingRule(
+        name="Untagged is not a third value",
+        rule=(
+            "every measure is computed over the nodes that carry a value, because a node "
+            "nobody tagged has no label to correlate. A corpus tagged in half therefore "
+            "describes that half. Check the untagged count before generalising, and never read "
+            "an absent tag as a value of its own."
+        ),
+    ),
+    ReadingRule(
+        name="Two values are two builds, not two halves of one",
+        rule=(
+            "--where on one value and --where2 on the other builds two networks, each with "
+            "its own n, density and communities, exactly as two time windows are two networks. "
+            "Compare them the way the comparison report does -- counts first, structure second "
+            "-- and never subtract one from the unfiltered whole to infer the other."
+        ),
+    ),
+    ReadingRule(
+        name="A majority label on a shared node is a majority",
+        rule=(
+            "a speaker carries the value somebody wrote for them, but an entity or a topic "
+            "inherits one from the documents its passages sit in, which can disagree. The "
+            "report says how many nodes were mixed; when that number is large the attribute is "
+            "describing documents, and the entity network is the wrong place to ask about it."
+        ),
+    ),
+)
+
 ALWAYS: tuple[str, ...] = (
     "Report n. A centrality ranking over 12 nodes is an anecdote with decimal places.",
     "Report the null model. Without it, modularity is a number, not a finding.",
@@ -292,6 +348,7 @@ READING_RULES: tuple[tuple[str, tuple[ReadingRule, ...]], ...] = (
     ("Signed networks (--stance)", SIGNED_RULES),
     ("Time windows (--since / --until)", WINDOW_RULES),
     ("Bipartite projections (--network speakers-entities)", BIPARTITE_RULES),
+    ("Node attributes (--where / --by)", ATTRIBUTE_RULES),
 )
 
 
