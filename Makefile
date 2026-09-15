@@ -118,8 +118,9 @@ ingest: ## Ingest SRC into PERSONA (SRC=repo-relative path PERSONA=id [SOURCE=id
 	$(COMPOSE) run --rm -T graphrag graphrag ingest /app/$(SRC) --persona $(PERSONA) \
 		$(if $(SOURCE),--source $(SOURCE)) --export
 
-sync: ## Ingest whatever is missing for PERSONA and re-import its enrichment JSON
-	$(COMPOSE) run --rm -T graphrag graphrag sync $(PERSONA) $(if $(SOURCE),--source $(SOURCE))
+sync: ## Ingest what is missing for PERSONA and re-import its sidecars (REFRESH=1 re-reads all)
+	$(COMPOSE) run --rm -T graphrag graphrag sync $(PERSONA) $(if $(SOURCE),--source $(SOURCE)) \
+		$(if $(REFRESH),--refresh-attribution --refresh-annotations)
 
 snapshot-export: ## Export PERSONA from Neo4j to data/snapshots/PERSONA
 	$(COMPOSE) run --rm -T graphrag graphrag snapshot export $(PERSONA)

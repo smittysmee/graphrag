@@ -8,7 +8,9 @@ content (see NOTICE.md), otherwise each user ingests locally.
 - `make setup` — first-time: hooks, images, Neo4j, load snapshots, MCP on :8765
 - `make check` — ruff format check, ruff lint, mypy --strict, unit tests (this is the pre-commit hook)
 - `make test-integration` — against a throwaway Neo4j (pre-push hook)
-- `make sync PERSONA=<id>` — ingest what is missing and re-import that source's enrichment JSON
+- `make sync PERSONA=<id> [REFRESH=1]` — ingest what is missing and re-import that source's
+  sidecars; `REFRESH=1` re-reads every attribution and annotation file, which is how a
+  rewritten sidecar (node attributes, say) reaches a graph that already has that layer
 - `make ingest PERSONA=<id> SRC=<path> [SOURCE=<id>]` / `make enrich` / `make search Q="..."` / `make context`
 - `make doctor` — Neo4j, embedder placement (local vs http), snapshot compatibility
 
@@ -16,9 +18,12 @@ content (see NOTICE.md), otherwise each user ingests locally.
 `src/graphrag/` — `config.py` (pydantic-settings, the only place env is read), `models.py`,
 `ingest/` (loaders + chunker), `embed/` (Embedder Protocol: fastembed | http | hash, plus the
 embed server), `graph/` (GraphStore Protocol: neo4j_store, memory_store, snapshot),
-`extract/` (topic co-occurrence; optional Claude enrichment), `retrieve/` (hybrid RRF search,
+`extract/` (topic co-occurrence; optional Claude enrichment; `attributes.py` holds the node
+attribute vocabulary a persona declares in `facets.yaml`), `retrieve/` (hybrid RRF search,
 context packs), `personas/` (registry, brief, skill export), `sna/` (network export,
-centrality, Louvain/K-means/GMM with stability and null-model checks), `pipeline.py`, `cli.py`,
+centrality, Louvain/K-means/GMM with stability and null-model checks, plus `attributes.py`:
+whether a network divides along a node attribute, against a permutation and a rewiring null),
+`pipeline.py`, `cli.py`,
 `mcp_server.py`, `app.py` (composition root).
 `hooks/` (host-side Claude Code hooks, stdlib only; shell wrappers in `.claude/hooks/`).
 `extract/layers.py` + `graphrag layers check <persona> [--all|--doc-id|--file]` reports which
