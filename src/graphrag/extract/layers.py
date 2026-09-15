@@ -124,6 +124,11 @@ class DocumentCheck:
     mentions: bool = False
     speakers: bool = False
     annotations: bool = False
+    #: How many document attributes the graph holds for this id. An annotation file can carry
+    #: nothing but a top-level ``attributes`` block and no ``annotations`` entries, which sets
+    #: this without ever touching a chunk facet or a mention stance, so the table prints it
+    #: alongside ``annotations`` rather than folding it into that one flag.
+    attribute_count: int = 0
     sidecars: Mapping[str, SidecarCheck] = field(default_factory=dict)
 
     def sidecar(self, layer: str) -> SidecarCheck | None:
@@ -317,6 +322,9 @@ class GraphLayers:
     mentions: frozenset[str] = frozenset()
     speakers: frozenset[str] = frozenset()
     annotations: frozenset[str] = frozenset()
+    #: How many document attributes the graph holds, for every document of the persona that has
+    #: any (not just the ones in ``documents``) -- cheap to read whole, since it is one call.
+    attribute_counts: Mapping[str, int] = field(default_factory=dict)
 
 
 def read_graph_layers(
@@ -326,7 +334,8 @@ def read_graph_layers(
 
     Four set reads per source rather than one read per document: the store already answers each
     of these per source, and a persona with three hundred documents would otherwise be three
-    hundred round trips.
+    hundred round trips. Document attribute counts are read once for the whole persona, since
+    ``document_attributes`` is not scoped to a source.
     """
     sources = [s for s in persona.sources if source_id is None or s.id == source_id]
     documents: set[str] = set()
@@ -338,11 +347,15 @@ def read_graph_layers(
         mentions |= store.enriched_document_ids(persona.id, source.id)
         speakers |= store.attributed_document_ids(persona.id, source.id)
         annotations |= store.annotated_document_ids(persona.id, source.id)
+    attribute_counts = {
+        doc_id: len(attrs) for doc_id, attrs in store.document_attributes(persona.id).items()
+    }
     return GraphLayers(
         documents=frozenset(documents),
         mentions=frozenset(mentions),
         speakers=frozenset(speakers),
         annotations=frozenset(annotations),
+        attribute_counts=attribute_counts,
     )
 
 
@@ -395,6 +408,7 @@ def check_documents(
                 mentions=doc_id in layers.mentions,
                 speakers=doc_id in layers.speakers,
                 annotations=doc_id in layers.annotations,
+                attribute_count=layers.attribute_counts.get(doc_id, 0),
                 sidecars=sidecars,
             )
         )

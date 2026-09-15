@@ -445,6 +445,30 @@ def test_dated_speaker_edges_annotations_and_aliases_on_neo4j(
     assert clean_store.entities_for_chunks([chunks[0].id])[0].aliases == ["hand book"]
 
 
+def test_a_document_carrying_only_attributes_counts_as_annotated_on_neo4j(
+    clean_store: Neo4jGraphStore,
+    sample_corpus: Path,
+    thread_source: SourceSpec,
+    hash_embedder: HashEmbedder,
+) -> None:
+    """An annotation file can carry nothing but a top-level ``attributes`` block.
+
+    No ``annotations`` entries means no chunk facet and no mention stance, but the document's
+    attributes still landed, and a check that only looks at facets and stances would treat that
+    import as if it never ran. The in-memory store is held to the same assertion in
+    ``tests/unit/test_pipeline_and_store.py``.
+    """
+    persona = PersonaSpec(id="it-attr-only", name="IT Attr Only", sources=[thread_source])
+    IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
+    doc_id = next(iter(clean_store.document_ids("it-attr-only", "threads")))
+
+    assert clean_store.annotated_document_ids("it-attr-only", "threads") == set()
+
+    clean_store.set_document_attributes(doc_id, {"region": "north"})
+
+    assert clean_store.annotated_document_ids("it-attr-only", "threads") == {doc_id}
+
+
 def test_an_id_collision_never_renames_an_entity_on_neo4j(
     clean_store: Neo4jGraphStore,
     sample_corpus: Path,

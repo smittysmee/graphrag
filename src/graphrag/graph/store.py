@@ -149,7 +149,9 @@ class GraphStore(Protocol):
     # Both are idempotent, and both ignore a chunk that is not a passage of `doc_id`.
     def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None: ...
     def annotate_chunk(self, doc_id: str, chunk_id: str, facets: Sequence[str]) -> None: ...
-    # documents of one source that already carry at least one stance or facet
+    # documents of one source that already carry at least one stance, facet, or document
+    # attribute -- an annotation file with nothing but a top-level ``attributes`` block and no
+    # ``annotations`` entries still counts, since it wrote something the graph now holds
     def annotated_document_ids(self, persona_id: str, source_id: str) -> set[str]: ...
     # the annotated edges a signed entity network and a facet filter are built from
     def mention_stances(

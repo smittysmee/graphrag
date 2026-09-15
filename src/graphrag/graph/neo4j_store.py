@@ -1130,6 +1130,11 @@ class Neo4jGraphStore:
         )
 
     def annotated_document_ids(self, persona_id: str, source_id: str) -> set[str]:
+        # A document counts as annotated when a passage carries a facet, a mention carries a
+        # stance, or the document itself carries an attribute. That third case covers an
+        # annotation file with nothing but a top-level `attributes` block and no `annotations`
+        # entries: it wrote `d.attributes_json`, and without this clause that import looks
+        # identical to one that never ran.
         rows = self._read(
             """
             MATCH (d:Document {persona_id: $persona_id})
@@ -1137,7 +1142,8 @@ class Neo4jGraphStore:
               AND (EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
                             WHERE size(coalesce(c.facets, [])) > 0 }
                    OR EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[m:MENTIONS]->(:Entity)
-                               WHERE m.stance IS NOT NULL })
+                               WHERE m.stance IS NOT NULL }
+                   OR (d.attributes_json IS NOT NULL AND d.attributes_json <> '{}'))
             RETURN d.id AS id
             """,
             persona_id=persona_id,

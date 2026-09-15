@@ -21,7 +21,8 @@ importing it is ``make sync``.
 
 A fourth check covers the speaker and annotation layers, and covers exactly one state: a document
 whose attribution or annotation JSON is on disk and whose graph holds neither a ``SPOKE`` edge nor
-a stance or facet. That is an import somebody has not run, and ``make sync`` fixes it.
+a stance, a facet, or a document attribute. That is an import somebody has not run, and
+``make sync`` fixes it.
 
 Documents with no such sidecar at all are deliberately *not* counted. Most of a real corpus never
 carries either layer -- a regulation, a filing, a company page has no posts to attribute and
@@ -327,12 +328,15 @@ _SPOKEN_IDS_QUERY = (
     "AND EXISTS { (d)-[:HAS_CHUNK]->(:Chunk)<-[:SPOKE]-(:Speaker) } "
     "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
 )
-#: A document is annotated when a passage carries facets or a mention carries a stance.
+#: A document is annotated when a passage carries facets, a mention carries a stance, or the
+#: document itself carries an attribute (an annotation file with nothing but a top-level
+#: ``attributes`` block and no ``annotations`` entries still wrote something the graph holds).
 _ANNOTATED_IDS_QUERY = (
     "MATCH (d:Document) WHERE d.id STARTS WITH $prefix AND ("
     "EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WHERE size(coalesce(c.facets, [])) > 0 } "
     "OR EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[m:MENTIONS]->(:Entity) "
-    "WHERE m.stance IS NOT NULL }) "
+    "WHERE m.stance IS NOT NULL } "
+    "OR (d.attributes_json IS NOT NULL AND d.attributes_json <> '{}')) "
     "RETURN d.id ORDER BY d.id SKIP $skip LIMIT 500"
 )
 

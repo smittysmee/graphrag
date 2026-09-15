@@ -582,6 +582,10 @@ class InMemoryGraphStore:
             for m in self.mentions
             if m.stance is not None and m.chunk_id in chunk_to_doc
         }
+        # An annotation file that carries only a top-level ``attributes`` block, with no
+        # ``annotations`` entries, still landed something: the document's attributes. Without
+        # this, that import looks identical to one that never ran.
+        annotated |= {doc_id for doc_id in wanted if self.documents[doc_id].attributes}
         return annotated
 
     def mention_stances(self, persona_id: str, source_id: str | None = None) -> list[MentionStance]:

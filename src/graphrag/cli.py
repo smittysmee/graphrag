@@ -1944,7 +1944,7 @@ def layers_check(
         # column this table exists for, and it is longer than a default 80-column terminal.
         table.add_column("document", overflow="fold")
         table.add_column("source", overflow="fold")
-        for col in ("graph", *LAYERS, "loose"):
+        for col in ("graph", *LAYERS, "attributes", "loose"):
             table.add_column(col)
         for document in report.documents:
             table.add_row(
@@ -1952,6 +1952,7 @@ def layers_check(
                 document.source_id,
                 "yes" if document.in_graph else "[red]no[/red]",
                 *(_layer_cell(document.state(layer)) for layer in LAYERS),
+                str(document.attribute_count) if document.attribute_count else "",
                 str(len(document.loose)) if document.loose else "",
             )
         console.print(table)

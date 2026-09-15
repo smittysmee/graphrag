@@ -386,6 +386,22 @@ def test_annotations_write_a_stance_on_a_mention_and_facets_on_a_passage(
     assert memory_store.chunk_facets("test-docs")[0].facets == ["handover", "access"]
 
 
+def test_a_document_carrying_only_attributes_counts_as_annotated(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """An annotation file can carry nothing but a top-level ``attributes`` block.
+
+    No ``annotations`` entries means no chunk facet and no mention stance, but the document's
+    attributes still landed, and a check that only looks at facets and stances would call that
+    import as if it never ran. The Neo4j store is held to the same assertion below.
+    """
+    assert memory_store.annotated_document_ids("test-docs", "threads") == set()
+
+    memory_store.set_document_attributes(thread_document, {"region": "north"})
+
+    assert memory_store.annotated_document_ids("test-docs", "threads") == {thread_document}
+
+
 def test_persona_entities_answer_with_every_spelling_a_node_holds(
     thread_document: str, memory_store: InMemoryGraphStore
 ) -> None:

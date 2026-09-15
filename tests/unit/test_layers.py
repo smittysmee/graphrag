@@ -346,6 +346,37 @@ def test_a_valid_attribute_is_not_loose_and_is_counted_in_the_sidecars_summary(
     assert report.loose_totals["attribution/attribute"] == 0
 
 
+def test_a_document_carrying_only_attributes_is_reported_as_annotated(
+    memory_store: InMemoryGraphStore,
+    persona: PersonaSpec,
+    ingested: IngestReport,
+    episode_id: str,
+    tmp_path: Path,
+) -> None:
+    """A document whose only annotation content is attributes is reported as annotated.
+
+    An annotation file can carry nothing but a top-level ``attributes`` block, with no
+    ``annotations`` entries: no chunk facet, no mention stance, just a document attribute. That
+    still has to count, or a check that only looks at facets and stances treats a real import as
+    one that never ran. The count itself rides in ``attribute_count``, for the table's benefit.
+    """
+    assert memory_store.annotated_document_ids("test-pm", "test-podcast") == set()
+
+    memory_store.set_document_attributes(episode_id, {"region": "north", "tier": "gold"})
+
+    report = check_documents(
+        memory_store,
+        persona,
+        enrichment_root=tmp_path / "enrichment",
+        doc_ids=[episode_id],
+    )
+
+    document = report.documents[0]
+    assert document.annotations is True
+    assert document.attribute_count == 2
+    assert document.state("annotation") == "graph"  # in the graph, no sidecar on disk
+
+
 def test_all_walks_the_persona_and_a_source_narrows_it(
     memory_store: InMemoryGraphStore, persona: PersonaSpec, ingested: IngestReport, tmp_path: Path
 ) -> None:
@@ -410,6 +441,25 @@ def test_the_command_exits_0_when_every_layer_is_complete(
 
     assert result.exit_code == 0, result.output
     assert "every layer complete" in result.output
+
+
+def test_the_command_prints_the_attribute_count_per_document(
+    cli_context: AppContext, ingested: IngestReport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table names how many document attributes the graph holds, one column of its own.
+
+    A wide terminal is forced so the long document id cannot wrap the row onto a second line,
+    which would otherwise put the count on a different line than the id it belongs to.
+    """
+    monkeypatch.setenv("COLUMNS", "300")
+    doc_id = "test-pm:test-podcast:ada-north"
+    cli_context.store.set_document_attributes(doc_id, {"region": "north", "tier": "gold"})
+
+    result = runner.invoke(app, ["layers", "check", "test-pm", "--doc-id", doc_id])
+
+    assert "attributes" in result.output
+    rows = [line for line in result.output.splitlines() if doc_id in line]
+    assert rows and "2" in rows[0]
 
 
 def test_the_command_takes_a_raw_file_and_derives_the_id(

@@ -57,8 +57,9 @@ a thin `.claude/hooks/*.sh` wrapper around a module in `src/graphrag/hooks/`.
   waiting JSON for documents without mentions even when a source is otherwise up to date. The
   same check covers the speaker and annotation layers, and covers exactly one state: a document
   whose attribution or annotation JSON is on disk while the graph holds neither a `SPOKE` edge
-  nor a stance or facet for it, meaning an import nobody ran. `make sync` is the fix and the
-  only one it names. Documents carrying no such sidecar are deliberately not counted, because
+  nor a stance, a facet, or a document attribute for it, meaning an import nobody ran. `make sync`
+  is the fix and the only one it names. Documents carrying no such sidecar are deliberately not
+  counted, because
   most of a corpus never needs either layer and the number would be unactionable in every turn;
   new documents are covered at write time by the capture-contract hook below, and
   `graphrag layers check <persona> --all` audits the backlog on demand. The check runs only for

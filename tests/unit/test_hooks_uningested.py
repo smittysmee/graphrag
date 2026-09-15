@@ -692,6 +692,22 @@ def test_a_sidecar_that_did_reach_the_graph_is_not_reported(root: Path) -> None:
     assert report.unlayered == ()
 
 
+def test_the_annotated_query_also_asks_about_document_attributes(root: Path) -> None:
+    """An annotation file with nothing but a top-level ``attributes`` block, and no
+    ``annotations`` entries, still lands something: the document's attributes. The query that
+    decides whether a document is "annotated" has to ask about that too, or such a document
+    looks exactly like one whose import never ran.
+    """
+    _write_sidecar(root, "annotations", ["demo-persona:notes:one"])
+    client = _layer_client(spoken=set(), annotated={"demo-persona:notes:one"})
+
+    uningested.find_uningested(root, client)  # type: ignore[arg-type]
+
+    annotated_calls = [c for c in client.calls if "m.stance" in c["query"]]
+    assert annotated_calls, "the annotated-ids query should have been asked"
+    assert "d.attributes_json" in annotated_calls[0]["query"]
+
+
 def test_only_the_unimported_half_of_a_source_is_reported(root: Path) -> None:
     _write_sidecar(root, "attribution", ["demo-persona:notes:one", "demo-persona:notes:two"])
     client = _layer_client(spoken={"demo-persona:notes:one"}, annotated=set())
