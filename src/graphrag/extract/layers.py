@@ -19,10 +19,12 @@ an entity name that occurs in no passage, a post anchor that matches nothing, an
 pointing at an entity the passage does not name -- is collected here as *loose*, counted by
 reason, because each reason sends a reviewer to a different file.
 
-Node attributes ride the same check. An attribution or annotation file may say what kind of
-speaker or document it is about, and a key or value the persona's vocabulary does not declare is
-counted here as a loose entry with its own reason, ``attribute invalid``: nothing is written, so
-a tagging pass that invented a value fails visibly rather than half-landing.
+Node attributes ride the same check. All three sidecars may say what kind of thing they are
+about -- an extraction file what kind of entity, an attribution file what kind of speaker, an
+annotation file what kind of document -- and a key or value the persona's vocabulary does not
+declare is counted here as a loose entry with its own reason, ``attribute invalid``: nothing is
+written, so a tagging pass that invented a value fails visibly rather than half-landing. The
+three are kept apart because each sends a reviewer to a different file.
 
 Nothing here knows about any particular corpus: the persona's own ``persona.yaml`` supplies the
 sources, and its ``aliases.yaml`` and ``facets.yaml`` supply the vocabulary the importers check
@@ -82,6 +84,7 @@ ATTRIBUTE_INVALID = "attribute invalid"
 LOOSE_LABELS: dict[str, str] = {
     "extraction/loose": "entity name not verbatim in any passage",
     "extraction/unmatched": "entity name in no passage",
+    "extraction/attribute": f"entity {ATTRIBUTE_INVALID}",
     "attribution/anchor": "post anchor not found",
     "attribution/attribute": f"speaker {ATTRIBUTE_INVALID}",
     **{f"annotation/{reason}": text for reason, text in LOOSE_REASONS.items()},
@@ -454,7 +457,9 @@ def _dry_run(
 ) -> SidecarCheck:
     """Run one sidecar through its own importer without writing, and record what came loose."""
     if layer == "extraction":
-        result = import_extraction_file(store, path, dry_run=True, aliases=aliases)
+        result = import_extraction_file(
+            store, path, dry_run=True, aliases=aliases, attributes=attributes
+        )
         if not result.ok:
             return SidecarCheck(layer=layer, path=path, error=result.error)
         return SidecarCheck(
@@ -463,10 +468,12 @@ def _dry_run(
             summary=(
                 f"{result.entities} entities, {result.mentions} mentions, "
                 f"{result.relations} relations"
+                + (f", {result.attributes} attributes" if result.attributes else "")
                 + (f", {len(result.dangling)} dangling" if result.dangling else "")
             ),
             loose=tuple(("extraction/loose", _short(name)) for name in result.loose)
-            + tuple(("extraction/unmatched", _short(name)) for name in result.unmatched),
+            + tuple(("extraction/unmatched", _short(name)) for name in result.unmatched)
+            + tuple(("extraction/attribute", _short(entry)) for entry in result.attribute_problems),
         )
     if layer == "attribution":
         posts = import_attribution_file(store, path, dry_run=True, attributes=attributes)

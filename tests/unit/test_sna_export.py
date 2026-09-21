@@ -14,8 +14,10 @@ from graphrag.pipeline import IngestReport
 from graphrag.sna.export import (
     bipartite_projection,
     build_network,
+    describe,
     ego,
     entity_co_mention,
+    entity_relations,
     speaker_co_participation,
     speaker_entity_bipartite,
     topic_co_occurrence,
@@ -358,3 +360,189 @@ def test_build_network_rejects_filters_the_chosen_network_cannot_answer(
     with pytest.raises(ValueError, match="--project applies to"):
         build_network(layered, "entities", "test-layers", project="speakers")
     assert build_network(layered, "speakers-entities", "test-layers").number_of_nodes() == 6
+
+
+# ------------------------------------------------------------- the directed relations network
+
+
+def test_the_relations_network_is_directed_typed_and_weighed_in_passages(
+    related: InMemoryGraphStore,
+) -> None:
+    """The planted table in ``conftest``: four directed edges, weights counting passages."""
+    graph = entity_relations(related, "test-layers")
+    assert isinstance(graph, nx.DiGraph)
+    assert graph.graph["network"] == "relations"
+    assert set(graph.nodes) == {"product:alpha", "product:beta", "product:gamma"}
+    assert set(graph.edges) == {
+        ("product:alpha", "product:beta"),
+        ("product:beta", "product:alpha"),
+        ("product:alpha", "product:gamma"),
+        ("product:gamma", "product:beta"),
+    }
+    # Alpha relates to Beta in posts 1 and 3; Beta relates back only in post 1. (u, v) != (v, u).
+    assert graph["product:alpha"]["product:beta"]["weight"] == 2
+    assert graph["product:beta"]["product:alpha"]["weight"] == 1
+    assert graph["product:alpha"]["product:gamma"]["type"] == "competes_with"
+    # Gamma to Beta is stated once as `replaces` and once as `competes_with`: one edge, two
+    # passages, the tied types resolved alphabetically and both recorded.
+    folded = graph["product:gamma"]["product:beta"]
+    assert folded["weight"] == 2
+    assert folded["type"] == "competes_with"
+    assert folded["types"] == "competes_with; replaces"
+    assert graph.nodes["product:alpha"]["label"] == "Alpha"
+    assert graph.nodes["product:alpha"]["type"] == "product"
+    assert graph.nodes["product:alpha"]["documents"] == 4  # posts 1-4 all state a relation of it
+    assert "directed network" in graph.graph["frame"]
+
+
+def test_a_relation_type_filter_keeps_one_kind_of_tie(related: InMemoryGraphStore) -> None:
+    integrates = entity_relations(related, "test-layers", relation_types=["integrates_with"])
+    assert set(integrates.nodes) == {"product:alpha", "product:beta"}
+    assert set(integrates.edges) == {
+        ("product:alpha", "product:beta"),
+        ("product:beta", "product:alpha"),
+    }
+    competes = entity_relations(related, "test-layers", relation_types=["competes_with"])
+    assert set(competes.edges) == {
+        ("product:alpha", "product:gamma"),
+        ("product:gamma", "product:beta"),
+    }
+    assert competes["product:gamma"]["product:beta"]["weight"] == 1  # post 4 only
+    assert "integrates_with" in integrates.graph["frame"]
+    assert entity_relations(related, "test-layers", relation_types=["owns"]).number_of_nodes() == 0
+
+
+def test_the_relations_network_takes_the_window_and_attribute_filters(
+    related: InMemoryGraphStore,
+) -> None:
+    """Same semantics as the entity network: the dates come from the passages, and both ends of
+    an edge have to satisfy ``--where``."""
+    late = entity_relations(related, "test-layers", since="2025-06-01")  # posts 3 and 4
+    assert late["product:alpha"]["product:beta"]["weight"] == 1  # post 3 only
+    assert late["product:gamma"]["product:beta"]["weight"] == 2  # posts 3 and 4
+    assert not late.has_edge("product:beta", "product:alpha")  # post 1 is outside the window
+
+    north = entity_relations(related, "test-layers", where={"region": "north"})  # posts 1 and 3
+    assert set(north.edges) == {
+        ("product:alpha", "product:beta"),
+        ("product:beta", "product:alpha"),
+        ("product:gamma", "product:beta"),
+    }
+    assert "region=north" in north.graph["frame"]
+    assert entity_relations(related, "test-layers", where={"region": "west"}).number_of_nodes() == 0
+
+
+def test_relations_are_scoped_to_the_persona_and_the_source(related: InMemoryGraphStore) -> None:
+    assert entity_relations(related, "other-persona").number_of_nodes() == 0
+    assert entity_relations(related, "test-layers", "nope").number_of_nodes() == 0
+    assert entity_relations(related, "test-layers", "posts").number_of_edges() == 4
+
+
+def test_build_network_dispatches_to_relations_and_guards_its_filters(
+    related: InMemoryGraphStore,
+) -> None:
+    graph = build_network(related, "relations", "test-layers")
+    assert graph.graph["network"] == "relations" and graph.is_directed()
+    one = build_network(related, "relations", "test-layers", relation_types=["replaces"])
+    assert one.number_of_edges() == 1
+    with pytest.raises(ValueError, match="--relation-type applies to"):
+        build_network(related, "entities", "test-layers", relation_types=["replaces"])
+    with pytest.raises(ValueError, match="--stance reads the annotation"):
+        build_network(related, "relations", "test-layers", stances=["praise"])
+
+
+def test_describe_names_the_network_type_the_way_the_atlas_does(
+    related: InMemoryGraphStore,
+) -> None:
+    """Chapter 6 builds its types one edge feature at a time: §6.1 simple, §6.2 directed,
+    §6.3 weighted, §6.4 the kinds of node."""
+    relations = describe(entity_relations(related, "test-layers"))
+    assert relations.text == "directed, weighted"
+    assert relations.directed and relations.weighted and not relations.simple
+    assert "§6.2" in relations.sentence
+
+    entities = describe(entity_co_mention(related, "test-layers", min_weight=1))
+    assert entities.text == "undirected, weighted"
+    assert not entities.directed and not entities.bipartite
+
+    two_mode = describe(speaker_entity_bipartite(related, "test-layers"))
+    assert two_mode.bipartite and two_mode.text == "undirected, weighted, bipartite"
+    projected = describe(speaker_entity_bipartite(related, "test-layers", project="speakers"))
+    assert projected.text == "undirected, weighted"  # a projection leaves one mode of node
+
+    bare = nx.Graph()
+    nx.add_path(bare, ["a", "b", "c"])
+    assert describe(bare).text == "simple" and describe(bare).simple
+    bare.add_edge("c", "c")
+    assert describe(bare).text == "undirected, unweighted, 1 self loop(s)"
+
+
+def test_analyze_runs_end_to_end_on_the_directed_network(related: InMemoryGraphStore) -> None:
+    """In and out degree in the report, reciprocity in the summary, and the flattening said."""
+    from graphrag.sna.analysis import render_markdown, run_analysis
+
+    graph = build_network(related, "relations", "test-layers")
+    analysis = run_analysis(
+        related,
+        graph,
+        persona_id="test-layers",
+        network="relations",
+        method="louvain",
+        seed=1,
+        runs=3,
+        samples=5,
+    )
+    assert set(analysis.centralities) >= {"in_degree", "out_degree"}
+    assert "degree" not in analysis.centralities  # the undirected battery does not run here
+    assert analysis.summary["reciprocity"] == pytest.approx(1 / 3)
+    report = render_markdown(analysis)
+    assert "**Network type.** directed, weighted (Atlas §6.2)" in report
+    assert "### in_degree" in report and "### out_degree" in report
+    assert "reciprocity" in report
+    assert any("Louvain and its degree-preserving null model" in n for n in analysis.notes)
+    assert any("eigenvector centrality" in n for n in analysis.notes)
+    assert "flattened undirected view" in report
+    # The two numbers that changed definition rather than name, and the caption that says which
+    # closeness this is (§6.2): both have to reach the page, not only the docstrings.
+    assert "out-in coefficient" in report and "Fagiolo" in report
+    assert "being reachable" in report
+    assert "top members by weighted degree (in + out)" in report
+    # Chapter 10 rides along in every report, and on a digraph it prints both component
+    # readings and the dyad census the summary's reciprocity is a ratio of (§10.3, §10.4).
+    assert analysis.paths is not None
+    assert "## Paths and components" in report
+    assert "| weakly connected |" in report and "| strongly connected |" in report
+    assert "### Reciprocity and the dyad census (§10.3)" in report
+    assert analysis.paths.dyads is not None
+    assert analysis.paths.dyads.reciprocity == pytest.approx(analysis.summary["reciprocity"])
+
+
+def test_the_vector_methods_and_the_attribute_section_survive_a_directed_network(
+    related: InMemoryGraphStore,
+) -> None:
+    """Spectral features and the ``--by`` nulls are undirected constructs, so they flatten.
+
+    Running rather than refusing is the choice the ticket's chapter argues for: a directed
+    network with no communities and no attribute section would answer nothing at all. What is
+    not allowed is doing it quietly, so the note has to be there.
+    """
+    from graphrag.sna.analysis import run_analysis, to_payload
+
+    analysis = run_analysis(
+        related,
+        build_network(related, "relations", "test-layers"),
+        persona_id="test-layers",
+        network="relations",
+        method="kmeans",
+        k=2,
+        seed=1,
+        samples=5,
+        by="region",
+        permutations=20,
+    )
+    assert analysis.groups and analysis.attribute is not None
+    assert any("spectral features" in note for note in analysis.notes)
+    payload = to_payload(analysis)
+    assert payload["summary"]["reciprocity"] == pytest.approx(1 / 3)
+    assert payload["paths"]["dyads"]["reciprocity"] == pytest.approx(1 / 3)
+    assert payload["paths"]["path_lengths"]["component_kind"] == "weakly connected"

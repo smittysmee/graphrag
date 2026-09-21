@@ -6,7 +6,7 @@ import pytest
 
 from graphrag.graph.memory_store import InMemoryGraphStore
 from graphrag.sna.compare import compare_windows, render_comparison
-from graphrag.sna.stances import build_stance_report, render_stances
+from graphrag.sna.stances import SignedPair, build_stance_report, render_stances
 
 
 def test_the_stance_report_counts_annotations_per_entity_and_names_who_wrote_them(
@@ -147,6 +147,80 @@ def test_a_comparison_rejects_a_centrality_it_does_not_compute(
         compare_windows(layered, "test-layers", "speakers", centrality_kind="charisma")
 
 
+def test_a_window_grid_of_one_window_is_refused_rather_than_compared_with_itself(
+    layered: InMemoryGraphStore,
+) -> None:
+    """A six-month window over six months is one window, and a build cannot be its own before.
+
+    The grid would hand ``grid[0]`` and ``grid[-1]`` to both sides, producing a comparison whose
+    every number is trivially identical -- ARI 1.0, no entrants, no leavers -- and which reads
+    like a finding of stability. Refusing it is the only honest answer.
+    """
+    with pytest.raises(ValueError, match="makes one window; a before-and-after needs two"):
+        compare_windows(
+            layered,
+            "test-layers",
+            "speakers",
+            since="2025-01-01",
+            until="2025-06-30",
+            window="6M",
+        )
+    with pytest.raises(ValueError, match="cannot be given with --since2"):
+        compare_windows(
+            layered,
+            "test-layers",
+            "speakers",
+            since="2025-01-01",
+            until="2025-06-30",
+            since2="2025-04-01",
+            window="3M",
+        )
+    with pytest.raises(ValueError, match="needs --since and --until"):
+        compare_windows(layered, "test-layers", "speakers", window="3M")
+
+
+def test_comparing_two_windows_of_the_directed_network_keeps_its_direction(
+    related: InMemoryGraphStore,
+) -> None:
+    """A comparison of a directed network says it is one, and takes a directed centrality.
+
+    The two windows are the planted halves of the year: posts 1-2 against posts 3-4, so Alpha
+    and Beta are in both and the relations between them differ.
+    """
+    comparison = compare_windows(
+        related,
+        "test-layers",
+        "relations",
+        until="2025-03-01",
+        since2="2025-06-01",
+        centrality_kind="in_degree",
+        seed=1,
+        runs=2,
+    )
+    assert comparison.centrality == "in_degree"
+    assert comparison.a.graph.is_directed()
+    assert set(comparison.shared) == {"product:alpha", "product:beta", "product:gamma"}
+    assert any("is invisible to it" in note for note in comparison.notes)  # the flattening
+    assert any("Fagiolo" in note for note in comparison.notes)  # the summary conventions
+    assert any("Louvain and its degree-preserving null model" in n for n in comparison.notes)
+
+    text = render_comparison(comparison)
+    assert "**Network type.** directed, weighted (Atlas §6.2)" in text
+    assert "Largest rank changes (in_degree)" in text
+    assert "being named" in text  # the caption for in_degree
+    assert "flattened undirected view" in text
+
+    # The undirected battery keeps its own error, and the total degree is legal on both.
+    with pytest.raises(ValueError, match="centrality must be one of"):
+        compare_windows(related, "test-layers", "relations", centrality_kind="charisma")
+    with pytest.raises(ValueError, match="centrality must be one of"):
+        compare_windows(related, "test-layers", "speakers", centrality_kind="in_degree")
+    totals = compare_windows(
+        related, "test-layers", "relations", centrality_kind="weighted_degree", seed=1, runs=2
+    )
+    assert "in + out" in render_comparison(totals)
+
+
 def test_the_rendered_comparison_explains_what_is_and_is_not_comparable(
     layered: InMemoryGraphStore,
 ) -> None:
@@ -179,3 +253,46 @@ def test_an_empty_window_is_reported_rather_than_rendered_as_a_change(
     assert any("is empty" in note for note in comparison.notes)
     assert any("share no nodes at all" in note for note in comparison.notes)
     assert "Not computed" in render_comparison(comparison)
+
+
+def test_the_stance_filter_prefers_the_entitys_own_value_over_its_documents(
+    layered: InMemoryGraphStore,
+) -> None:
+    """``--where`` means one thing everywhere: the node's own value, then its documents'.
+
+    Alpha is complained about in the two south posts and praised in the one north post. Given
+    its own value, ``region=north`` keeps all three -- what is said about a north thing -- rather
+    than the one reading that happened to be written in a north document.
+    """
+    borrowed = build_stance_report(layered, "test-layers", where={"region": "north"})
+    alpha = next(e for e in borrowed.entities if e.name == "Alpha")
+    assert alpha.counts == {"praise": 1}
+
+    layered.set_entity_attributes("test-layers", "product:alpha", {"region": "north"})
+    own = build_stance_report(layered, "test-layers", where={"region": "north"})
+
+    alpha = next(e for e in own.entities if e.name == "Alpha")
+    assert alpha.counts == {"praise": 1, "complaint": 2}
+    # Gamma has no value of its own, so it still borrows: only its one north reading survives,
+    # and the two complaints written in south documents stay out.
+    gamma = next(e for e in own.entities if e.name == "Gamma")
+    assert gamma.counts == {"neutral": 1}
+
+
+def test_signed_pair_dominant_sign_is_the_majority_stance_or_none_on_a_tie() -> None:
+    """§24.1's convention (praise = +1, complaint = -1), and its own stated exception: a pair
+    whose counts tie -- including a tie at zero, meaning neither stance was ever annotated -- is
+    genuinely ambiguous under a majority reading, not a fact to guess at."""
+    assert SignedPair("a", "b", {"praise": 2, "complaint": 1}).dominant_sign == 1
+    assert SignedPair("a", "b", {"praise": 1, "complaint": 2}).dominant_sign == -1
+    assert SignedPair("a", "b", {"praise": 1, "complaint": 1}).dominant_sign is None
+    assert SignedPair("a", "b", {}).dominant_sign is None
+
+
+def test_the_signed_co_mention_table_carries_a_dominant_sign_for_the_planted_corpus(
+    layered: InMemoryGraphStore,
+) -> None:
+    report = build_stance_report(layered, "test-layers")
+    pairs = {(p.left, p.right): p for p in report.pairs}
+    assert pairs[("Alpha", "Beta")].dominant_sign == 1  # one shared praise, no complaint
+    assert pairs[("Alpha", "Gamma")].dominant_sign == -1  # two shared complaints, no praise

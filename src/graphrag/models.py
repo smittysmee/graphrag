@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Literal, get_args
 
@@ -150,6 +151,30 @@ ENTITY_TYPES: tuple[str, ...] = get_args(EntityType)
 #: absence of one: a mention with no annotation at all carries no stance.
 Stance = Literal["praise", "complaint", "substitution", "neutral"]
 
+#: How the passage behind a mention was found, which is the evidence the mention rests on
+#: (:func:`graphrag.extract.llm.match_chunks` decides it). ``exact`` means the passage contains
+#: the entity's name verbatim, ``loose`` that it contains a significant token of it, ``none``
+#: that no passage names it at all and the mention was anchored to the document's first passage
+#: as a fallback. ``unknown`` is the fourth case and is not a match: it is a mention written
+#: before the tier was recorded -- every mention in a snapshot committed before this existed --
+#: and the reports say how many edges rest on one rather than treating it as a measurement.
+#: :mod:`graphrag.sna.uncertain` turns the tier into an edge probability (Atlas §28.1-28.2).
+MentionTier = Literal["exact", "loose", "none", "unknown"]
+
+#: The tiers ordered by how directly the passage supports the mention, strongest first, with
+#: ``unknown`` last because a record nobody wrote is weaker evidence than any record.
+MENTION_TIERS: tuple[MentionTier, ...] = get_args(MentionTier)
+
+
+def strongest_tier(tiers: Iterable[MentionTier]) -> MentionTier:
+    """The best-supported of several tiers for one mention, ``unknown`` when there are none.
+
+    Two spellings of one entity in one passage (an alias table folds them together) are two
+    matches for the same claim, so the mention keeps whichever matched better rather than
+    whichever was written last.
+    """
+    return min(tiers, key=MENTION_TIERS.index, default="unknown")
+
 
 class Entity(BaseModel):
     id: str
@@ -241,6 +266,10 @@ class Mention(BaseModel):
     entity_id: str
     #: Set by the annotation layer, never by extraction: what this passage says about the entity.
     stance: Stance | None = None
+    #: How this passage was matched to the entity's name, set by extraction and never by the
+    #: annotation layer. Defaults to ``unknown``, which is what every mention written before the
+    #: tier was recorded reads back as -- an old snapshot loads, and says so.
+    tier: MentionTier = "unknown"
 
 
 class Relation(BaseModel):
@@ -412,6 +441,34 @@ class EntityChunk(BaseModel):
     type: str = "other"
     chunk_id: str
     doc_id: str
+    #: How the passage was matched to the entity, which is how strong this edge's evidence is.
+    #: ``graphrag.sna.export`` turns it into the edge probability ``p`` (Atlas §28.1).
+    tier: MentionTier = "unknown"
+
+
+class RelationRow(BaseModel):
+    """One ``(:Entity)-[:RELATED_TO]->(:Entity)`` edge, as one passage stated it.
+
+    The directed edge the ``relations`` network is built from. Unlike every other row here it is
+    *not* symmetric: an extraction pass wrote ``source_id`` as the thing doing the relating and
+    ``target_id`` as the thing related to, and the Atlas is explicit that in a directed graph
+    ``(u, v)`` is not ``(v, u)`` (§6.2). Swapping them is not a reordering, it is a different
+    claim.
+
+    Both names ride along so a network can be labelled without a second read, and ``chunk_id``
+    and ``doc_id`` are the provenance: one row is one passage saying one thing, which is what
+    the network's edge weight counts.
+    """
+
+    source_id: str
+    source_name: str
+    source_type: str = "other"
+    target_id: str
+    target_name: str
+    target_type: str = "other"
+    type: str
+    chunk_id: str
+    doc_id: str
 
 
 class TopicEdge(BaseModel):
@@ -465,3 +522,7 @@ class EntityMention(BaseModel):
     #: The attributes of the document this passage belongs to, so a two-mode network can be cut
     #: by what kind of document a mention came from without joining the documents back on.
     document_attributes: dict[str, str] = Field(default_factory=dict)
+    #: The same tier :class:`EntityChunk` carries, on the same terms: an edge built from this
+    #: row gets the same probability whichever of the two reads produced it, which is why the
+    #: evidence model uses the tier and not the stance beside it (:mod:`graphrag.sna.uncertain`).
+    tier: MentionTier = "unknown"

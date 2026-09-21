@@ -17,6 +17,7 @@ from neo4j import GraphDatabase, RoutingControl
 from graphrag.config import Neo4jSettings
 from graphrag.embed.base import Matrix, Vector
 from graphrag.graph.schema import FULLTEXT_INDEX, VECTOR_INDEX, lucene_escape, schema_statements
+from graphrag.graph.store import AttributeKind
 from graphrag.graph.vectors import stack_means
 from graphrag.models import (
     ENTITY_TYPES,
@@ -34,6 +35,7 @@ from graphrag.models import (
     PersonaSpec,
     RelatedTopic,
     Relation,
+    RelationRow,
     ScoredChunk,
     SpeakerCount,
     SpeakerDocument,
@@ -121,8 +123,12 @@ def _attr_prefix(persona_id: str) -> str:
     return f"{ATTR_PREFIX}{persona_id}__"
 
 
-def _speaker_attributes(props: Mapping[str, Any], persona_id: str) -> dict[str, str]:
-    """This persona's attributes out of a ``Speaker`` node's properties."""
+def _scoped_attributes(props: Mapping[str, Any], persona_id: str) -> dict[str, str]:
+    """This persona's attributes out of a shared node's properties.
+
+    ``Speaker`` and ``Entity`` nodes are both shared between personas and both carry their
+    attributes as persona-prefixed properties, so both are read the same way.
+    """
     prefix = _attr_prefix(persona_id)
     return {
         key[len(prefix) :]: str(value)
@@ -149,6 +155,19 @@ def _doc_props(doc: Document) -> dict[str, Any]:
         "attributes_json": json.dumps(doc.attributes, sort_keys=True),
         "word_count": doc.word_count,
     }
+
+
+def _mention_row(mention: Mention) -> dict[str, Any]:
+    """One mention as Cypher parameters, with ``unknown`` written as a null.
+
+    ``unknown`` is the absence of a tier rather than a fourth measurement of one, so it travels
+    as ``NULL`` and the write is a ``coalesce`` -- exactly how the stance behaves. That is what
+    lets a re-import of an old extraction file, or of a snapshot written before tiers existed,
+    land on an edge that already carries a tier without erasing it. Reads put ``unknown`` back.
+    """
+    row = mention.model_dump()
+    row["tier"] = None if mention.tier == "unknown" else mention.tier
+    return row
 
 
 def _attributes(raw: Any) -> dict[str, str]:
@@ -412,9 +431,10 @@ class Neo4jGraphStore:
                 UNWIND $rows AS row
                 MATCH (c:Chunk {id: row.chunk_id}), (e:Entity {id: row.entity_id})
                 MERGE (c)-[m:MENTIONS]->(e)
-                SET m.stance = coalesce(row.stance, m.stance)
+                SET m.stance = coalesce(row.stance, m.stance),
+                    m.tier = coalesce(row.tier, m.tier)
                 """,
-                rows=[m.model_dump() for m in enrichment.mentions],
+                rows=[_mention_row(m) for m in enrichment.mentions],
             )
         if enrichment.relations:
             self._run(
@@ -520,13 +540,23 @@ class Neo4jGraphStore:
             pid=persona_id,
             target_id=target_id,
         )
+        # The tier of the surviving mention is the better-supported of the two, which is
+        # :func:`graphrag.models.strongest_tier` written in Cypher: the four tiers sort
+        # strongest-first alphabetically, so the smaller string is the stronger evidence.
+        # ``tests/unit/test_sna_uncertain.py`` pins that ordering, because this statement and
+        # nothing else depends on it.
         moved = self._run(
             """
             MATCH (c:Chunk {persona_id: $pid})-[m:MENTIONS]->(old:Entity)
             WHERE old.id IN $stale
             MATCH (target:Entity {id: $target_id})
             MERGE (c)-[n:MENTIONS]->(target)
-            SET n.stance = coalesce(n.stance, m.stance)
+            SET n.stance = coalesce(n.stance, m.stance),
+                n.tier = CASE
+                    WHEN m.tier IS NULL THEN n.tier
+                    WHEN n.tier IS NULL THEN m.tier
+                    WHEN m.tier < n.tier THEN m.tier
+                    ELSE n.tier END
             DELETE m
             RETURN count(*) AS moved
             """,
@@ -837,11 +867,17 @@ class Neo4jGraphStore:
 
     def enrichment_for_persona(self, persona_id: str) -> Enrichment:
         mentions = [
-            Mention(chunk_id=r["chunk_id"], entity_id=r["entity_id"], stance=r["stance"])
+            Mention(
+                chunk_id=r["chunk_id"],
+                entity_id=r["entity_id"],
+                stance=r["stance"],
+                tier=r["tier"],
+            )
             for r in self._read(
                 """
                 MATCH (c:Chunk {persona_id: $pid})-[m:MENTIONS]->(e:Entity)
-                RETURN c.id AS chunk_id, e.id AS entity_id, m.stance AS stance
+                RETURN c.id AS chunk_id, e.id AS entity_id, m.stance AS stance,
+                       coalesce(m.tier, 'unknown') AS tier
                 ORDER BY chunk_id, entity_id
                 """,
                 pid=persona_id,
@@ -899,6 +935,63 @@ class Neo4jGraphStore:
             topics=counts["Topic"],
             entities=counts["Entity"],
             per_persona=per,
+        )
+
+    def persona_fingerprint(self, persona_id: str) -> tuple[int, int, int, int]:
+        """See the protocol docstring. One round trip: six independent ``CALL {}`` subqueries,
+        each guaranteed exactly one output row (every ``MATCH`` inside is ``OPTIONAL``, and the
+        two-pattern speaker search collects into a list and counts that, rather than returning
+        rows to count outside -- a ``CALL {}`` subquery that itself returns zero rows drops the
+        correlated outer row, which silently zeroed every column here during development, not
+        only the one the empty subquery belonged to)."""
+        rows = self._read(
+            """
+            CALL {
+                OPTIONAL MATCH (d:Document {persona_id: $persona_id})
+                RETURN count(d) AS documents
+            }
+            CALL {
+                OPTIONAL MATCH (c:Chunk {persona_id: $persona_id})
+                RETURN count(c) AS chunks
+            }
+            CALL {
+                OPTIONAL MATCH (:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+                RETURN count(e) AS mentions
+            }
+            CALL {
+                OPTIONAL MATCH (d:Document {persona_id: $persona_id})
+                WHERE d.attributes_json IS NOT NULL AND d.attributes_json <> '{}'
+                RETURN count(d) AS attributed_documents
+            }
+            CALL {
+                OPTIONAL MATCH (:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+                WHERE any(key IN keys(e) WHERE key STARTS WITH $prefix)
+                RETURN count(DISTINCT e) AS attributed_entities
+            }
+            CALL {
+                OPTIONAL MATCH (:Document {persona_id: $persona_id})-[:FEATURES]->(s1:Speaker)
+                WHERE any(key IN keys(s1) WHERE key STARTS WITH $prefix)
+                WITH collect(DISTINCT s1) AS featured
+                OPTIONAL MATCH (:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(:Chunk)
+                    <-[:SPOKE]-(s2:Speaker)
+                WHERE any(key IN keys(s2) WHERE key STARTS WITH $prefix)
+                WITH featured, collect(DISTINCT s2) AS spoke
+                UNWIND (featured + spoke) AS s
+                RETURN count(DISTINCT s) AS attributed_speakers
+            }
+            RETURN documents, chunks, mentions,
+                   attributed_documents + attributed_entities + attributed_speakers
+                       AS attributed_nodes
+            """,
+            persona_id=persona_id,
+            prefix=_attr_prefix(persona_id),
+        )
+        row = rows[0]
+        return (
+            int(row["documents"]),
+            int(row["chunks"]),
+            int(row["mentions"]),
+            int(row["attributed_nodes"]),
         )
 
     def run_readonly_cypher(
@@ -1024,7 +1117,7 @@ class Neo4jGraphStore:
         rows = self._read(
             "MATCH (s:Speaker {name: $speaker}) RETURN properties(s) AS props", speaker=speaker
         )
-        held = _speaker_attributes(rows[0]["props"], persona_id) if rows else {}
+        held = _scoped_attributes(rows[0]["props"], persona_id) if rows else {}
         refused = [key for key, value in wanted.items() if held.get(key, value) != value]
         fresh = {
             _attr_prefix(persona_id) + key: value
@@ -1035,6 +1128,43 @@ class Neo4jGraphStore:
             self._run(
                 "MATCH (s:Speaker {name: $speaker}) SET s += $props",
                 speaker=speaker,
+                props=fresh,
+            )
+        return refused
+
+    def set_entity_attributes(
+        self, persona_id: str, entity_id: str, attributes: Mapping[str, str]
+    ) -> list[str]:
+        """Record what this persona's corpus says the entity is. Returns the keys it refused.
+
+        Held as persona-prefixed properties on the shared ``Entity`` node, for the reason
+        :meth:`set_speaker_attributes` gives: the node is shared between personas, and "which
+        sector this company is in" is a reading of one corpus rather than a fact about the
+        world.
+
+        Read then written, in two statements, because first-value-wins needs the held value.
+        The write matches rather than merges: an entity no passage mentions is not an entity,
+        and an attribute must not be the thing that keeps one alive past the orphan sweep.
+        """
+        wanted = {key: value for key, value in attributes.items() if value}
+        if not wanted:
+            return []
+        rows = self._read(
+            "MATCH (e:Entity {id: $entity_id}) RETURN properties(e) AS props", entity_id=entity_id
+        )
+        if not rows:
+            return list(wanted)
+        held = _scoped_attributes(rows[0]["props"], persona_id)
+        refused = [key for key, value in wanted.items() if held.get(key, value) != value]
+        fresh = {
+            _attr_prefix(persona_id) + key: value
+            for key, value in wanted.items()
+            if key not in refused
+        }
+        if fresh:
+            self._run(
+                "MATCH (e:Entity {id: $entity_id}) SET e += $props",
+                entity_id=entity_id,
                 props=fresh,
             )
         return refused
@@ -1053,6 +1183,47 @@ class Neo4jGraphStore:
             doc_id=doc_id,
             json=json.dumps(merged, sort_keys=True),
         )
+
+    def clear_attributes(self, persona_id: str, kind: AttributeKind) -> int:
+        """Forget this persona's values of one kind; return how many nodes held one.
+
+        Speaker and entity values are persona-prefixed properties on shared nodes, so only the
+        keys under this persona's prefix go: setting a property to null in ``SET +=`` removes it,
+        which names each key without needing APOC's dynamic property removal. A document belongs
+        to one persona and keeps its values in one property, so that property goes whole.
+        """
+        if kind == "document":
+            rows = self._read(
+                """
+                MATCH (d:Document {persona_id: $persona_id})
+                WHERE d.attributes_json IS NOT NULL
+                RETURN count(d) AS n
+                """,
+                persona_id=persona_id,
+            )
+            self._run(
+                "MATCH (d:Document {persona_id: $persona_id}) REMOVE d.attributes_json",
+                persona_id=persona_id,
+            )
+            return int(rows[0]["n"]) if rows else 0
+        label = "Speaker" if kind == "speaker" else "Entity"
+        held = self._read(
+            f"""
+            MATCH (n:{label})
+            WITH n, [key IN keys(n) WHERE key STARTS WITH $prefix] AS held
+            WHERE size(held) > 0
+            RETURN elementId(n) AS node, held
+            """,
+            prefix=_attr_prefix(persona_id),
+        )
+        rows = [{"node": r["node"], "nulls": dict.fromkeys(r["held"])} for r in held]
+        if rows:
+            self._run(
+                f"UNWIND $rows AS row MATCH (n:{label}) WHERE elementId(n) = row.node "
+                "SET n += row.nulls",
+                rows=rows,
+            )
+        return len(rows)
 
     def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
         """Every speaker of this persona that carries attributes, with what it carries."""
@@ -1075,7 +1246,7 @@ class Neo4jGraphStore:
         )
         out: dict[str, dict[str, str]] = {}
         for row in rows:
-            attrs = _speaker_attributes(row["props"], persona_id)
+            attrs = _scoped_attributes(row["props"], persona_id)
             if attrs:
                 out[row["speaker"]] = attrs
         return out
@@ -1092,6 +1263,30 @@ class Neo4jGraphStore:
             persona_id=persona_id,
         )
         return {row["doc_id"]: _attributes(row["attrs"]) for row in rows}
+
+    def entity_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        """Every entity this persona's passages mention that carries attributes.
+
+        Scoped through the mentions rather than through the node, exactly as
+        :meth:`persona_entities` is: the node is shared, so "the entities of this persona" only
+        ever means the ones its passages name.
+        """
+        rows = self._paged(
+            """
+            MATCH (c:Chunk {persona_id: $persona_id})-[:MENTIONS]->(e:Entity)
+            WITH DISTINCT e
+            RETURN e.id AS entity_id, properties(e) AS props
+            ORDER BY entity_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+        )
+        out: dict[str, dict[str, str]] = {}
+        for row in rows:
+            attrs = _scoped_attributes(row["props"], persona_id)
+            if attrs:
+                out[row["entity_id"]] = attrs
+        return out
 
     # ------------------------------------------------------------- annotation
     def annotate_mention(self, doc_id: str, chunk_id: str, entity: str, stance: Stance) -> None:
@@ -1246,7 +1441,7 @@ class Neo4jGraphStore:
                 speaker=r["speaker"],
                 doc_id=r["doc_id"],
                 chunks=int(r["chunks"]),
-                speaker_attributes=_speaker_attributes(r["props"], persona_id),
+                speaker_attributes=_scoped_attributes(r["props"], persona_id),
                 document_attributes=_attributes(r["doc_attrs"]),
             )
             for r in rows
@@ -1261,11 +1456,11 @@ class Neo4jGraphStore:
         rows = self._paged(
             """
             MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk)
-            MATCH (c)-[:MENTIONS]->(e:Entity)
+            MATCH (c)-[m:MENTIONS]->(e:Entity)
             WHERE ($source_id IS NULL OR d.source_id = $source_id)
               AND ($types IS NULL OR e.type IN $types)
             RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
-                   c.id AS chunk_id, d.id AS doc_id
+                   c.id AS chunk_id, d.id AS doc_id, coalesce(m.tier, 'unknown') AS tier
             ORDER BY entity_id, chunk_id
             SKIP $skip LIMIT $page
             """,
@@ -1292,6 +1487,35 @@ class Neo4jGraphStore:
         return [
             TopicEdge(source=r["source"], target=r["target"], weight=int(r["weight"])) for r in rows
         ]
+
+    def relation_rows(self, persona_id: str, source_id: str | None = None) -> list[RelationRow]:
+        """The directed ``RELATED_TO`` edges this persona's passages state.
+
+        The scope runs through the passage each relation is anchored to, for the reason
+        :meth:`enrichment_for_persona` scopes through it: the ``Entity`` nodes are shared between
+        personas, so a relation another persona's passage stated is not this persona's to
+        export. The route differs, though, and deliberately -- that method matches the passage
+        on ``Chunk.persona_id``, this one reaches it from its ``Document``, because the document
+        is what carries ``source_id`` and a relation whose passage a re-ingest removed then
+        comes back not at all rather than unscoped.
+        """
+        rows = self._paged(
+            """
+            MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+            MATCH (d:Document {persona_id: $persona_id})-[:HAS_CHUNK]->(c:Chunk {id: r.chunk_id})
+            WHERE $source_id IS NULL OR d.source_id = $source_id
+            RETURN a.id AS source_id, a.name AS source_name,
+                   coalesce(a.type, 'other') AS source_type,
+                   b.id AS target_id, b.name AS target_name,
+                   coalesce(b.type, 'other') AS target_type,
+                   r.type AS type, c.id AS chunk_id, d.id AS doc_id
+            ORDER BY source_id, target_id, type, chunk_id
+            SKIP $skip LIMIT $page
+            """,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+        return [RelationRow.model_validate(r) for r in rows]
 
     def mean_embeddings(self, persona_id: str, level: str = "document") -> tuple[list[str], Matrix]:
         if level == "document":
@@ -1338,7 +1562,8 @@ class Neo4jGraphStore:
             RETURN e.id AS entity_id, e.name AS name, coalesce(e.type, 'other') AS type,
                    c.id AS chunk_id, d.id AS doc_id, m.stance AS stance,
                    coalesce(c.speakers, []) AS speakers,
-                   coalesce(d.attributes_json, '{}') AS doc_attrs
+                   coalesce(d.attributes_json, '{}') AS doc_attrs,
+                   coalesce(m.tier, 'unknown') AS tier
             ORDER BY entity_id, chunk_id
             SKIP $skip LIMIT $page
             """,
@@ -1356,6 +1581,7 @@ class Neo4jGraphStore:
                 stance=r["stance"],
                 speakers=list(r["speakers"]),
                 document_attributes=_attributes(r["doc_attrs"]),
+                tier=r["tier"],
             )
             for r in rows
         ]

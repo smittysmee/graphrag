@@ -168,9 +168,9 @@ def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
 ) -> None:
     """The other half of the attribute contract in ``tests/unit/test_pipeline_and_store.py``.
 
-    Speaker attributes are properties on a shared ``Speaker`` node, so the two things worth
+    Speaker and entity attributes are properties on shared nodes, so the two things worth
     proving against a real database are that one persona's reading cannot be read as another's,
-    and that an attribute never keeps a speaker alive whose passages are gone.
+    and that an attribute never keeps a node alive whose passages are gone.
     """
     persona = PersonaSpec(id="it-attrs", name="IT Attributes", sources=[thread_source])
     IngestPipeline(clean_store, hash_embedder).ingest(sample_corpus, persona, thread_source)
@@ -178,14 +178,31 @@ def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
     chunks = clean_store.document_chunks(doc_id, 0, 100)
     clean_store.attach_speaker(doc_id, chunks[0].id, "quill-maker")
 
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+
     assert clean_store.set_speaker_attributes("it-attrs", "quill-maker", {"region": "north"}) == []
     clean_store.set_document_attributes(doc_id, {"region": "south"})
+    assert (
+        clean_store.set_entity_attributes("it-attrs", "concept:handbook", {"region": "north"}) == []
+    )
 
     assert clean_store.speaker_attributes("it-attrs") == {"quill-maker": {"region": "north"}}
     assert clean_store.document_attributes("it-attrs") == {doc_id: {"region": "south"}}
+    assert clean_store.entity_attributes("it-attrs") == {"concept:handbook": {"region": "north"}}
     row = next(r for r in clean_store.speaker_document_pairs("it-attrs"))
     assert row.speaker_attributes == {"region": "north"}
     assert row.document_attributes == {"region": "south"}
+
+    # ATL-ENT-3: the cache fingerprint's attributed-node count is this document, this speaker
+    # and this entity -- three nodes, on a real database, with the same CALL {} query the
+    # network cache runs on every build.
+    _, _, mentions, attributed = clean_store.persona_fingerprint("it-attrs")
+    assert (mentions, attributed) == (1, 3)
 
     # first value written wins, and an identical one is not a disagreement
     assert clean_store.set_speaker_attributes("it-attrs", "quill-maker", {"region": "north"}) == []
@@ -197,6 +214,13 @@ def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
         "region": "north",
         "team": "blue",
     }
+    assert clean_store.set_entity_attributes(
+        "it-attrs", "concept:handbook", {"region": "south"}
+    ) == ["region"]
+    # an id no node holds refuses every key rather than reporting them as written
+    assert clean_store.set_entity_attributes(
+        "it-attrs", "concept:nothing", {"region": "north"}
+    ) == ["region"]
 
     # a second persona holding the same handle reads none of the first one's attributes
     other = PersonaSpec(id="it-attrs-two", name="IT Attributes 2", sources=[thread_source])
@@ -205,6 +229,18 @@ def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
     second_chunks = clean_store.document_chunks(second_doc, 0, 100)
     clean_store.attach_speaker(second_doc, second_chunks[0].id, "quill-maker")
     assert clean_store.speaker_attributes("it-attrs-two") == {}
+    # and neither does it read the entity attributes, though it mentions the same entity
+    clean_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=second_chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+    assert clean_store.entity_attributes("it-attrs-two") == {}
+    # it mentions the same shared entity, but attributes it, so the fingerprint's cross-persona
+    # isolation is a real query result, not just what `entity_attributes` filters back
+    _, _, _, attributed_second = clean_store.persona_fingerprint("it-attrs-two")
+    assert attributed_second == 0
 
     # both attribute sets ride the snapshot
     root = tmp_path / "snapshots"
@@ -220,6 +256,28 @@ def test_node_attributes_on_neo4j_survive_a_snapshot_and_stay_per_persona(
         "region": "north",
         "team": "blue",
     }
+    assert clean_store.entity_attributes("it-attrs") == {"concept:handbook": {"region": "north"}}
+
+    # a refresh clears one persona's values of one kind and nothing else: the second persona's
+    # reading of the same shared speaker and entity stays, and so does the other kind
+    assert (
+        clean_store.set_speaker_attributes("it-attrs-two", "quill-maker", {"region": "west"}) == []
+    )
+    assert (
+        clean_store.set_entity_attributes("it-attrs-two", "concept:handbook", {"region": "west"})
+        == []
+    )
+    assert clean_store.clear_attributes("it-attrs", "speaker") == 1
+    assert clean_store.speaker_attributes("it-attrs") == {}
+    assert clean_store.speaker_attributes("it-attrs-two") == {"quill-maker": {"region": "west"}}
+    assert clean_store.entity_attributes("it-attrs") == {"concept:handbook": {"region": "north"}}
+    assert clean_store.clear_attributes("it-attrs", "entity") == 1
+    assert clean_store.entity_attributes("it-attrs") == {}
+    assert clean_store.entity_attributes("it-attrs-two") == {"concept:handbook": {"region": "west"}}
+    assert clean_store.clear_attributes("it-attrs", "document") == 1
+    assert clean_store.document_attributes("it-attrs") == {}
+    # and a value written after the clear is a first value again, not a conflict
+    assert clean_store.set_speaker_attributes("it-attrs", "quill-maker", {"region": "south"}) == []
 
     # an attribute is not a reason to keep a speaker nothing records any more
     clean_store.delete_persona("it-attrs")
@@ -238,12 +296,12 @@ def test_network_reads_and_mean_embeddings_on_neo4j(
 ) -> None:
     """The other half of ``tests/unit/test_pipeline_and_store.py``'s network-read contract.
 
-    Everything ``graphrag sna`` builds comes through these four methods, so the Cypher behind
+    Everything ``graphrag sna`` builds comes through these five methods, so the Cypher behind
     them has to agree with the in-memory store rather than merely return something.
     """
     import numpy as np
 
-    from graphrag.sna.export import entity_co_mention, speaker_co_participation
+    from graphrag.sna.export import entity_co_mention, entity_relations, speaker_co_participation
 
     IngestPipeline(clean_store, hash_embedder).ingest(
         sample_corpus, it_persona, it_persona.sources[0]
@@ -274,8 +332,36 @@ def test_network_reads_and_mean_embeddings_on_neo4j(
                 Mention(chunk_id=chunk_id, entity_id="metric:retention"),
                 Mention(chunk_id=chunk_id, entity_id="concept:onboarding"),
             ],
+            relations=[
+                Relation(
+                    source_id="concept:onboarding",
+                    target_id="metric:retention",
+                    type="drives",
+                    evidence="fix onboarding before you spend on acquisition",
+                    chunk_id=chunk_id,
+                )
+            ],
         )
     )
+    relations = clean_store.relation_rows("it-pm")
+    assert len(relations) == 1
+    row = relations[0]
+    assert (row.source_id, row.target_id, row.type) == (
+        "concept:onboarding",
+        "metric:retention",
+        "drives",
+    )
+    assert (row.source_name, row.target_name) == ("Onboarding", "Retention")
+    assert (row.source_type, row.target_type) == ("concept", "metric")
+    assert row.chunk_id == chunk_id and row.doc_id == doc.id
+    assert clean_store.relation_rows("it-pm", "test-podcast") == relations
+    assert clean_store.relation_rows("it-pm", "absent") == []
+    assert clean_store.relation_rows("other-persona") == []  # the Entity nodes are shared
+    directed = entity_relations(clean_store, "it-pm")
+    assert directed.is_directed()
+    assert directed["concept:onboarding"]["metric:retention"]["type"] == "drives"
+    assert not directed.has_edge("metric:retention", "concept:onboarding")  # (u, v) != (v, u)
+
     mentions = clean_store.entity_chunk_pairs("it-pm")
     assert {m.entity_id for m in mentions} == {"metric:retention", "concept:onboarding"}
     assert all(m.chunk_id == chunk_id and m.doc_id == doc.id for m in mentions)
@@ -361,7 +447,7 @@ def test_dated_speaker_edges_annotations_and_aliases_on_neo4j(
                 Entity(id="concept:hand-book", name="hand book", type="concept"),
             ],
             mentions=[
-                Mention(chunk_id=chunks[0].id, entity_id="concept:handbook"),
+                Mention(chunk_id=chunks[0].id, entity_id="concept:handbook", tier="exact"),
                 Mention(chunk_id=chunks[-1].id, entity_id="concept:hand-book"),
             ],
         )
@@ -394,6 +480,25 @@ def test_dated_speaker_edges_annotations_and_aliases_on_neo4j(
     # The unannotated mention is still a row, carrying no stance rather than a neutral one.
     assert [r.stance for r in rows if r.stance is None] == [None]
     assert [r.type for r in rows] == ["concept", "concept"]
+    # The mention tier round-trips, and the one nobody recorded comes back as ``unknown`` rather
+    # than as a null: an edge with no tier is priced at the documented placeholder (§28.1).
+    assert sorted(r.tier for r in rows) == ["exact", "unknown"]
+    assert sorted(r.tier for r in clean_store.entity_chunk_pairs("it-layers")) == [
+        "exact",
+        "unknown",
+    ]
+    assert sorted(m.tier for m in clean_store.enrichment_for_persona("it-layers").mentions) == [
+        "exact",
+        "unknown",
+    ]
+    # And a re-import that carries no tier leaves the recorded one alone, as a stance does.
+    clean_store.upsert_enrichment(
+        Enrichment(mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")])
+    )
+    assert sorted(r.tier for r in clean_store.entity_mention_rows("it-layers")) == [
+        "exact",
+        "unknown",
+    ]
     assert clean_store.entity_mention_rows("it-layers", types=["person"]) == []
     assert clean_store.entity_mention_rows("it-layers", "absent") == []
     assert clean_store.entity_mention_rows("other-persona") == []

@@ -20,6 +20,7 @@ from graphrag.models import (
     Entity,
     EntityType,
     Mention,
+    MentionTier,
     PersonaSpec,
     Relation,
 )
@@ -35,6 +36,11 @@ class ExtractedEntity(BaseModel):
     name: str
     type: EntityType = "concept"
     description: str = ""
+    #: What this document says the entity *is*: a property of the thing, not of the document
+    #: that names it. Checked against the persona's vocabulary and written onto the ``Entity``
+    #: node by :func:`graphrag.extract.importer.import_extraction_file`. See
+    #: :mod:`graphrag.extract.attributes` for why an entity needs attributes of its own.
+    attributes: dict[str, str] = Field(default_factory=dict)
 
 
 class ExtractedRelation(BaseModel):
@@ -108,10 +114,14 @@ def windows(chunks: Sequence[Chunk], max_chars: int) -> list[list[Chunk]]:
 MIN_TOKEN_LEN = 4
 
 
-def match_chunks(name: str, window: Sequence[Chunk]) -> tuple[list[str], str]:
+def match_chunks(name: str, window: Sequence[Chunk]) -> tuple[list[str], MentionTier]:
     """Chunks that mention ``name``. Returns ``(chunk_ids, tier)`` with tier ``exact`` (verbatim,
     case-insensitive), ``loose`` (every significant token of the name occurs in the chunk, e.g.
-    "Lenny Rachitsky" vs a transcript that only says "Lenny") or ``none`` (first chunk)."""
+    "Lenny Rachitsky" vs a transcript that only says "Lenny") or ``none`` (first chunk).
+
+    The tier is the evidence the mention rests on, and it is stored on the mention rather than
+    only reported to the importer: the fourth tier, ``unknown``, is what a mention written before
+    this was recorded reads back as (:data:`graphrag.models.MentionTier`)."""
     lowered = name.lower()
     exact = [c.id for c in window if lowered in c.text.lower()]
     if exact:
@@ -130,7 +140,10 @@ def match_chunks(name: str, window: Sequence[Chunk]) -> tuple[list[str], str]:
 
 def result_to_enrichment(result: ExtractionResult, window: Sequence[Chunk]) -> Enrichment:
     """Map model output onto graph objects; a mention is attached to every chunk naming the entity
-    (see ``match_chunks``; the first chunk is the fallback so nothing is lost)."""
+    (see ``match_chunks``; the first chunk is the fallback so nothing is lost).
+
+    Each mention keeps the tier that found it, so how well the passage matched survives into the
+    graph instead of being thrown away at the end of this function."""
     entities: dict[str, Entity] = {}
     name_to_id: dict[str, str] = {}
     mentions: list[Mention] = []
@@ -144,8 +157,11 @@ def result_to_enrichment(result: ExtractionResult, window: Sequence[Chunk]) -> E
             Entity(id=entity_id, name=name, type=item.type, description=item.description.strip()),
         )
         name_to_id[name.lower()] = entity_id
-        hits, _tier = match_chunks(name, window)
-        mentions.extend(Mention(chunk_id=cid, entity_id=entity_id) for cid in hits)
+        hits, tier = match_chunks(name, window)
+        # The tier rides on the mention rather than being recomputed later: it is a fact about
+        # how *this* passage was found, and the passage's text can change under a re-ingest.
+        # It is what an edge's probability is derived from (Atlas §28.1, graphrag.sna.uncertain).
+        mentions.extend(Mention(chunk_id=cid, entity_id=entity_id, tier=tier) for cid in hits)
 
     relations: list[Relation] = []
     for rel in result.relations:

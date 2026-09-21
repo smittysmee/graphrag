@@ -48,10 +48,10 @@ One file per document, each named after the document's slug:
 Every sidecar carries the `doc_id` of the document it is about. That id, not the directory, is
 what ties the file to a document.
 
-**Extraction** — entities and relations, format and quality rules in the `graph-rag-enrich`
-skill (`.claude/skills/graph-rag-enrich/SKILL.md`, section 3). The rule that costs the most when
-broken: each `name` must occur **verbatim** in the text, or the mention anchors to the wrong
-passage and the check reports it as loose.
+**Extraction** — entities, their attributes and relations; format and quality rules in the
+`graph-rag-enrich` skill (`.claude/skills/graph-rag-enrich/SKILL.md`, section 3). The rule that
+costs the most when broken: each `name` must occur **verbatim** in the text, or the mention
+anchors to the wrong passage and the check reports it as loose.
 
 **Attribution** — who wrote which passage, for a document the loader reads as one body of prose:
 
@@ -67,10 +67,11 @@ passage and the check reports it as loose.
 `role` is `op` or `reply`; `date` and `score` may be `null`. A post whose anchor occurs in no
 passage is skipped, never guessed at.
 
-**Node attributes** — what a speaker or a document *is*, as opposed to what it says. A post may
-carry `"attributes": {"region": "north"}`, which goes on the speaker; an annotation file may
-carry a top-level `"attributes": {"region": "north"}`, which goes on the document, and a file may
-carry attributes and no annotations at all. Both are checked against the `attributes:` section of
+**Node attributes** — what a speaker, an entity or a document *is*, as opposed to what it says.
+An entity in an extraction file may carry `"attributes": {"region": "north"}`, which goes on the
+entity; a post may carry one, which goes on the speaker; an annotation file may carry a top-level
+`"attributes": {"region": "north"}`, which goes on the document, and a file may carry attributes
+and no annotations at all. All three are checked against the `attributes:` section of
 `personas/<persona>/facets.yaml`:
 
 ```yaml
@@ -81,14 +82,19 @@ attributes:
     description: As written.      # no values: free text
 ```
 
-Three rules make the tags worth measuring later:
+Four rules make the tags worth measuring later:
 
 - Tag only what the document states. A key you inferred from something the speaker merely
   mentions is not evidence, and it will be counted as though it were.
-- The first value written for a speaker wins. A second post that disagrees is reported as a
-  conflict and changes nothing, so decide which reading is right and fix the file.
+- The first value written for a speaker or an entity wins. A second file that disagrees is
+  reported as a conflict and changes nothing, so decide which reading is right and fix the file.
 - Leave the key out when the document does not say. An untagged node is outside every filtered
   network and every attribute measure, which is correct; a guessed one is worse than absent.
+- An entity attribute describes the **thing**, so it must hold in every document that names it:
+  "would this still be true in another document?" If not, it is a fact about this document and
+  belongs in the annotation file instead. Entities left untagged borrow their documents' values,
+  and because network edges come from those same documents, anything measured against a borrowed
+  label is circular — `sna analyze --by` reports it as such rather than as a finding.
 
 **Annotation** — what a passage says about something, and which function it is about:
 

@@ -30,7 +30,7 @@ from pathlib import Path
 import yaml
 
 from graphrag.graph.store import GraphStore
-from graphrag.models import Enrichment, Entity, Mention, Relation
+from graphrag.models import Enrichment, Entity, Mention, Relation, strongest_tier
 
 # One definition of how two spellings are compared, shared with the stores, which apply it
 # to the name on a node whose id an incoming entity has landed on.
@@ -182,7 +182,12 @@ def apply_aliases(enrichment: Enrichment, table: AliasTable) -> Enrichment:
         key = (mention.chunk_id, entity_id)
         seen = mentions.get(key)
         stance = (seen.stance if seen is not None else None) or mention.stance
-        mentions[key] = Mention(chunk_id=mention.chunk_id, entity_id=entity_id, stance=stance)
+        # Two spellings of one entity in one passage are two matches for the same claim, so the
+        # folded mention keeps the better-supported tier rather than the last one written.
+        tier = strongest_tier([mention.tier] if seen is None else [seen.tier, mention.tier])
+        mentions[key] = mention.model_copy(
+            update={"entity_id": entity_id, "stance": stance, "tier": tier}
+        )
 
     relations: dict[tuple[str, str, str, str], Relation] = {}
     for relation in enrichment.relations:

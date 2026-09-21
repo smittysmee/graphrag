@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # rather than let a dead run block every future sync forever.
     sync_lock_stale_seconds: float = 900.0
 
+    # ATL-ENT-3: an on-disk cache of built networks, keyed by persona, network kind, filters and
+    # the snapshot's own identity (`graphrag.sna.cache`). On by default -- the commands that
+    # build a network all take `--no-cache` for the one call that must skip it.
+    sna_cache: bool = True
+    sna_cache_dir: Path = Path("data/.cache/sna")
+
     mcp_host: str = "0.0.0.0"  # noqa: S104 - bound inside a container on purpose
     mcp_port: int = 8765
     embed_server_host: str = "0.0.0.0"  # noqa: S104

@@ -19,6 +19,7 @@ from graphrag.models import (
     Entity,
     Mention,
     PersonaSpec,
+    Relation,
     RetrievalConfig,
     SourceSpec,
     SpeakerPost,
@@ -483,6 +484,59 @@ def layered(
     return memory_store
 
 
+LAYERED_RELATIONS: tuple[tuple[str, str, str, str], ...] = (
+    ("product:alpha", "product:beta", "integrates_with", "post-1"),
+    ("product:alpha", "product:beta", "integrates_with", "post-3"),
+    ("product:beta", "product:alpha", "integrates_with", "post-1"),
+    ("product:alpha", "product:gamma", "competes_with", "post-2"),
+    ("product:alpha", "product:gamma", "competes_with", "post-4"),
+    ("product:gamma", "product:beta", "replaces", "post-3"),
+    ("product:gamma", "product:beta", "competes_with", "post-4"),
+)
+"""The relations an extraction pass wrote on top of the planted corpus above.
+
+Kept out of ``layered`` because the counts in its own tests are asserted by hand; a test that
+wants the directed network asks for ``related`` and gets both. Written as ``(source, target,
+type, post)`` so the answers can be read off the table rather than computed:
+
+===== ===== ================ ====== =========
+from  to    type             post   passages
+===== ===== ================ ====== =========
+Alpha Beta  integrates_with  1, 3   2
+Beta  Alpha integrates_with  1      1
+Alpha Gamma competes_with    2, 4   2
+Gamma Beta  replaces         3      1
+Gamma Beta  competes_with    4      1
+===== ===== ================ ====== =========
+
+So four directed edges over three connected pairs, one of them (Alpha-Beta) stated in both
+directions: reciprocity is 1/3 by the book's definition (§10.3, connected pairs reciprocated
+over connected pairs), where ``nx.overall_reciprocity`` would say 2/4. Gamma to Beta carries two
+types in two passages, which a simple directed graph folds into one edge of weight 2 typed with
+the alphabetically first of the tied types.
+"""
+
+
+@pytest.fixture
+def related(layered: InMemoryGraphStore) -> InMemoryGraphStore:
+    """``layered`` with the relations above, for the directed ``relations`` network."""
+    layered.upsert_enrichment(
+        Enrichment(
+            relations=[
+                Relation(
+                    source_id=source,
+                    target_id=target,
+                    type=kind,
+                    evidence=f"{slug} says so",
+                    chunk_id=f"{LAYERED_PERSONA}:{LAYERED_SOURCE}:{slug}#0",
+                )
+                for source, target, kind, slug in LAYERED_RELATIONS
+            ]
+        )
+    )
+    return layered
+
+
 @pytest.fixture
 def retriever(memory_store: InMemoryGraphStore, hash_embedder: HashEmbedder) -> Retriever:
     return Retriever(memory_store, hash_embedder)
@@ -499,6 +553,7 @@ def settings(tmp_path: Path) -> Settings:
         annotations_dir=tmp_path / "annotations",
         skills_dir=tmp_path / "skills",
         sync_lock_dir=tmp_path / "locks",
+        sna_cache_dir=tmp_path / "sna-cache",
         neo4j=Neo4jSettings(uri="bolt://unused:7687"),
         embedding=EmbeddingSettings(backend="hash", model="hash-test", dim=DIM),
     )

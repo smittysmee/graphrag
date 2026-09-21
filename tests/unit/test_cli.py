@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
 
+import networkx as nx
 from typer.testing import CliRunner
 
 from graphrag.app import AppContext
 from graphrag.cli import app
 from graphrag.ingest.validate import MAX_BODY_WORDS
 from graphrag.pipeline import IngestReport
+from graphrag.sna.cache import NetworkCache
 from tests.conftest import THREAD_POSTS, write_sample_corpus
 from tests.unit.test_validate import GOOD_META, write_capture
 
@@ -101,6 +103,46 @@ def test_sync_ingests_what_is_missing_then_goes_quiet(cli_context: AppContext) -
 
     unknown = runner.invoke(app, ["sync", "test-pm", "--source", "nope"])
     assert unknown.exit_code == 2
+
+
+def test_a_sync_that_writes_clears_the_persona_cache_and_leaves_another_alone(
+    cli_context: AppContext,
+) -> None:
+    """ATL-ENT-3 review fix: every write path clears its own persona's cache entries as its
+    last step, and only its own -- a stale entry left under another persona's id would be a
+    correctness bug the filters in the key alone cannot catch, since two personas can ask for
+    the same network and filters."""
+    cache = NetworkCache(cli_context.settings.sna_cache_dir)
+    cache.put("test-pm", "stale-key", nx.Graph())
+    cache.put("test-docs", "stale-key", nx.Graph())
+
+    write_sample_corpus(cli_context.settings.raw_dir / "test-pm")
+    done = runner.invoke(app, ["sync", "test-pm"])
+    assert done.exit_code == 0, done.output
+
+    assert cache.get("test-pm", "stale-key") is None
+    assert cache.get("test-docs", "stale-key") is not None
+
+    # A second sync with nothing new to do does not write, so it leaves what is there alone.
+    cache.put("test-pm", "stale-key", nx.Graph())
+    again = runner.invoke(app, ["sync", "test-pm"])
+    assert again.exit_code == 0, again.output
+    assert "nothing to sync" in again.stdout
+    assert cache.get("test-pm", "stale-key") is not None
+
+
+def test_sna_cache_clear_empties_every_persona(cli_context: AppContext) -> None:
+    cache = NetworkCache(cli_context.settings.sna_cache_dir)
+    cache.put("test-pm", "a", nx.Graph())
+    cache.put("test-docs", "b", nx.Graph())
+
+    result = runner.invoke(app, ["sna", "cache", "clear"])
+    assert result.exit_code == 0, result.output
+    assert "cleared" in result.stdout
+
+    assert cache.get("test-pm", "a") is None
+    assert cache.get("test-docs", "b") is None
+    assert list(cache.directory.rglob("*.pickle")) == []
 
 
 def test_sync_refreshes_attribution_when_asked(cli_context: AppContext) -> None:

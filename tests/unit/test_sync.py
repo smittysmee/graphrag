@@ -426,6 +426,31 @@ def test_a_document_that_already_has_entities_is_not_imported_again(
     assert summary_lines(report)[-1] == f"{PERSONA_ID}: nothing to sync"
 
 
+def test_refresh_extraction_re_imports_documents_that_already_have_entities(
+    synced: None,
+    memory_store: InMemoryGraphStore,
+    multi_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+) -> None:
+    """The flag is how an entity attribute added to an extraction file reaches a graph that
+    already has that document's entities, which the gap check alone never re-reads."""
+    doc_ids = sorted(memory_store.document_ids(PERSONA_ID, DOCS))
+    for doc_id in doc_ids:
+        give_entities(memory_store, doc_id)
+        write_extraction(enrichment_root / PERSONA_ID / DOCS, doc_id)
+    memory_store.set_entity_attributes(PERSONA_ID, "metric:existing", {"region": "south"})
+
+    report = run(memory_store, multi_persona, raw_root, enrichment_root, refresh_extraction=True)
+
+    docs = next(s for s in report.sources if s.source_id == DOCS)
+    assert docs.enrichment_files == len(doc_ids)
+    assert memory_store.entity_attributes(PERSONA_ID) == {}  # cleared, and no file restates it
+    assert summary_lines(report)[-1] == (
+        f"{PERSONA_ID}: nothing to ingest, re-imported {len(doc_ids)} extraction files"
+    )
+
+
 # ----------------------------------------------------------------------------- dry run
 
 
@@ -799,6 +824,94 @@ def test_a_refresh_is_how_node_attributes_reach_a_graph_that_already_has_the_lay
     assert memory_store.speaker_attributes(PERSONA_ID) == {"quill-maker": {"region": "north"}}
     assert memory_store.documents[threaded].attributes == {"region": "south"}
     assert any("attribute invalid: colour" in line for line in said)
+
+
+def _one_post_file(attribution_root: Path, threaded: str, region: str) -> None:
+    directory = attribution_root / PERSONA_ID / THREADS
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{threaded.rsplit(':', 1)[-1]}.json").write_text(
+        json.dumps(
+            {
+                "doc_id": threaded,
+                "posts": [
+                    {
+                        "speaker": "quill-maker",
+                        "anchor": THREAD_POSTS[0][2][:60],
+                        "role": "op",
+                        "attributes": {"region": region},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_refresh_lets_a_corrected_file_replace_the_value_its_old_version_wrote(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """First value wins, so a corrected attribution file used to be reported as a conflict with
+    its own earlier version and change nothing. A persona-wide refresh clears the stored speaker
+    values first; another persona's reading of the same shared speaker is left alone."""
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "quill-maker"
+    )
+    memory_store.set_speaker_attributes(PERSONA_ID, "quill-maker", {"region": "south"})
+    memory_store.set_speaker_attributes("someone-else", "quill-maker", {"region": "west"})
+    _one_post_file(attribution_root, threaded, "north")
+    said: list[str] = []
+
+    run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        refresh_attribution=True,
+        progress=said.append,
+    )
+
+    assert memory_store.speaker_attributes(PERSONA_ID) == {"quill-maker": {"region": "north"}}
+    assert memory_store.speaker_attributes("someone-else") == {"quill-maker": {"region": "west"}}
+    assert "cleared stored speaker attributes on 1 node(s) before re-reading" in said
+    assert not any("attribute conflict" in line for line in said)
+
+
+def test_a_one_source_refresh_clears_nothing(
+    threaded: str,
+    memory_store: InMemoryGraphStore,
+    thread_persona: PersonaSpec,
+    raw_root: Path,
+    enrichment_root: Path,
+    attribution_root: Path,
+) -> None:
+    """The other sources' files set values too and are not re-read, so a refresh limited to one
+    source keeps what is stored and reports the disagreement instead."""
+    memory_store.attach_speaker(
+        threaded, memory_store.document_chunks(threaded, 0, 1)[0].id, "quill-maker"
+    )
+    memory_store.set_speaker_attributes(PERSONA_ID, "quill-maker", {"region": "south"})
+    _one_post_file(attribution_root, threaded, "north")
+    said: list[str] = []
+
+    run(
+        memory_store,
+        thread_persona,
+        raw_root,
+        enrichment_root,
+        attribution_root=attribution_root,
+        refresh_attribution=True,
+        source_id=THREADS,
+        progress=said.append,
+    )
+
+    assert memory_store.speaker_attributes(PERSONA_ID) == {"quill-maker": {"region": "south"}}
+    assert any("attribute conflict" in line for line in said)
 
 
 def test_without_the_flag_a_rewritten_attribution_file_is_left_alone(

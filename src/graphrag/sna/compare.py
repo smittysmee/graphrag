@@ -16,6 +16,13 @@ The two builds are usually two time windows. They can be two attribute values in
 population of a corpus against another, with ``--where`` and ``--where2`` -- and every caution
 above holds unchanged, including the one that matters most: two populations that share no nodes
 produce no similarity score, and saying so is the finding.
+
+``--topology`` adds a second, independent reading (ch. 48, ATL-48): where the sections above ask
+whether the *nodes* both builds share moved, :mod:`graphrag.sna.topodist` asks whether the two
+builds' *whole topologies* look alike, node overlap or none at all. A before-and-after with no
+shared nodes still has a topological distance -- two node sets with nothing in common can still
+be two facsimiles of the same shape -- which is why the flag exists rather than folding into the
+node-based sections above.
 """
 
 from __future__ import annotations
@@ -23,20 +30,32 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import networkx as nx
 
 from graphrag import __version__
 from graphrag.graph.store import GraphStore
+from graphrag.sna.backbone import DEFAULT_ALPHA
 from graphrag.sna.cluster import LouvainResult, compare_partitions, louvain
-from graphrag.sna.export import Project, build_network, where_text
+from graphrag.sna.export import Project, describe, where_text
 from graphrag.sna.guide import ALWAYS
-from graphrag.sna.measures import CENTRALITIES, centrality, summary
+from graphrag.sna.layers import window_graph, windows
+from graphrag.sna.measures import (
+    centralities_for,
+    centrality,
+    centrality_meaning,
+    directed_notes,
+    summary,
+)
+from graphrag.sna.projection import DEFAULT_LAMBDA
+from graphrag.sna.topodist import TopologicalDistances, compare_topology, render_topology
 
 __all__ = [
     "Comparison",
     "RankChange",
     "Window",
+    "compare_payload",
     "compare_windows",
     "render_comparison",
 ]
@@ -45,6 +64,9 @@ __all__ = [
 TOP_CHANGES = 10
 #: Below this many shared nodes, a similarity score is noise and the report says so.
 MIN_SHARED = 10
+#: Accepted on any network, directed or not: the total degree these rank tables have always
+#: used. ``measures.centrality`` documents what it is on a digraph and the caption repeats it.
+CENTRALITY_ALWAYS = ("degree", "weighted_degree")
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,7 @@ class Comparison:
     left: tuple[str, ...] = ()
     similarity: dict[str, float] = field(default_factory=dict)
     changes: tuple[RankChange, ...] = ()
+    topology: TopologicalDistances | None = None
     seed: int | None = None
     generated_at: str = ""
     notes: tuple[str, ...] = ()
@@ -139,6 +162,8 @@ def compare_windows(
     until: str | None = None,
     since2: str | None = None,
     until2: str | None = None,
+    window: str | int | None = None,
+    step: str | int | None = None,
     source_id: str | None = None,
     min_weight: int | None = None,
     types: Sequence[str] | None = None,
@@ -146,11 +171,18 @@ def compare_windows(
     facets: Sequence[str] | None = None,
     where: Mapping[str, str] | None = None,
     where2: Mapping[str, str] | None = None,
+    projection: str = "simple",
+    lam: float = DEFAULT_LAMBDA,
+    backbone: str | None = None,
+    alpha: float = DEFAULT_ALPHA,
+    correction: str = "none",
+    threshold: float | None = None,
     project: Project | None = None,
     centrality_kind: str = "weighted_degree",
     resolution: float = 1.0,
     runs: int = 10,
     seed: int | None = None,
+    topology: bool = False,
 ) -> Comparison:
     """Build one network twice, and compare the two results.
 
@@ -161,24 +193,64 @@ def compare_windows(
     window is. Two attribute values are not two measurements of one thing any more than two
     windows are, which is why n comes first and the partitions are compared only over the nodes
     both builds hold.
-    """
-    if centrality_kind not in CENTRALITIES:
-        msg = f"centrality must be one of {', '.join(CENTRALITIES)}, got {centrality_kind!r}"
-        raise ValueError(msg)
 
-    def window(start: str | None, end: str | None, filters: Mapping[str, str] | None) -> Window:
-        graph = build_network(
+    ``backbone`` applies the same chapter 27 filter to both builds, and it has to be the same
+    one: two backbones are two networks, so a comparison across them would be reporting the
+    filter rather than the corpus. It runs inside :func:`graphrag.sna.layers.window_graph`, so a
+    window here and a snapshot there are filtered identically. ``projection`` is the same story
+    for chapter 26: both builds are weighted by the one scheme, because a weight of 3 under
+    ``simple`` and one of 0.46 under ``hyperbolic`` are not two measurements of the same thing,
+    and a comparison across them would report the scheme. Both builds' frames name it.
+
+    ``window`` and ``step`` are the general form of the two date pairs (Atlas §7.4): they cut
+    ``since``..``until`` into a grid of windows and compare the **first against the last**, which
+    is what a before-and-after over a dated corpus is. Every window in between is named in the
+    notes rather than silently dropped -- a grid of nine windows compared at its ends is a
+    comparison of two of them. Use :func:`graphrag.sna.layers.snapshots` when the whole sequence
+    is the question.
+
+    ``topology`` runs :func:`graphrag.sna.topodist.compare_topology` (ch. 48, ATL-48) over the
+    two builds' whole graphs and adds it as :attr:`Comparison.topology`. It needs no shared nodes
+    at all -- unlike every section above, it is not about the nodes both builds hold -- and is
+    skipped, with a note, when either build has fewer than two nodes, which is the smallest a
+    spectral distance can read a Laplacian from.
+    """
+    grid: list[tuple[str, str]] = []
+    if window is not None:
+        if since2 is not None or until2 is not None:
+            msg = "--window builds both date pairs, so it cannot be given with --since2/--until2"
+            raise ValueError(msg)
+        if not since or not until:
+            msg = "--window needs --since and --until to bound the grid it cuts"
+            raise ValueError(msg)
+        grid = windows(since, until, window, step)
+        if len(grid) < 2:
+            msg = (
+                f"a window of {window} over {since}..{until} makes one window; a before-and-after "
+                "needs two -- widen the range or narrow --window"
+            )
+            raise ValueError(msg)
+        (since, until), (since2, until2) = grid[0], grid[-1]
+
+    def build(start: str | None, end: str | None, filters: Mapping[str, str] | None) -> Window:
+        graph = window_graph(
             store,
-            network,
             persona_id,
+            network,
+            since=start,
+            until=end,
             source_id=source_id,
             min_weight=min_weight,
             types=types,
             stances=stances,
             facets=facets,
-            since=start,
-            until=end,
             where=filters,
+            projection=projection,
+            lam=lam,
+            backbone=backbone,
+            alpha=alpha,
+            correction=correction,
+            threshold=threshold,
             project=project,
         )
         result = (
@@ -195,8 +267,15 @@ def compare_windows(
             louvain_result=result,
         )
 
-    first = window(since, until, where)
-    second = window(since2, until2, where2 if where2 is not None else where)
+    first = build(since, until, where)
+    # Checked against the first build rather than against a fixed list: which centralities a
+    # network has is a property of the network, and on a directed one in_degree and out_degree
+    # are two of them (§6.2). Both builds are the same network kind, so one of them settles it.
+    allowed = centralities_for(first.graph)
+    if centrality_kind not in allowed and centrality_kind not in CENTRALITY_ALWAYS:
+        msg = f"centrality must be one of {', '.join(allowed)}, got {centrality_kind!r}"
+        raise ValueError(msg)
+    second = build(since2, until2, where2 if where2 is not None else where)
     nodes_a, nodes_b = set(first.graph.nodes), set(second.graph.nodes)
     shared = sorted(nodes_a & nodes_b)
 
@@ -220,6 +299,17 @@ def compare_windows(
     ]
     changes.sort(key=lambda c: (-abs(c.change), c.node))
 
+    topology_result: TopologicalDistances | None = None
+    topology_note = ""
+    if topology:
+        if first.graph.number_of_nodes() < 2 or second.graph.number_of_nodes() < 2:
+            topology_note = (
+                "--topology was asked for but skipped: a spectral distance needs at least two "
+                "nodes on each side, and at least one build has fewer than that."
+            )
+        else:
+            topology_result = compare_topology(first.graph, second.graph)
+
     return Comparison(
         persona_id=persona_id,
         network=network,
@@ -231,15 +321,35 @@ def compare_windows(
         left=tuple(sorted(nodes_a - nodes_b)),
         similarity=similarity,
         changes=tuple(changes[:TOP_CHANGES]),
+        topology=topology_result,
         seed=seed,
         generated_at=datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        notes=_notes(first, second, shared),
+        notes=(*_notes(first, second, shared, grid), *([topology_note] if topology_note else ())),
     )
 
 
-def _notes(a: Window, b: Window, shared: Sequence[str]) -> tuple[str, ...]:
-    """The things that make this particular comparison weaker than it looks."""
-    notes: list[str] = []
+def _notes(
+    a: Window, b: Window, shared: Sequence[str], grid: Sequence[tuple[str, str]] = ()
+) -> tuple[str, ...]:
+    """The things that make this particular comparison weaker than it looks.
+
+    A directed network says here what it says in an analysis report: which measures could not
+    read the direction, which summary numbers changed definition with it, and that Louvain
+    flattened the graph before partitioning it. Both builds produce the same sentences, so they
+    are said once.
+    """
+    notes: list[str] = list(directed_notes(a.graph))
+    if len(grid) > 2:
+        labels = ", ".join(f"{opens} to {closes}" for opens, closes in grid[1:-1])
+        notes.append(
+            f"The window grid holds {len(grid)} windows and only its ends are compared here. "
+            f"Not compared: {labels}. A history is not a before-and-after (Atlas §7.4); read the "
+            "whole sequence with sna layers or snapshots() before treating these two as a trend."
+        )
+    for window in (a, b):
+        note = window.louvain_result.note if window.louvain_result else ""
+        if note and note not in notes:
+            notes.append(note)
     for window in (a, b):
         nodes = int(window.summary["nodes"])
         if nodes == 0:
@@ -303,6 +413,8 @@ def render_comparison(comparison: Comparison) -> str:
         "",
         f"Generated {comparison.generated_at} by graphrag {__version__}{seed}",
         "",
+        f"**Network type.** {describe(a.graph).sentence}",
+        "",
         f"**Sampling frame.** {a.graph.graph.get('frame', '')}",
         "",
         *(
@@ -332,6 +444,9 @@ def render_comparison(comparison: Comparison) -> str:
             for window in (a, b)
         ],
     )
+
+    if comparison.topology is not None:
+        lines += render_topology(comparison.topology)
 
     lines += [
         "## Who entered and who left",
@@ -369,6 +484,8 @@ def render_comparison(comparison: Comparison) -> str:
     lines += [
         f"## Largest rank changes ({comparison.centrality})",
         "",
+        centrality_meaning(comparison.centrality, a.graph),
+        "",
         "Rank 1 is the highest score. Ranks are computed inside each build, so a climb can mean "
         "the node rose or that the nodes above it left.",
         "",
@@ -393,3 +510,54 @@ def render_comparison(comparison: Comparison) -> str:
     lines += [f"- {item}" for item in ALWAYS]
     lines += [f"- {note}" for note in comparison.notes]
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _window_payload(w: Window) -> dict[str, Any]:
+    return {
+        "since": w.since,
+        "until": w.until,
+        "where": w.where,
+        "label": w.label,
+        "summary": w.summary,
+    }
+
+
+def compare_payload(comparison: Comparison) -> dict[str, Any]:
+    """``comparison`` as the JSON `sna compare` writes with ``--json`` and the ``sna_compare``
+    MCP tool returns as ``payload`` -- the same :class:`Comparison` fields :func:`render_comparison`
+    reads, field for field (ATL-F1: one function both surfaces call, instead of each building
+    this dict inline). Each :class:`Window`'s graph itself is not included -- it is not
+    JSON-serialisable and every number about it is already in ``summary``."""
+    topo = comparison.topology
+    return {
+        "persona_id": comparison.persona_id,
+        "network": comparison.network,
+        "centrality": comparison.centrality,
+        "a": _window_payload(comparison.a),
+        "b": _window_payload(comparison.b),
+        "shared": list(comparison.shared),
+        "entered": list(comparison.entered),
+        "left": list(comparison.left),
+        "similarity": comparison.similarity,
+        "changes": [
+            {
+                "node": c.node,
+                "label": c.label,
+                "rank_a": c.rank_a,
+                "rank_b": c.rank_b,
+                "change": c.change,
+            }
+            for c in comparison.changes
+        ],
+        "topology": None
+        if topo is None
+        else {
+            "spectral_distance": topo.spectral.distance,
+            "netsimile_distance": topo.netsimile.distance,
+            "delta_con_similarity": topo.delta_con.similarity,
+            "portrait_divergence": topo.portrait.divergence,
+        },
+        "seed": comparison.seed,
+        "generated_at": comparison.generated_at,
+        "notes": list(comparison.notes),
+    }

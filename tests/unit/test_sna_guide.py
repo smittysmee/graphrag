@@ -43,8 +43,50 @@ def test_the_guide_covers_every_filtered_network_rule() -> None:
         for rule in rules:
             assert rule.name in text
             assert rule.rule in text
-    # signed networks, time windows, bipartite projections, node attributes
-    assert len(READING_RULES) == 4
+    # density, signed networks, time windows, bipartite projections, bipartite community
+    # discovery, projection weights, directed networks, layers and time, node attributes,
+    # homophily, sampling, against random, null models, backboning, random walks, degree,
+    # quantitative assortativity, node roles, hierarchies, high-order, paths and components,
+    # ranking, link prediction (predict-eval), link prediction simple graphs, signed and
+    # multilayer prediction, graph partitions, community evaluation, hierarchical communities,
+    # overlapping coverage, multilayer community discovery, robustness, motifs and mining,
+    # spreading, core-periphery, embeddings, visualization, node vector distance, graph
+    # summarization, topological distances, graph convolution, uncertain edges
+    assert len(READING_RULES) == 41
+    assert len(dict(READING_RULES)["Graph summarization (sna summarize)"]) == 4
+    assert (
+        len(dict(READING_RULES)["Multilayer community discovery (sna multilayer-communities)"]) == 5
+    )
+    assert len(dict(READING_RULES)["Node roles (sna roles)"]) == 5
+    assert len(dict(READING_RULES)["Visualization (sna draw)"]) == 7
+    assert len(dict(READING_RULES)["Hierarchies (--network relations / sna hierarchy)"]) == 5
+    assert len(dict(READING_RULES)["High-order (sna highorder)"]) == 4
+    assert len(dict(READING_RULES)["Overlapping coverage (sna overlap)"]) == 4
+    assert len(dict(READING_RULES)["Community evaluation (every grouping report)"]) == 5
+    assert len(dict(READING_RULES)["Node vector distance (sna distance)"]) == 8
+    assert (
+        len(
+            dict(READING_RULES)[
+                "Graph partitions (--method sbm|infomap|walktrap|label-propagation / sna community)"
+            ]
+        )
+        == 4
+    )
+    assert (
+        len(
+            dict(READING_RULES)[
+                "Hierarchical communities (louvain_levels / girvan_newman_dendrogram / hrg_fit)"
+            ]
+        )
+        == 2
+    )
+    assert (
+        len(
+            dict(READING_RULES)["Embeddings (sna.embed, --features spectral|node2vec|metapath2vec)"]
+        )
+        == 10
+    )
+    assert len(dict(READING_RULES)["Graph neural networks (sna complete, sna.gnn)"]) == 6
 
 
 def test_every_method_has_a_rationale_line_for_the_report() -> None:
@@ -62,4 +104,9 @@ def test_docs_and_skill_quote_the_rules_verbatim(path: Path) -> None:
     """
     if not path.exists():
         pytest.skip(f"{path} is not mounted in this container")
-    assert render_guide() in path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    block = render_guide()
+    assert block in text
+    # And the block is a block: a blank line between its last bullet and whatever heading comes
+    # next, which a regeneration that joins the two would quietly swallow.
+    assert text[text.index(block) + len(block) :].startswith("\n\n")

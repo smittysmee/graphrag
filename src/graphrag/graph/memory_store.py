@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from graphrag.embed.base import Matrix, Vector
+from graphrag.graph.store import AttributeKind
 from graphrag.graph.vectors import stack_means
 from graphrag.models import (
     Chunk,
@@ -23,9 +24,11 @@ from graphrag.models import (
     GraphStats,
     Mention,
     MentionStance,
+    MentionTier,
     PersonaSpec,
     RelatedTopic,
     Relation,
+    RelationRow,
     ScoredChunk,
     SpeakerCount,
     SpeakerDocument,
@@ -34,6 +37,7 @@ from graphrag.models import (
     TopicCount,
     TopicEdge,
     merge_entity,
+    strongest_tier,
 )
 
 TOKEN = re.compile(r"[a-z0-9]+")
@@ -73,6 +77,7 @@ class InMemoryGraphStore:
         #: (persona_id, speaker) -> attributes. Keyed on the persona because a speaker name is
         #: shared between personas exactly as the Neo4j ``Speaker`` node is.
         self.speaker_attrs: dict[tuple[str, str], dict[str, str]] = {}
+        self.entity_attrs: dict[tuple[str, str], dict[str, str]] = {}
         self.dim: int | None = None
 
     # ------------------------------------------------------------- lifecycle
@@ -127,11 +132,18 @@ class InMemoryGraphStore:
             if index is None:
                 self.mentions.append(mention)
                 existing[key] = len(self.mentions) - 1
-            elif mention.stance is not None:
+                continue
+            stored = self.mentions[index]
+            update: dict[str, object] = {}
+            if mention.stance is not None:
                 # A re-import must not erase an annotation, but may set one that was missing.
-                self.mentions[index] = self.mentions[index].model_copy(
-                    update={"stance": mention.stance}
-                )
+                update["stance"] = mention.stance
+            if mention.tier != "unknown":
+                # The incoming tier is a fresh measurement of the passage the mention sits in, so
+                # it wins; a re-import that does not carry one leaves the recorded tier alone.
+                update["tier"] = mention.tier
+            if update:
+                self.mentions[index] = stored.model_copy(update=update)
         seen = {(r.source_id, r.target_id, r.type, r.chunk_id) for r in self.relations}
         for rel in enrichment.relations:
             if (rel.source_id, rel.target_id, rel.type, rel.chunk_id) not in seen:
@@ -174,6 +186,10 @@ class InMemoryGraphStore:
         moved = 0
         kept: list[Mention] = []
         stances: dict[tuple[str, str], Stance | None] = {}
+        # Two spellings mentioned in one passage merge into one mention, so the surviving one
+        # keeps the best-supported tier of the two: folding two nodes together is not evidence
+        # that either match was worse than it was.
+        tiers: dict[tuple[str, str], MentionTier] = {}
         for mention in self.mentions:
             if mention.entity_id in stale and mention.chunk_id in chunk_ids:
                 moved += 1
@@ -182,11 +198,18 @@ class InMemoryGraphStore:
             if mention.entity_id == target_id:
                 if key in stances:
                     stances[key] = stances[key] or mention.stance
+                    tiers[key] = strongest_tier([tiers[key], mention.tier])
                     continue
                 stances[key] = mention.stance
+                tiers[key] = mention.tier
             kept.append(mention)
         self.mentions = [
-            m.model_copy(update={"stance": stances[(m.chunk_id, m.entity_id)]})
+            m.model_copy(
+                update={
+                    "stance": stances[(m.chunk_id, m.entity_id)],
+                    "tier": tiers[(m.chunk_id, m.entity_id)],
+                }
+            )
             if m.entity_id == target_id
             else m
             for m in kept
@@ -214,6 +237,7 @@ class InMemoryGraphStore:
         }
         for entity_id in stale - alive:
             self.entities.pop(entity_id, None)
+        self._drop_dead_entity_attributes()
         return moved
 
     def delete_orphan_entities(self, persona_id: str, *, dry_run: bool = False) -> int:
@@ -238,7 +262,18 @@ class InMemoryGraphStore:
         self.relations = [
             r for r in self.relations if r.source_id not in orphans and r.target_id not in orphans
         ]
+        self._drop_dead_entity_attributes()
         return len(orphans)
+
+    def _drop_dead_entity_attributes(self) -> None:
+        """Forget what was claimed about entities that are no longer nodes.
+
+        An attribute is a claim about a thing the corpus names. Once the node is gone -- folded
+        into another spelling, or swept because nothing mentions it -- there is nothing left for
+        the claim to be about, and keeping it would quietly re-attach it to whatever later took
+        that id. The Neo4j store gets this for free: the attributes are properties of the node.
+        """
+        self.entity_attrs = {k: v for k, v in self.entity_attrs.items() if k[1] in self.entities}
 
     def delete_documents(self, doc_ids: Sequence[str]) -> None:
         wanted = set(doc_ids)
@@ -263,6 +298,7 @@ class InMemoryGraphStore:
         self.relations = [r for r in self.relations if r.chunk_id not in chunk_ids]
         self.personas.pop(persona_id, None)
         self.speaker_attrs = {k: v for k, v in self.speaker_attrs.items() if k[0] != persona_id}
+        self.entity_attrs = {k: v for k, v in self.entity_attrs.items() if k[0] != persona_id}
         self.delete_orphan_entities(persona_id)
 
     # ------------------------------------------------------------- search
@@ -447,6 +483,17 @@ class InMemoryGraphStore:
             per_persona=dict(per),
         )
 
+    def persona_fingerprint(self, persona_id: str) -> tuple[int, int, int, int]:
+        chunk_ids = {cid for cid, chunk in self.chunks.items() if chunk.persona_id == persona_id}
+        documents = sum(1 for doc in self.documents.values() if doc.persona_id == persona_id)
+        mentions = sum(1 for m in self.mentions if m.chunk_id in chunk_ids)
+        attributed = (
+            len(self.document_attributes(persona_id))
+            + len(self.entity_attributes(persona_id))
+            + len(self.speaker_attributes(persona_id))
+        )
+        return documents, len(chunk_ids), mentions, attributed
+
     def run_readonly_cypher(
         self, query: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -517,6 +564,26 @@ class InMemoryGraphStore:
             held.setdefault(key, value)
         return refused
 
+    def set_entity_attributes(
+        self, persona_id: str, entity_id: str, attributes: Mapping[str, str]
+    ) -> list[str]:
+        """Record what this persona's corpus says the entity is. Returns the keys it refused.
+
+        The speaker rule, for the same reason: one entity is named by many documents, so many
+        extraction files can claim it, and the first value written stands rather than whichever
+        file was imported last. An entity no passage mentions is not an entity, so an id the
+        graph does not hold refuses every key: nothing is written, and the caller is told so
+        rather than being left to count it as landed.
+        """
+        wanted = {key: value for key, value in attributes.items() if value}
+        if entity_id not in self.entities:
+            return list(wanted)
+        held = self.entity_attrs.setdefault((persona_id, entity_id), {})
+        refused = [key for key, value in wanted.items() if held.get(key, value) != value]
+        for key, value in wanted.items():
+            held.setdefault(key, value)
+        return refused
+
     def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None:
         document = self.documents.get(doc_id)
         if document is None:
@@ -538,6 +605,27 @@ class InMemoryGraphStore:
             for doc in self.documents.values()
             if doc.persona_id == persona_id and doc.attributes
         }
+
+    def entity_attributes(self, persona_id: str) -> dict[str, dict[str, str]]:
+        return {
+            entity_id: dict(attrs)
+            for (pid, entity_id), attrs in self.entity_attrs.items()
+            if pid == persona_id and attrs
+        }
+
+    def clear_attributes(self, persona_id: str, kind: AttributeKind) -> int:
+        if kind == "document":
+            cleared = 0
+            for doc_id, doc in list(self.documents.items()):
+                if doc.persona_id == persona_id and doc.attributes:
+                    self.documents[doc_id] = doc.model_copy(update={"attributes": {}})
+                    cleared += 1
+            return cleared
+        held = self.speaker_attrs if kind == "speaker" else self.entity_attrs
+        keys = [key for key, attrs in held.items() if key[0] == persona_id and attrs]
+        for key in keys:
+            del held[key]
+        return len(keys)
 
     # ------------------------------------------------------------- annotation
     def _mention_index(self, doc_id: str, chunk_id: str, entity: str) -> int | None:
@@ -688,9 +776,37 @@ class InMemoryGraphStore:
                     type=entity.type,
                     chunk_id=chunk.id,
                     doc_id=chunk.doc_id,
+                    tier=mention.tier,
                 )
             )
         rows.sort(key=lambda r: (r.entity_id, r.chunk_id))
+        return rows
+
+    def relation_rows(self, persona_id: str, source_id: str | None = None) -> list[RelationRow]:
+        wanted = self.document_ids(persona_id, source_id)
+        rows: list[RelationRow] = []
+        for relation in self.relations:
+            chunk = self.chunks.get(relation.chunk_id)
+            source = self.entities.get(relation.source_id)
+            target = self.entities.get(relation.target_id)
+            if chunk is None or source is None or target is None:
+                continue
+            if chunk.doc_id not in wanted:
+                continue
+            rows.append(
+                RelationRow(
+                    source_id=source.id,
+                    source_name=source.name,
+                    source_type=source.type,
+                    target_id=target.id,
+                    target_name=target.name,
+                    target_type=target.type,
+                    type=relation.type,
+                    chunk_id=chunk.id,
+                    doc_id=chunk.doc_id,
+                )
+            )
+        rows.sort(key=lambda r: (r.source_id, r.target_id, r.type, r.chunk_id))
         return rows
 
     def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]:
@@ -756,6 +872,7 @@ class InMemoryGraphStore:
                     stance=mention.stance,
                     speakers=list(chunk.speakers),
                     document_attributes=dict(self.documents[chunk.doc_id].attributes),
+                    tier=mention.tier,
                 )
             )
         rows.sort(key=lambda r: (r.entity_id, r.chunk_id))
