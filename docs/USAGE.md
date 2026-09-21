@@ -280,6 +280,28 @@ The dry run reports names that do not occur in any passage and relations pointin
 entities, so you can fix the JSON before writing. Import is idempotent, so re-running everything is
 cheap and safe.
 
+An entity may also carry `attributes`, which describe the *entity* rather than the document that
+names it and go onto the `Entity` node:
+
+```json
+{"name": "Northwind Ledger", "type": "company",
+ "description": "one sentence grounded in the document",
+ "attributes": {"region": "north"}}
+```
+
+They are checked against the persona's vocabulary, below, and scoped to the persona, because an
+`Entity` node is shared between personas and a reading written for one corpus is not a fact about
+the other. One entity is named by many documents, so many files can claim it: the first value
+written wins and a second file that disagrees is reported as
+`attribute conflict: <entity id> <key> <kept> vs <incoming>` rather than overwriting.
+
+Tag the property of the thing, not of the document — a sector, a discipline, something that holds
+wherever the entity turns up. This is what makes network analysis over entities answerable: an
+entity with no value of its own borrows the majority of its documents, and because the edges of
+every network come from those same documents, an assortativity measured against a borrowed label
+is circular. `graphrag sna analyze --by` reports the provenance of every label and withholds its
+verdict when most were borrowed. See [SNA.md](SNA.md).
+
 There is also an unattended path that calls the API directly, `make enrich PERSONA=<id> LIMIT=10`,
 which needs `ANTHROPIC_API_KEY` in `.env`. The agent path needs no key and was used for the
 existing corpus.
@@ -483,8 +505,8 @@ An annotation file may also carry a top-level `attributes` object, which describ
 ```
 
 A file may carry attributes and no annotations at all: a document nobody has a reading of still
-belongs to a part of the corpus. Document attributes are what `graphrag sna --where` cuts an
-entity or topic network by, and what `--by` partitions one by.
+belongs to a part of the corpus. Document attributes are what `graphrag sna --where` cuts a topic
+network by, and an entity network for the keys its entities carry no value of their own for.
 
 When the persona keeps a `facets.yaml`, facets outside it are reported and dropped, and the same
 file declares which attributes exist:
@@ -504,8 +526,9 @@ attributes:
 A key with `values` is closed, so a value outside the list is reported and dropped, per entry; a
 key without `values` is free text, which is the right shape for something nobody can enumerate in
 advance. Without the `attributes:` section, any key and value is accepted. `graphrag layers
-check` counts what the vocabulary refused as loose, under `speaker attribute invalid` and
-`document attribute invalid`, so a tagging pass that invented a value fails visibly.
+check` counts what the vocabulary refused as loose, under `entity attribute invalid`,
+`speaker attribute invalid` and `document attribute invalid`, so a tagging pass that invented a
+value fails visibly. The three are kept apart because each sends a reviewer to a different file.
 
 Without that file, any facet is accepted. Import is idempotent, and `make sync` re-imports these
 files on the same two triggers as the other layers: a source it had to re-ingest, and a document
@@ -513,10 +536,11 @@ sitting in the graph with no stance and no facet.
 
 ### Analyse the networks
 
-Three networks sit inside the graph and nobody has to build them: who appears alongside whom
-(speakers sharing a document), what is discussed together (entities sharing a passage), and how
-the ingestion topics co-occur. `graphrag sna` measures them, groups them, and checks whether the
-grouping means anything.
+Five networks sit inside the graph and nobody has to build them: who appears alongside whom
+(speakers sharing a document), what is discussed together (entities sharing a passage), how the
+ingestion topics co-occur, who wrote about what (speakers and entities as two modes), and what
+the corpus states about one entity in relation to another (the directed `relations` network).
+`graphrag sna` measures them, groups them, and checks whether the grouping means anything.
 
 ```bash
 # which network, which method, and what each one is for
@@ -540,6 +564,16 @@ Pass `--seed` so the run can be repeated, and write under `/app/data/` so the fi
 container. The report carries the method rationale, the stability score, the null-model z-score
 and the caveats, so it can go into a corpus as a research note unedited.
 
+`--out` (markdown) and `--json` next to it are both optional on every report-producing `sna`
+command: leave them off and the same report prints to the console instead, exactly as above --
+useful for a first look before deciding a run is worth keeping as a file.
+
+Every `sna` command also ends its report with `## Provenance` -- the method, every argument it
+ran with, the seed, the tool version, and the corpus commit the persona's snapshot was exported
+from -- so a number in a research note can be reproduced without re-reading the command that made
+it. Add `--cite` to also print `## References`: the book's own citation, then the reference for
+each Atlas chapter that report answers, for a note that is going somewhere citations get checked.
+
 If the corpus carries node attributes, two more questions open up. `--where key=value` builds the
 network over one population of it, and `--by key` asks whether the network divides along that
 attribute at all, against a null that shuffles the labels and one that rewires the graph:
@@ -555,8 +589,11 @@ docker compose run --rm graphrag graphrag sna analyze <persona> \
 An attribute is a hypothesis about where a network divides, not a finding, and the report is
 written to be as able to say no as yes.
 
-[SNA.md](SNA.md) has the full reference: which method for which question, how to read a z-score,
-and what to do when silhouette and BIC disagree.
+Every one of these is also an MCP tool for an agent -- `sna_analyze`, `sna_export`, `sna_guide`,
+one `sna_<command>` per line of `graphrag sna --help` -- returning the same report text and JSON
+payload in one call instead of files to read back. [SNA.md](SNA.md) has the full reference: which
+method for which question, how to read a z-score, what to do when silhouette and BIC disagree,
+and the tool names.
 
 ### Share a persona with someone
 

@@ -8,10 +8,19 @@ Layout of ``data/snapshots/<persona>/``::
     embeddings.npy       float32 (n_chunks, dim)
     enrichment.json.gz   entities / mentions / relations (may be empty)
     speakers.json.gz     speaker -> attributes, for the speakers an attribution pass tagged
+    entities.json.gz     entity id -> attributes, for the entities an extraction pass tagged
 
-``speakers.json.gz`` is the one file a snapshot written before node attributes existed does not
-have, so loading treats it as optional; everything else a snapshot holds has always been there.
-Document attributes need no file of their own, because a ``Document`` carries them.
+A snapshot is also where an old mention tier goes missing. ``enrichment.json.gz`` holds the
+mentions as models, so a mention written before the tier existed simply has no ``tier`` key and
+loads as ``unknown`` -- which is a documented reading, not a match (:data:`graphrag.models.
+MentionTier`), and every report that prices an edge from the tier says how many of its edges
+rest on one.
+
+``speakers.json.gz`` and ``entities.json.gz`` are the two files a snapshot written before node
+attributes existed does not have, so loading treats each as optional; everything else a snapshot
+holds has always been there. Document attributes need no file of their own, because a
+``Document`` carries them, and an ``Entity`` does not: its attributes are persona-scoped, so
+they live beside the enrichment rather than on the shared node the enrichment describes.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ CHUNKS = "chunks.jsonl.gz"
 EMBEDDINGS = "embeddings.npy"
 ENRICHMENT = "enrichment.json.gz"
 SPEAKERS = "speakers.json.gz"
+ENTITIES = "entities.json.gz"
 LOAD_BATCH = 1000
 
 
@@ -102,6 +112,9 @@ def export_snapshot(
 
     with gzip.open(target / SPEAKERS, "wt", encoding="utf-8") as fh:
         fh.write(json.dumps(store.speaker_attributes(persona.id), indent=2, sort_keys=True))
+
+    with gzip.open(target / ENTITIES, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(store.entity_attributes(persona.id), indent=2, sort_keys=True))
 
     manifest = SnapshotManifest(
         persona_id=persona.id,
@@ -190,21 +203,34 @@ def load_snapshot(
     if speaker_file.exists():
         # Written after the chunks, because a speaker is a node only once a passage records it.
         with gzip.open(speaker_file, "rt", encoding="utf-8") as fh:
-            for speaker, attributes in _speaker_attributes(fh.read()).items():
+            for speaker, attributes in _node_attributes(fh.read()).items():
                 store.set_speaker_attributes(persona.id, speaker, attributes)
+
+    entity_file = target / ENTITIES
+    if entity_file.exists():
+        # Written after the enrichment, for the reason speakers are written after the chunks:
+        # the store refuses attributes for an entity no passage of this persona mentions.
+        with gzip.open(entity_file, "rt", encoding="utf-8") as fh:
+            for entity_id, attributes in _node_attributes(fh.read()).items():
+                store.set_entity_attributes(persona.id, entity_id, attributes)
     if on_progress:
         on_progress(f"{persona.id}: loaded")
     return manifest
 
 
-def _speaker_attributes(raw: str) -> dict[str, dict[str, str]]:
-    """``speakers.json.gz`` as a mapping, ignoring anything that is not two levels of strings."""
+def _node_attributes(raw: str) -> dict[str, dict[str, str]]:
+    """``speakers.json.gz`` or ``entities.json.gz`` as a mapping.
+
+    Anything that is not two levels of strings is ignored: both files are written by this module
+    and read back by it, so a shape it did not write is a corrupted snapshot, not input to be
+    interpreted.
+    """
     loaded = json.loads(raw or "{}")
     if not isinstance(loaded, dict):
         return {}
     return {
-        str(speaker): {str(key): str(value) for key, value in attributes.items()}
-        for speaker, attributes in loaded.items()
+        str(node): {str(key): str(value) for key, value in attributes.items()}
+        for node, attributes in loaded.items()
         if isinstance(attributes, dict)
     }
 

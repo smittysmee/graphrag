@@ -39,7 +39,8 @@ Run 5-6 subagents at a time; wait for the batch, validate, import, then start th
   "doc_id": "product-leader:lennys-podcast:<slug>",
   "entities": [
     {"name": "Canonical Name", "type": "person|company|product|framework|concept|book|metric|regulation|other",
-     "description": "one sentence, your own words, grounded in the document"}
+     "description": "one sentence, your own words, grounded in the document",
+     "attributes": {"<key>": "<value>"}}
   ],
   "relations": [
     {"source": "Canonical Name", "target": "Canonical Name", "type": "UPPER_SNAKE_VERB",
@@ -64,6 +65,27 @@ Quality rules:
 - Descriptions and evidence are paraphrases. Never copy sentences from the source.
 - Valid JSON only: no trailing commas, no comments, no markdown fences.
 
+### `attributes` (optional): what the entity *is*
+Omit the key entirely unless the persona declares an `attributes:` block in
+`personas/<persona>/facets.yaml`; read that file first and use only the keys and values it
+declares. A key or value outside it is reported and dropped, per key, by the importer.
+
+An attribute is a property of the **thing**, not of the document that names it: the sector a
+company is in, the discipline a framework belongs to. It must be the same wherever the entity
+turns up, so ask "would this still be true in another episode?" before writing it. If the answer
+is no, it is a fact about the document and belongs in that document's annotation file instead.
+
+Tag only what the document states. A tagger that cannot point at the sentence leaves the key out;
+an untagged entity is honestly untagged, and is reported as such. Two documents that disagree
+about one entity are reported as a conflict and the first value written stands, so a guess costs
+more than a gap.
+
+This is what makes network analysis over entities possible at all. Without it, an entity's
+attributes are borrowed from the documents that mention it, and those are the same documents the
+edges are drawn from -- so "entities of this kind cluster together" comes out true by
+construction. `graphrag sna analyze --by` reports such a result as circular rather than as a
+finding. See `.claude/skills/graph-rag-sna/SKILL.md`.
+
 ## 4. Validate, then import
 ```bash
 docker compose run --rm -T graphrag graphrag enrich-import product-leader \
@@ -71,7 +93,10 @@ docker compose run --rm -T graphrag graphrag enrich-import product-leader \
 docker compose run --rm -T graphrag graphrag enrich-import product-leader \
   /app/data/enrichment/*.json                                           # writes graph + snapshot
 ```
-The report lists **unmatched names** (entity name not found verbatim in any passage: fix the
+The report lists **attribute problems** (a key or value the persona's vocabulary does not
+declare: fix it or drop it), **attribute conflicts** (another document already claimed a
+different value for that entity: the stored value stands, and one of the two files is wrong),
+**unmatched names** (entity name not found verbatim in any passage: fix the
 name or drop the entity) and **dangling relations** (endpoint not in `entities`: add it or drop
 the relation). Fix the JSON and re-run; import is idempotent (MERGE by entity id).
 Re-importing everything is safe and takes seconds.

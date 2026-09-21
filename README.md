@@ -109,6 +109,8 @@ make lsp                # python-lsp-server over stdio for your editor
 | [SDLC.md](docs/SDLC.md) | Which persona applies at which stage |
 | [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Testing conventions, LSP setup |
 | [SNA.md](docs/SNA.md) | Network analysis: centrality, communities, clustering |
+| [SNA_FOUNDATIONS.md](docs/SNA_FOUNDATIONS.md) | The probability, statistics and linear algebra `sna` assumes, mapped to the book — and what is documented rather than built |
+| [ATLAS_PLAN.md](docs/ATLAS_PLAN.md) | The programme taking `sna` to full coverage of *The Atlas for the Aspiring Network Scientist*: coverage matrix, tickets, waves, orchestration |
 | [MARKET_INVESTIGATION.md](docs/MARKET_INVESTIGATION.md) | A repeatable method for investigating an adoption problem with the graph |
 | [NOTICE.md](NOTICE.md) | Attribution, third-party licenses, what you may redistribute |
 

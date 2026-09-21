@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from graphrag.app import AppContext
@@ -571,6 +572,45 @@ def test_the_cli_reports_a_dry_run_before_it_writes(
     missing = tmp_path / "missing.json"
     missing.write_text(json.dumps({"doc_id": "nope", "annotations": []}))
     assert runner.invoke(app, ["annotations-import", "test-docs", str(missing)]).exit_code == 2
+
+
+def test_a_reimport_clears_the_persona_cache_even_when_it_adds_nothing_new(
+    cli_context: AppContext, thread_document: str, annotated_thread: dict[str, str], tmp_path: Path
+) -> None:
+    """ATL-ENT-3 review fix: the sidecar importers write through `set_document_attributes` /
+    `annotate_mention` / `annotate_chunk`, none of which sync's own `report.wrote` bookkeeping
+    covers, so this command clears unconditionally on any non-dry-run call -- including a second
+    import of the exact same file, which changes nothing but still ran the writer."""
+    from typer.testing import CliRunner
+
+    from graphrag.cli import app
+    from graphrag.sna.cache import NetworkCache
+
+    runner = CliRunner()
+    write_facets(cli_context.settings.personas_dir, "test-docs")
+    file = write_annotations(
+        tmp_path / "thread.json",
+        thread_document,
+        [annotation(FIRST, entity="Handbook", stance="praise")],
+    )
+    assert runner.invoke(app, ["annotations-import", "test-docs", str(file)]).exit_code == 0
+
+    cache = NetworkCache(cli_context.settings.sna_cache_dir)
+    cache.put("test-docs", "stale-key", nx.Graph())
+    cache.put("test-pm", "stale-key", nx.Graph())
+
+    # Same file again: nothing new for `report_lines` to say, but the writer still ran.
+    again = runner.invoke(app, ["annotations-import", "test-docs", str(file)])
+    assert again.exit_code == 0, again.output
+
+    assert cache.get("test-docs", "stale-key") is None
+    assert cache.get("test-pm", "stale-key") is not None
+
+    # A dry run, by contrast, writes nothing and must not clear anything.
+    cache.put("test-docs", "stale-key", nx.Graph())
+    dry = runner.invoke(app, ["annotations-import", "test-docs", str(file), "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert cache.get("test-docs", "stale-key") is not None
 
 
 def test_each_files_loose_lines_print_under_its_own_file(

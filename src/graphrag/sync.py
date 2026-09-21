@@ -58,7 +58,7 @@ from graphrag.extract.annotations import EntityIndex, FacetTable, import_annotat
 from graphrag.extract.attributes import EMPTY_ATTRIBUTES, AttributeTable
 from graphrag.extract.attribution import import_attribution_file
 from graphrag.extract.importer import import_extraction_file, read_doc_id
-from graphrag.graph.store import GraphStore
+from graphrag.graph.store import AttributeKind, GraphStore
 from graphrag.ingest.loaders import iter_source_files, load_source
 from graphrag.ingest.validate import DOCUMENT_SUFFIXES, ValidationReport, validate_files
 from graphrag.models import PersonaSpec, SourceSpec
@@ -240,6 +240,7 @@ class SourceReport:
     annotation_errors: tuple[str, ...] = ()
     attribution_refreshed: bool = False  # every attribution file was re-imported, not only gaps
     annotation_refreshed: bool = False  # every annotation file was re-imported, not only gaps
+    extraction_refreshed: bool = False  # every extraction file was re-imported, not only gaps
     invalid: bool = False  # a `documents` source with missing docs whose captures broke the
     # corpus contract, so the re-ingest that would have filled `missing` was refused
     invalid_files: int = 0  # captured files checked when refusing
@@ -291,6 +292,11 @@ class SyncReport:
     def refreshed_attribution(self) -> bool:
         """Whether this run re-imported attribution files it was not asked to by a gap."""
         return any(s.attribution_refreshed for s in self.sources)
+
+    @property
+    def refreshed_extraction(self) -> bool:
+        """Whether this run re-imported extraction files it was not asked to by a gap."""
+        return any(s.extraction_refreshed for s in self.sources)
 
     @property
     def refreshed_annotations(self) -> bool:
@@ -382,6 +388,15 @@ def index_annotations(annotation_root: Path | None) -> dict[str, list[Path]]:
     return index_extractions(annotation_root) if annotation_root else {}
 
 
+REFRESH_CLEARS: dict[str, AttributeKind] = {
+    "attribution": "speaker",
+    "extraction": "entity",
+    "annotation": "document",
+}
+"""Which stored attribute values each refresh clears before re-reading: the kind of node that
+kind of sidecar says what it is (CLAUDE.md, node attributes)."""
+
+
 def sync_persona(
     persona: PersonaSpec,
     *,
@@ -397,6 +412,7 @@ def sync_persona(
     source_id: str | None = None,
     refresh_attribution: bool = False,
     refresh_annotations: bool = False,
+    refresh_extraction: bool = False,
     allow_invalid: bool = False,
     dry_run: bool = False,
     progress: Progress | None = None,
@@ -409,6 +425,13 @@ def sync_persona(
     ``refresh_attribution`` and ``refresh_annotations`` re-import every sidecar of that kind
     rather than only the ones filling a gap, which is what a rewritten file needs: it names a
     document that already has the layer, so nothing else would pick the new fields up.
+    ``refresh_extraction`` does the same for extraction files, which is how entity attributes
+    added to files already in the graph get there.
+
+    A refresh over the whole persona first clears the attribute values that kind of sidecar owns
+    (:data:`REFRESH_CLEARS`): the first value written wins, so without the clear a corrected file
+    could never replace the value its earlier version wrote. A refresh limited to one source
+    clears nothing, because the other sources' files, which it does not re-read, set values too.
 
     A `documents` source that is missing documents is checked against the corpus contract
     (:func:`graphrag.ingest.validate.validate_files`) before it is re-ingested, exactly as
@@ -419,6 +442,16 @@ def sync_persona(
     the check, as it does for ``ingest``.
     """
     say = progress or (lambda _msg: None)
+    if source_id is None and not dry_run:
+        refreshing = {
+            "attribution": refresh_attribution,
+            "extraction": refresh_extraction,
+            "annotation": refresh_annotations,
+        }
+        for layer, kind in REFRESH_CLEARS.items():
+            if refreshing[layer]:
+                cleared = store.clear_attributes(persona.id, kind)
+                say(f"cleared stored {kind} attributes on {cleared} node(s) before re-reading")
     extractions = index_extractions(enrichment_root)
     attributions = index_attributions(attribution_root)
     annotations = index_annotations(annotation_root)
@@ -454,7 +487,9 @@ def sync_persona(
         voices = attributions.get(key, [])
         readings = annotations.get(key, [])
         if dry_run:
-            pending = _pending(store, persona, source, files, reingested=bool(missing))
+            pending = _pending(
+                store, persona, source, files, reingested=bool(missing) or refresh_extraction
+            )
             waiting = _pending_attribution(
                 store,
                 persona,
@@ -480,6 +515,7 @@ def sync_persona(
                     annotation_files=len(unread),
                     attribution_refreshed=refresh_attribution,
                     annotation_refreshed=refresh_annotations,
+                    extraction_refreshed=refresh_extraction,
                     invalid=invalid,
                     invalid_files=invalid_files,
                     invalid_documents=len(found_missing) if invalid else 0,
@@ -497,8 +533,12 @@ def sync_persona(
             if ingested.orphans_removed:
                 say(f"{source.id}: removed {ingested.orphans_removed} orphaned entities")
         # After the re-ingest, so the documents it replaced count as needing their entities back.
-        pending = _pending(store, persona, source, files, reingested=bool(missing))
-        imported, errors = _reimport(store, pending, say, aliases, reingested=bool(missing))
+        pending = _pending(
+            store, persona, source, files, reingested=bool(missing) or refresh_extraction
+        )
+        imported, errors = _reimport(
+            store, pending, say, aliases, attributes, reingested=bool(missing) or refresh_extraction
+        )
         # Likewise for speakers: a re-ingest deleted the chunks their SPOKE edges hung off.
         waiting = _pending_attribution(
             store, persona, source, voices, reingested=bool(missing), refresh=refresh_attribution
@@ -534,6 +574,7 @@ def sync_persona(
                 annotation_errors=reading_errors,
                 attribution_refreshed=refresh_attribution,
                 annotation_refreshed=refresh_annotations,
+                extraction_refreshed=refresh_extraction,
                 invalid=invalid,
                 invalid_files=invalid_files,
                 invalid_documents=len(found_missing) if invalid else 0,
@@ -609,13 +650,21 @@ def _pending(
 
 
 def _reimport(
-    store: GraphStore, files: list[Path], say: Progress, aliases: AliasTable, *, reingested: bool
+    store: GraphStore,
+    files: list[Path],
+    say: Progress,
+    aliases: AliasTable,
+    attributes: AttributeTable,
+    *,
+    reingested: bool,
 ) -> tuple[int, tuple[str, ...]]:
     """Put a source's pending extraction files back into the graph.
 
     An id collision is said out loud rather than counted as an error: the file was imported and
     its mentions landed, but one name is now hanging off a node called something else, and a
-    sync that swallowed that would be the silence this reporting exists to break.
+    sync that swallowed that would be the silence this reporting exists to break. An entity
+    attribute the vocabulary refused, and one a stored value contradicts, are said out loud for
+    the same reason: the file landed, and the key did not.
     """
     if files:
         what = "re-importing" if reingested else "importing"
@@ -623,11 +672,15 @@ def _reimport(
     imported = 0
     errors: list[str] = []
     for path in files:
-        result = import_extraction_file(store, path, aliases=aliases)
+        result = import_extraction_file(store, path, aliases=aliases, attributes=attributes)
         if result.ok:
             imported += 1
             for collision in result.collisions:
                 say(f"{path.name}: collision: {collision}")
+            for problem in result.attribute_problems:
+                say(f"{path.name}: attribute invalid: {problem}")
+            for conflict in result.attribute_conflicts:
+                say(f"{path.name}: {conflict}")
         else:
             errors.append(f"{path.name}: {result.error}")
     return imported, tuple(errors)
@@ -772,8 +825,14 @@ def _backfill_clause(src: SourceReport, dry_run: bool) -> str:
     """What an up-to-date source did about documents that had no entities, if anything."""
     if not src.enrichment_files:
         return ""
-    verb = "would import" if dry_run else "imported"
-    return f", {verb} {src.enrichment_files} extraction files for documents without entities"
+    phrase = _layer_phrase(
+        src.enrichment_files,
+        "extraction",
+        "entities",
+        dry_run=dry_run,
+        refreshed=src.extraction_refreshed,
+    )
+    return f", {phrase}"
 
 
 def _layer_phrase(count: int, layer: str, without: str, *, dry_run: bool, refreshed: bool) -> str:
@@ -848,11 +907,16 @@ def _closing_line(report: SyncReport) -> str:
             f"{report.persona_id}: synced {len(report.stale_sources)} source(s), "
             f"{report.missing_total} documents were missing"
         )
-    verb = "would import" if report.dry_run else "imported"
     clauses = []
     if report.backfilled_files:
         clauses.append(
-            f"{verb} {report.backfilled_files} extraction files for documents without entities"
+            _layer_phrase(
+                report.backfilled_files,
+                "extraction",
+                "entities",
+                dry_run=report.dry_run,
+                refreshed=report.refreshed_extraction,
+            )
         )
     if report.backfilled_attribution_files:
         clauses.append(

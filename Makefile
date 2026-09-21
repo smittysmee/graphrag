@@ -11,8 +11,8 @@ Q           ?= how do I find product market fit
 K           ?= 5
 
 .PHONY: help build up down logs setup doctor hooks check check-local fmt lint type test \
-        test-integration test-integration-local validate ingest sync snapshot-export \
-        snapshot-load search context stats shell lsp embed-up enrich clean
+        test-integration test-integration-local bench bench-local validate ingest sync \
+        snapshot-export snapshot-load search context stats shell lsp embed-up enrich clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -66,6 +66,7 @@ hooks: ## Enable the versioned git hooks (.githooks)
 ifeq ($(IN_CONTAINER),1)
 check: check-local
 test: test-local
+bench: bench-local
 fmt: fmt-local
 lint: lint-local
 type: type-local
@@ -74,6 +75,8 @@ check: ## Format check + lint + mypy + unit tests (in Docker)
 	$(DEV) make check-local
 test: ## Unit tests (in Docker)
 	$(DEV) make test-local
+bench: ## Timing budget (ATL-ENT-3): needs neo4j up and a persona loaded (in Docker)
+	$(DEV) make bench-local
 fmt: ## Auto-format with ruff (in Docker)
 	$(DEV) make fmt-local
 lint: ## Ruff lint (in Docker)
@@ -86,7 +89,7 @@ check-local: ## (container) ruff format --check, ruff check, mypy, pytest
 	ruff format --check src tests
 	ruff check src tests
 	mypy
-	pytest -q -m "not integration and not embedding"
+	pytest -q -m "not integration and not embedding and not slow"
 
 fmt-local:
 	ruff format src tests
@@ -99,7 +102,10 @@ type-local:
 	mypy
 
 test-local:
-	pytest -q -m "not integration and not embedding"
+	pytest -q -m "not integration and not embedding and not slow"
+
+bench-local:
+	pytest -q -s -m "slow" tests/benchmarks
 
 test-integration: ## Integration tests against a throwaway Neo4j (in Docker)
 	$(COMPOSE) --profile test run --rm -T test make test-integration-local; \
@@ -120,7 +126,7 @@ ingest: ## Ingest SRC into PERSONA (SRC=repo-relative path PERSONA=id [SOURCE=id
 
 sync: ## Ingest what is missing for PERSONA and re-import its sidecars (REFRESH=1 re-reads all)
 	$(COMPOSE) run --rm -T graphrag graphrag sync $(PERSONA) $(if $(SOURCE),--source $(SOURCE)) \
-		$(if $(REFRESH),--refresh-attribution --refresh-annotations)
+		$(if $(REFRESH),--refresh-attribution --refresh-extraction --refresh-annotations)
 
 snapshot-export: ## Export PERSONA from Neo4j to data/snapshots/PERSONA
 	$(COMPOSE) run --rm -T graphrag graphrag snapshot export $(PERSONA)

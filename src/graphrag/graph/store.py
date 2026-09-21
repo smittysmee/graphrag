@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from graphrag.embed.base import Matrix, Vector
 from graphrag.models import (
@@ -17,6 +17,7 @@ from graphrag.models import (
     MentionStance,
     PersonaSpec,
     RelatedTopic,
+    RelationRow,
     ScoredChunk,
     SpeakerCount,
     SpeakerDocument,
@@ -24,6 +25,10 @@ from graphrag.models import (
     TopicCount,
     TopicEdge,
 )
+
+AttributeKind = Literal["speaker", "entity", "document"]
+"""Which sidecar owns an attribute: attribution files say what a speaker is, extraction files what
+an entity is, annotation files what a document is."""
 
 
 class GraphStore(Protocol):
@@ -46,6 +51,11 @@ class GraphStore(Protocol):
     # The exception is a stale node -- no mention and no recorded alias, all that is left of an
     # entity whose passages a re-ingest deleted. It holds nothing but its id, so the incoming
     # name takes it over instead of a spelling nobody stands behind outliving its evidence.
+    # A mention carries the tier that found its passage (`MentionTier`: exact, loose, or none for
+    # the fallback anchor). An incoming `unknown` never erases a recorded tier, on the rule the
+    # stance already follows, so re-importing a file or a snapshot written before tiers existed
+    # does not cost the evidence a later pass measured; reads give `unknown` back for a mention
+    # nobody recorded one on.
     def upsert_enrichment(self, enrichment: Enrichment) -> list[EntityCollision]: ...
     # Fold the alias spellings of one entity into a single canonical node: re-point this
     # persona's MENTIONS and RELATED_TO edges, merge the mentions, record `aliases` on the
@@ -107,6 +117,13 @@ class GraphStore(Protocol):
 
     # misc
     def stats(self) -> GraphStats: ...
+    # ATL-ENT-3: a cheap, one-round-trip summary of a persona's data, for the network cache
+    # (graphrag.sna.cache) to fold into its key so a write the CLI did not make -- Cypher run by
+    # hand, a foreign client -- still misses. Returns (documents, chunks, mentions,
+    # attributed_nodes): the last is how many Document/Entity/Speaker nodes this persona's own
+    # data carries an attribute property on, so a property-only reimport (same document and
+    # mention counts, new values) still moves it.
+    def persona_fingerprint(self, persona_id: str) -> tuple[int, int, int, int]: ...
     def run_readonly_cypher(
         self, query: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]: ...
@@ -139,11 +156,25 @@ class GraphStore(Protocol):
     # Merge into the document's attributes, incoming value winning per key. One annotation file
     # holds one document, so there is no second writer to disagree with.
     def set_document_attributes(self, doc_id: str, attributes: Mapping[str, str]) -> None: ...
-    # Every speaker of this persona that carries attributes, and every document that does.
-    # Read by the importers (to report conflicts), by the snapshot, and by the networks, which
-    # need one lookup rather than one read per node.
+    # Entity attributes are scoped to one persona for the reason speaker attributes are: an
+    # Entity node is shared between personas and "which sector this company is in" is a reading
+    # of one corpus. Same first-value-wins rule, same refused-key return: one entity is named by
+    # many documents, so many extraction files can claim it, and which claim is right is the
+    # annotator's question rather than the last writer's.
+    def set_entity_attributes(
+        self, persona_id: str, entity_id: str, attributes: Mapping[str, str]
+    ) -> list[str]: ...
+    # Every speaker of this persona that carries attributes, every document that does, and every
+    # entity that does. Read by the importers (to report conflicts), by the snapshot, and by the
+    # networks, which need one lookup rather than one read per node.
     def speaker_attributes(self, persona_id: str) -> dict[str, dict[str, str]]: ...
     def document_attributes(self, persona_id: str) -> dict[str, dict[str, str]]: ...
+    def entity_attributes(self, persona_id: str) -> dict[str, dict[str, str]]: ...
+    # Forget every value of one kind this persona holds, and say how many nodes lost one.
+    # First-value-wins means a corrected sidecar cannot replace a stored value, so a full
+    # refresh clears the values that kind of sidecar owns before it re-reads them all. Another
+    # persona's values on the same shared node are untouched.
+    def clear_attributes(self, persona_id: str, kind: AttributeKind) -> int: ...
 
     # annotation: what a passage says about an entity, and which functions it is about
     # Both are idempotent, and both ignore a chunk that is not a passage of `doc_id`.
@@ -174,6 +205,8 @@ class GraphStore(Protocol):
         since: str | None = None,
         until: str | None = None,
     ) -> list[SpeakerDocument]: ...
+    # Each row carries the mention's tier, which is the evidence its edge rests on and what
+    # `graphrag.sna.export` turns into the edge probability `p` (Atlas §28.1).
     def entity_chunk_pairs(
         self,
         persona_id: str,
@@ -181,6 +214,13 @@ class GraphStore(Protocol):
         types: Sequence[str] | None = None,
     ) -> list[EntityChunk]: ...
     def topic_edges(self, persona_id: str, min_weight: int = 1) -> list[TopicEdge]: ...
+    # The directed, typed relations an extraction pass wrote between entities, scoped through
+    # this persona's passages exactly as `entity_chunk_pairs` is: the Entity nodes are shared,
+    # so "this persona's relations" only ever means the ones its passages state.
+    # One row per (relation, passage), so a relation stated in three passages comes back three
+    # times and the network weighs it 3. A row whose passage or whose endpoints the graph no
+    # longer holds is not returned at all.
+    def relation_rows(self, persona_id: str, source_id: str | None = None) -> list[RelationRow]: ...
     # Mean chunk embedding per document or per entity, L2-normalised, for clustering by content
     # rather than by graph structure. Returns the key order and a matrix aligned to it.
     def mean_embeddings(

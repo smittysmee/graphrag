@@ -17,12 +17,23 @@ dependencies = [
     "numpy>=2.5.3,<3",
     "networkx>=3.4,<4",
     "scikit-learn>=1.6,<2",
+    "scipy>=1.10,<2",
     "pypdf>=6.18.0,<7",
     "anthropic>=1.4.0,<2",
     "rich>=15.0.0,<16",
     "httpx>=0.28.1,<1",
     "starlette>=0.40",
     "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+# ATL-44: GCN/GraphSAGE (ch. 44), CPU-only. Never a mandatory dependency -- `graphrag sna
+# complete` and every `sna.gnn` function explain how to install this and exit 2 without it
+# (`sna.gnn.available`). Gated to linux, the only platform the dev/CI Docker image resolves on
+# (`uv lock` itself runs on a bare Intel Mac, which never installs this extra); widen the marker
+# only once another platform actually needs to lock against it, not silently.
+gnn = [
+    "torch>=2.2; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -43,6 +54,17 @@ lsp = [
     "pylsp-mypy>=0.8.0,<1",
     "python-lsp-ruff>=2.3.4,<3",
 ]
+
+# ATL-44: the CPU-only PyTorch wheels. Without this uv resolves torch's default PyPI wheel,
+# which drags in the full CUDA stack (nvidia-*, ~2 GB) even though nothing here uses a GPU; the
+# `explicit = true` index only ever supplies torch itself, never any other package's resolution.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [build-system]
 requires = ["hatchling"]
@@ -101,7 +123,11 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = [
     "fastembed", "fastembed.*", "pypdf", "pypdf.*",
-    "networkx", "networkx.*", "sklearn", "sklearn.*",
+    "networkx", "networkx.*", "sklearn", "sklearn.*", "scipy", "scipy.*",
+    # ATL-44: torch is the optional `graphrag[gnn]` extra, not installed in the dev image;
+    # `sna/gnn.py` only ever imports it inside functions (see `_require_torch`), so nothing here
+    # runs it, but mypy --strict still needs to resolve the annotations under TYPE_CHECKING.
+    "torch", "torch.*",
 ]
 ignore_missing_imports = true
 
@@ -112,6 +138,7 @@ addopts = "-ra --strict-markers"
 markers = [
     "integration: requires a live Neo4j (run via `make test-integration`)",
     "embedding: downloads/uses the real embedding model",
+    "slow: a timing benchmark (ATL-ENT-3); needs a loaded persona snapshot, skips otherwise",
 ]
 filterwarnings = ["error::DeprecationWarning:graphrag.*"]
 

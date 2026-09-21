@@ -224,6 +224,64 @@ def test_the_first_speaker_attribute_written_wins_and_the_rest_come_back(
     }
 
 
+def test_the_first_entity_attribute_written_wins_and_the_rest_come_back(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """One entity is named by many documents, so many extraction files can claim it.
+
+    The speaker rule, for the same reason: the first value stands and the refused keys come back
+    for the importer to report, rather than the last file imported deciding what a thing is.
+    """
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+
+    first = memory_store.set_entity_attributes("test-docs", "concept:handbook", {"region": "north"})
+    same = memory_store.set_entity_attributes("test-docs", "concept:handbook", {"region": "north"})
+    other = memory_store.set_entity_attributes(
+        "test-docs", "concept:handbook", {"region": "south", "team": "Blue"}
+    )
+
+    assert first == [] and same == []  # an identical value is not a disagreement
+    assert other == ["region"]
+    assert memory_store.entity_attributes("test-docs")["concept:handbook"] == {
+        "region": "north",
+        "team": "Blue",
+    }
+    # A reading of one corpus, not a fact about a node every persona shares.
+    assert memory_store.entity_attributes("other-persona") == {}
+
+
+def test_an_entity_the_graph_does_not_hold_is_not_given_attributes(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    """An attribute must never be the thing that brings a node into being, or keeps it alive."""
+    assert memory_store.set_entity_attributes("test-docs", "concept:nothing", {"region": "north"})
+    assert memory_store.entity_attributes("test-docs") == {}
+
+
+def test_sweeping_an_orphaned_entity_takes_its_attributes_with_it(
+    thread_document: str, memory_store: InMemoryGraphStore
+) -> None:
+    chunks = memory_store.document_chunks(thread_document, 0, 100)
+    memory_store.upsert_enrichment(
+        Enrichment(
+            entities=[Entity(id="concept:handbook", name="Handbook", type="concept")],
+            mentions=[Mention(chunk_id=chunks[0].id, entity_id="concept:handbook")],
+        )
+    )
+    memory_store.set_entity_attributes("test-docs", "concept:handbook", {"region": "north"})
+
+    memory_store.delete_documents([thread_document])
+    memory_store.delete_orphan_entities("test-docs")
+
+    assert memory_store.entity_attributes("test-docs") == {}
+
+
 def test_deleting_a_persona_takes_its_speaker_attributes_with_it(
     thread_document: str, memory_store: InMemoryGraphStore
 ) -> None:
@@ -232,6 +290,7 @@ def test_deleting_a_persona_takes_its_speaker_attributes_with_it(
     memory_store.delete_persona("test-docs")
 
     assert memory_store.speaker_attributes("test-docs") == {}
+    assert memory_store.entity_attributes("test-docs") == {}
 
 
 def test_network_reads_return_the_edges_the_sna_package_projects_from(
@@ -264,8 +323,33 @@ def test_network_reads_return_the_edges_the_sna_package_projects_from(
                 Mention(chunk_id=chunk_id, entity_id="metric:retention"),
                 Mention(chunk_id=chunk_id, entity_id="concept:onboarding"),
             ],
+            relations=[
+                Relation(
+                    source_id="concept:onboarding",
+                    target_id="metric:retention",
+                    type="drives",
+                    evidence="fix onboarding before you spend on acquisition",
+                    chunk_id=chunk_id,
+                )
+            ],
         )
     )
+    relations = memory_store.relation_rows("test-pm")
+    assert len(relations) == 1
+    row = relations[0]
+    # The row carries both ends and its provenance, so a directed network needs no second read.
+    assert (row.source_id, row.target_id, row.type) == (
+        "concept:onboarding",
+        "metric:retention",
+        "drives",
+    )
+    assert (row.source_name, row.target_name) == ("Onboarding", "Retention")
+    assert (row.source_type, row.target_type) == ("concept", "metric")
+    assert row.chunk_id == chunk_id and row.doc_id == doc_id
+    assert memory_store.relation_rows("test-pm", "test-podcast") == relations
+    assert memory_store.relation_rows("test-pm", "absent") == []
+    assert memory_store.relation_rows("other-persona") == []  # the Entity nodes are shared
+
     mentions = memory_store.entity_chunk_pairs("test-pm")
     assert {m.entity_id for m in mentions} == {"metric:retention", "concept:onboarding"}
     assert all(m.chunk_id == chunk_id and m.doc_id == doc_id for m in mentions)

@@ -14,8 +14,21 @@ import pytest
 
 from graphrag.graph.memory_store import InMemoryGraphStore
 from graphrag.sna.analysis import run_analysis
-from graphrag.sna.attributes import analyse_attribute, attribute_labels, render_attribute
-from graphrag.sna.export import attr_count_key, attr_key, build_network, matches
+from graphrag.sna.attributes import (
+    analyse_attribute,
+    attribute_labels,
+    attribute_payload,
+    render_attribute,
+)
+from graphrag.sna.export import (
+    INHERITED,
+    OWN,
+    attr_count_key,
+    attr_key,
+    attr_source_key,
+    build_network,
+    matches,
+)
 
 SEED = 11
 
@@ -264,3 +277,151 @@ def test_analyze_adds_the_attribute_section_when_asked_and_not_otherwise(
     assert by_region.attribute is not None
     assert by_region.attribute.key == "region"
     assert by_region.attribute.counts == {"south": 2, "north": 1}
+
+
+# ----------------------------------------------------------------------- where the labels came from
+
+
+def inherited(graph: nx.Graph) -> nx.Graph:
+    """The same two cliques, but with every label marked as borrowed from documents."""
+    copy = graph.copy()
+    for node in copy.nodes:
+        copy.nodes[node][attr_source_key("region")] = INHERITED
+        copy.nodes[node]["documents"] = 1
+    return copy
+
+
+def test_a_label_the_node_carries_itself_is_measured_as_a_finding() -> None:
+    report = analyse_attribute(two_cliques(), "region", seed=SEED, permutations=50, samples=20)
+
+    assert report.own == 16 and report.inherited == 0
+    assert not report.confounded
+    assert "tracks a real division" in report.verdict
+
+
+def test_a_borrowed_label_is_reported_as_circular_however_well_it_scores() -> None:
+    """The case the whole provenance key exists for.
+
+    These are the same two cliques that score above 0.9 with a z-score over 3 -- the strongest
+    result the measure can produce. Borrowed from the documents the edges came from, that score
+    is a restatement of how the labels were assigned, and the shuffle null cannot subtract it:
+    it destroys the correlation, so the null sits at zero and the z-score goes up rather than
+    down. The verdict has to say so instead of reporting the number.
+    """
+    report = analyse_attribute(
+        inherited(two_cliques()), "region", seed=SEED, permutations=50, samples=20
+    )
+
+    assert report.assortativity is not None and report.assortativity > 0.9
+    assert report.assortativity_z > 3  # the null does not catch it, which is the point
+    assert report.inherited == 16 and report.own == 0
+    assert report.inherited_share == 1.0 and report.confounded
+    assert report.single_document == 16
+    assert "Not a reading of this attribute" in report.verdict
+    assert "took their value from the very documents the edges were drawn from" in report.verdict
+
+
+def test_a_mostly_intrinsic_attribute_is_still_read_as_a_finding() -> None:
+    """The confound is a matter of degree: a few borrowed labels do not void the measure."""
+    graph = two_cliques()
+    for node in ("north-1", "south-1"):
+        graph.nodes[node][attr_source_key("region")] = INHERITED
+
+    report = analyse_attribute(graph, "region", seed=SEED, permutations=50, samples=20)
+
+    assert report.inherited == 2 and report.own == 14
+    assert not report.confounded
+    assert "tracks a real division" in report.verdict
+    assert any("carry no value of their own" in note for note in report.notes)
+
+
+def test_the_rendered_section_says_where_the_labels_came_from() -> None:
+    text = "\n".join(
+        render_attribute(
+            analyse_attribute(
+                inherited(two_cliques()), "region", seed=SEED, permutations=20, samples=10
+            )
+        )
+    )
+
+    assert "Recorded about the node itself: 0" in text
+    assert "Borrowed from the node's documents: 16" in text
+    assert "from a single document" in text
+
+
+def test_the_payload_carries_the_provenance_so_a_json_reader_sees_it_too() -> None:
+    payload = attribute_payload(
+        analyse_attribute(
+            inherited(two_cliques()), "region", seed=SEED, permutations=20, samples=10
+        )
+    )
+
+    assert payload["own"] == 0 and payload["inherited"] == 16
+    assert payload["confounded"] is True
+    assert payload["single_document"] == 16
+    assert payload["sources"] == {INHERITED: 16}
+
+
+# ------------------------------------------------------------------- entities with their own values
+
+
+def test_an_entity_with_its_own_value_keeps_it_against_the_documents_that_name_it(
+    layered: InMemoryGraphStore,
+) -> None:
+    """Alpha sits in one north document and two south ones, so the majority says south.
+
+    Given a value of its own, the node stops being a summary of where it was mentioned and
+    starts being a property of the thing -- which is the difference between an assortativity
+    that describes the projection and one that describes the entities.
+    """
+    layered.set_entity_attributes("test-layers", "product:alpha", {"region": "north"})
+
+    graph = build_network(layered, "entities", "test-layers", min_weight=1)
+
+    assert graph.nodes["product:alpha"][attr_key("region")] == "north"
+    assert graph.nodes["product:alpha"][attr_count_key("region")] == 1
+    assert graph.nodes["product:alpha"][attr_source_key("region")] == OWN
+    # Beta was never given one, so it still borrows, and says so.
+    assert graph.nodes["product:beta"][attr_key("region")] == "north"
+    assert graph.nodes["product:beta"][attr_source_key("region")] == INHERITED
+
+
+def test_the_entity_filter_prefers_the_entitys_own_value_over_its_documents(
+    layered: InMemoryGraphStore,
+) -> None:
+    """An entity tagged north is north in every passage that names it, south documents included.
+
+    Alpha is named in posts 1, 2 and 4, of which only post 1 is north. Borrowing, it would be a
+    south entity and ``region=north`` would keep one of its three mentions. Carrying its own
+    value, all three survive the filter and it is out of the south network altogether -- an
+    entity, not a summary of where it was mentioned.
+
+    Its neighbours are unaffected: Gamma has no value of its own, so it still borrows from the
+    south documents it sits in and the filter drops it, which is why no Alpha-Gamma edge appears
+    here. An edge needs both of its endpoints to survive.
+    """
+    layered.set_entity_attributes("test-layers", "product:alpha", {"region": "north"})
+
+    north = build_network(
+        layered, "entities", "test-layers", min_weight=1, where={"region": "north"}
+    )
+    south = build_network(
+        layered, "entities", "test-layers", min_weight=1, where={"region": "south"}
+    )
+
+    assert north.nodes["product:alpha"]["documents"] == 3
+    assert north.nodes["product:alpha"]["mentions"] == 3
+    assert not north.has_edge("product:alpha", "product:gamma")  # Gamma still borrows, so it went
+    assert "product:alpha" not in south  # and Alpha has left the south network entirely
+
+
+def test_a_speakers_value_is_its_own_in_every_network_it_appears_in(
+    layered: InMemoryGraphStore,
+) -> None:
+    """A speaker is what an attribution pass said it is, so nothing about it is borrowed."""
+    speakers = build_network(layered, "speakers", "test-layers")
+    two_mode = build_network(layered, "speakers-entities", "test-layers")
+
+    assert speakers.nodes["ana"][attr_source_key("region")] == OWN
+    assert two_mode.nodes["ana"][attr_source_key("region")] == OWN
+    assert two_mode.nodes["product:beta"][attr_source_key("region")] == INHERITED

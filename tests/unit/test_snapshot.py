@@ -123,6 +123,7 @@ def test_speaker_dates_stances_facets_and_attributes_ride_the_snapshot(
     memory_store.annotate_chunk(thread_document, chunks[0].id, ["handover"])
     memory_store.set_document_attributes(thread_document, {"region": "north"})
     memory_store.set_speaker_attributes("test-docs", "quill-maker", {"region": "south"})
+    memory_store.set_entity_attributes("test-docs", "concept:handbook", {"region": "north"})
 
     root = tmp_path / "snapshots"
     snap.export_snapshot(
@@ -149,9 +150,11 @@ def test_speaker_dates_stances_facets_and_attributes_ride_the_snapshot(
     stance = fresh.mention_stances("test-docs")[0]
     assert (stance.name, stance.stance) == ("Handbook", "complaint")
     assert fresh.entities["concept:handbook"].aliases == ["hand book"]
-    # Node attributes ride too: the document's on the document, the speaker's in its own file.
+    # Node attributes ride too: the document's on the document, the speaker's and the entity's
+    # in files of their own, because both of those nodes are shared between personas.
     assert fresh.document_attributes("test-docs") == {thread_document: {"region": "north"}}
     assert fresh.speaker_attributes("test-docs") == {"quill-maker": {"region": "south"}}
+    assert fresh.entity_attributes("test-docs") == {"concept:handbook": {"region": "north"}}
     row = next(r for r in fresh.speaker_document_pairs("test-docs"))
     assert row.speaker_attributes == {"region": "south"}
     assert row.document_attributes == {"region": "north"}

@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from graphrag.app import AppContext
 from graphrag.cli import app
+from graphrag.extract.aliases import load_aliases
 from graphrag.extract.annotations import import_annotation_file, load_persona_facets
 from graphrag.extract.attributes import (
     EMPTY_ATTRIBUTES,
@@ -24,6 +25,7 @@ from graphrag.extract.attributes import (
     load_persona_attributes,
 )
 from graphrag.extract.attribution import import_attribution_file, report_lines
+from graphrag.extract.importer import import_extraction_file
 from graphrag.graph.memory_store import InMemoryGraphStore
 from tests.conftest import THREAD_POSTS
 
@@ -40,6 +42,13 @@ attributes:
     description: Which half of the network this belongs to.
   team:
     description: The team a speaker says they are on, as written.
+  tenure_years:
+    type: number
+    min: 0
+    max: 60
+    description: How long the speaker says they have been doing this.
+  founded_year:
+    type: number
 """
 
 
@@ -118,6 +127,64 @@ def test_a_persona_with_no_file_and_one_with_no_section_both_accept_anything(
     # The same file still answers for facets, which is the point of keeping them together.
     facets = load_persona_facets(personas, "facets-only")
     assert facets is not None and facets.known("handover")
+
+
+def test_a_numeric_key_takes_a_number_and_refuses_anything_else(table: AttributeTable) -> None:
+    """Atlas ch. 31 needs a value with a sorting, so the vocabulary has to promise one."""
+    spec = table.spec("tenure_years")
+    assert spec is not None and spec.numeric and not spec.closed
+
+    assert table.check_attribute("tenure_years", "3.5") is None
+    assert table.check_attribute("tenure_years", "0") is None
+    assert table.check_attribute("tenure_years", "60") is None
+
+    problem = table.check_attribute("tenure_years", "abc")
+    assert problem is not None and "not a number" in problem
+    for outside in ("-1", "60.5"):
+        refused = table.check_attribute("tenure_years", outside)
+        assert refused is not None and "outside the declared range" in refused
+        assert "between 0 and 60" in refused
+    # nan and inf parse as floats and measure nothing, so they are refused as not numbers.
+    for junk in ("nan", "inf"):
+        assert table.check_attribute("tenure_years", junk) is not None
+
+
+def test_a_numeric_key_without_bounds_takes_any_finite_number(table: AttributeTable) -> None:
+    assert table.check_attribute("founded_year", "-800") is None
+    assert table.check_attribute("founded_year", "1994") is None
+    spec = table.spec("founded_year")
+    assert spec is not None and spec.minimum is None and spec.maximum is None
+    assert spec.bounds == "any finite number"
+
+
+def test_a_numeric_value_is_stored_as_the_string_the_sidecar_wrote(table: AttributeTable) -> None:
+    """Which is why `--where tenure_years=3.5` matches by exact string and 3.50 does not."""
+    kept, problems = table.check({"tenure_years": " 3.5 ", "founded_year": "1994"})
+    assert kept == {"tenure_years": "3.5", "founded_year": "1994"}
+    assert not problems
+
+
+def test_a_malformed_numeric_declaration_is_an_error(tmp_path: Path) -> None:
+    personas = tmp_path / "personas"
+    write_vocabulary(personas, "bad-type", "attributes:\n  age:\n    type: integer\n")
+    with pytest.raises(AttributeTableError, match="not one of text, number"):
+        load_persona_attributes(personas, "bad-type")
+    write_vocabulary(
+        personas, "both", "attributes:\n  age:\n    type: number\n    values: ['1', '2']\n"
+    )
+    with pytest.raises(AttributeTableError, match="declare one or the other"):
+        load_persona_attributes(personas, "both")
+    write_vocabulary(personas, "range-on-text", "attributes:\n  team:\n    min: 1\n")
+    with pytest.raises(AttributeTableError, match="range is meaningless"):
+        load_persona_attributes(personas, "range-on-text")
+    write_vocabulary(personas, "bad-min", "attributes:\n  age:\n    type: number\n    min: soon\n")
+    with pytest.raises(AttributeTableError, match="which is not a number"):
+        load_persona_attributes(personas, "bad-min")
+    write_vocabulary(
+        personas, "inverted", "attributes:\n  age:\n    type: number\n    min: 9\n    max: 2\n"
+    )
+    with pytest.raises(AttributeTableError, match="above max"):
+        load_persona_attributes(personas, "inverted")
 
 
 def test_a_malformed_vocabulary_is_an_error_rather_than_an_empty_table(tmp_path: Path) -> None:
@@ -489,3 +556,174 @@ def test_two_files_that_disagree_about_one_speaker_print_the_conflict(
     assert "attribute conflict: quill-maker region north vs south" in clash.stdout
     assert "1 attribute conflicts" in clash.stdout
     assert cli_context.store.speaker_attributes("test-docs")["quill-maker"] == {"region": "north"}
+
+
+# ----------------------------------------------------------------------------- extraction
+
+
+def write_extraction(path: Path, doc_id: str, entities: list[dict[str, object]]) -> Path:
+    path.write_text(
+        json.dumps({"doc_id": doc_id, "entities": entities, "relations": []}), encoding="utf-8"
+    )
+    return path
+
+
+def test_an_extraction_file_writes_its_entities_attributes_onto_the_entity(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    """The point of the whole layer: an entity carries what it is, not what named it.
+
+    ``onboarding`` is mentioned by a document the test never tags, so the value on the node can
+    only have come from the extraction file.
+    """
+    file = write_extraction(
+        tmp_path / "thread.json",
+        thread_document,
+        [
+            {"name": "onboarding", "type": "concept", "attributes": {"region": "north"}},
+            {"name": "handbook", "type": "concept", "attributes": {"region": "south"}},
+        ],
+    )
+
+    result = import_extraction_file(memory_store, file, attributes=table)
+
+    assert result.ok and result.attributes == 2
+    assert result.attribute_problems == () and result.attribute_conflicts == ()
+    assert memory_store.entity_attributes("test-docs") == {
+        "concept:onboarding": {"region": "north"},
+        "concept:handbook": {"region": "south"},
+    }
+
+
+def test_an_entity_value_the_vocabulary_refuses_is_dropped_and_the_entity_still_lands(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    file = write_extraction(
+        tmp_path / "thread.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "west"}}],
+    )
+
+    result = import_extraction_file(memory_store, file, attributes=table)
+
+    assert result.entities == 1  # the entity itself is not the casualty
+    assert result.attributes == 0
+    assert len(result.attribute_problems) == 1
+    assert "not one of north, south" in result.attribute_problems[0]
+    assert memory_store.entity_attributes("test-docs") == {}
+
+
+def test_two_documents_that_disagree_about_one_entity_keep_the_first_and_report_the_second(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    """The speaker rule, for the reason the speaker rule exists.
+
+    One entity is named by many documents, so many extraction files can claim it. Which of two
+    readings is right is a question for whoever wrote them, not for whichever file was imported
+    last.
+    """
+    first = write_extraction(
+        tmp_path / "first.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "north"}}],
+    )
+    second = write_extraction(
+        tmp_path / "second.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "south"}}],
+    )
+
+    assert import_extraction_file(memory_store, first, attributes=table).attribute_conflicts == ()
+    result = import_extraction_file(memory_store, second, attributes=table)
+
+    assert result.attribute_conflicts == (
+        "attribute conflict: concept:onboarding region north vs south",
+    )
+    assert result.attributes == 0
+    assert memory_store.entity_attributes("test-docs")["concept:onboarding"] == {"region": "north"}
+
+
+def test_one_file_that_disagrees_with_itself_reports_it_rather_than_racing(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    """Two spellings of one thing inside one file fold together, first value winning."""
+    file = write_extraction(
+        tmp_path / "thread.json",
+        thread_document,
+        [
+            {"name": "onboarding", "type": "concept", "attributes": {"region": "north"}},
+            {"name": "Onboarding", "type": "concept", "attributes": {"region": "south"}},
+        ],
+    )
+
+    result = import_extraction_file(memory_store, file, attributes=table)
+
+    assert memory_store.entity_attributes("test-docs")["concept:onboarding"] == {"region": "north"}
+    assert result.attributes == 1
+
+
+def test_re_importing_the_same_entity_attributes_is_not_a_conflict(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    """Re-import has to be a no-op: ``make sync`` re-runs these files after every re-ingest."""
+    file = write_extraction(
+        tmp_path / "thread.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "north"}}],
+    )
+
+    import_extraction_file(memory_store, file, attributes=table)
+    again = import_extraction_file(memory_store, file, attributes=table)
+
+    assert again.attribute_conflicts == ()
+    assert memory_store.entity_attributes("test-docs") == {
+        "concept:onboarding": {"region": "north"}
+    }
+
+
+def test_a_dry_run_reports_the_entity_conflict_it_would_have_hit_and_writes_nothing(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    first = write_extraction(
+        tmp_path / "first.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "north"}}],
+    )
+    import_extraction_file(memory_store, first, attributes=table)
+    second = write_extraction(
+        tmp_path / "second.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "south"}}],
+    )
+
+    dry = import_extraction_file(memory_store, second, dry_run=True, attributes=table)
+
+    assert dry.attribute_conflicts == (
+        "attribute conflict: concept:onboarding region north vs south",
+    )
+    assert memory_store.entity_attributes("test-docs")["concept:onboarding"] == {"region": "north"}
+
+
+def test_an_entity_attribute_follows_its_name_onto_the_canonical_node(
+    memory_store: InMemoryGraphStore, thread_document: str, tmp_path: Path, table: AttributeTable
+) -> None:
+    """A claim about an alias is a claim about whatever node that spelling folds onto.
+
+    Otherwise the attribute would land on an id with no mentions on it, and the entity the
+    mentions did land on would be the one the analysis reports as untagged.
+    """
+    alias_file = tmp_path / "aliases.yaml"
+    alias_file.write_text("aliases:\n  Onboarding Programme: [onboarding]\n", encoding="utf-8")
+    aliases = load_aliases(alias_file)
+    file = write_extraction(
+        tmp_path / "thread.json",
+        thread_document,
+        [{"name": "onboarding", "type": "concept", "attributes": {"region": "north"}}],
+    )
+
+    result = import_extraction_file(memory_store, file, aliases=aliases, attributes=table)
+
+    assert result.ok
+    assert memory_store.entity_attributes("test-docs") == {
+        "concept:onboarding-programme": {"region": "north"}
+    }

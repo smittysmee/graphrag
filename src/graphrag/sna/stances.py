@@ -20,13 +20,14 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from itertools import combinations
+from typing import Any
 
 from graphrag.extract.aliases import fold_name
 from graphrag.graph.store import GraphStore
 from graphrag.models import MentionStance, Stance
-from graphrag.sna.export import STANCES, matches, where_text
+from graphrag.sna.export import STANCES, matches, resolve, where_text
 from graphrag.textutil import sanitize_inline
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "StanceReport",
     "build_stance_report",
     "render_stances",
+    "stances_payload",
 ]
 
 #: How much of a passage is quoted as evidence. Long enough to be a quotation, short enough
@@ -73,6 +75,21 @@ class SignedPair:
 
     def count(self, stance: Stance) -> int:
         return self.shared.get(stance, 0)
+
+    @property
+    def dominant_sign(self) -> int | None:
+        """This pair's sign under §24.1's convention -- praise = +1, complaint = -1 -- the one
+        every signed-prediction frame in :mod:`graphrag.sna.predict` states next to its numbers.
+
+        The majority stance wins; a pair whose praise and complaint counts tie (including a tie
+        at zero, meaning neither was ever annotated) is genuinely ambiguous under a majority
+        reading and returns ``None`` rather than a guessed sign. Substitution and neutral
+        mentions carry no sign and never enter the count.
+        """
+        praise, complaint = self.count("praise"), self.count("complaint")
+        if praise == complaint:
+            return None
+        return 1 if praise > complaint else -1
 
 
 @dataclass(frozen=True)
@@ -113,15 +130,23 @@ def build_stance_report(
     reported rather than silently dropped, because a typo and an entity with no annotations look
     identical in the output otherwise.
 
-    ``where`` keeps only annotations whose document carries those attribute values, which is how
-    one population's opinion of a thing is read apart from another's. Run it twice and compare
-    the two tables rather than reading one against the unfiltered whole: the denominators are
+    ``where`` keeps only the annotations whose entity carries those attribute values, falling
+    back to the document the passage belongs to for a key the entity carries no value of its
+    own for -- the rule ``graphrag sna --where`` applies everywhere. On a key recorded about
+    documents that reads as one population's opinion of a thing; on a key recorded about
+    entities it reads as what is said about things of that kind. Run it twice and compare the
+    two tables rather than reading one against the unfiltered whole: the denominators are
     different corpora.
     """
     rows = store.mention_stances(persona_id, source_id)
     if where:
         attributes = store.document_attributes(persona_id)
-        rows = [r for r in rows if matches(attributes.get(r.doc_id, {}), where)]
+        own = store.entity_attributes(persona_id)
+        rows = [
+            r
+            for r in rows
+            if matches(resolve(own.get(r.entity_id, {}), attributes.get(r.doc_id, {})), where)
+        ]
     facet_of = {r.chunk_id: list(r.facets) for r in store.chunk_facets(persona_id, source_id)}
     if facets:
         wanted_facets = {f.strip() for f in facets if f.strip()}
@@ -334,3 +359,16 @@ def render_stances(report: StanceReport) -> str:
         "the way the count claims, the annotation is wrong, not the passage.",
     ]
     return "\n".join(lines).rstrip() + "\n"
+
+
+def stances_payload(persona_id: str, report: StanceReport) -> dict[str, Any]:
+    """``report`` as the JSON `sna stances` writes with ``--json`` and the ``sna_stances`` MCP
+    tool returns as ``payload`` -- the same :class:`StanceReport` fields :func:`render_stances`
+    reads (ATL-F1: one function both surfaces call, instead of each building this dict inline)."""
+    return {
+        "persona_id": persona_id,
+        "annotations": report.annotations,
+        "entities": [asdict(e) for e in report.entities],
+        "pairs": [asdict(p) for p in report.pairs],
+        "missing": list(report.missing),
+    }
